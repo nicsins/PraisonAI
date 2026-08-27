@@ -1211,7 +1211,15 @@ Your Goal: {self.goal}"""
         return content
 
     def _extract_llm_response_content(self, response) -> Optional[str]:
-        """Return assistant message text, a tool-call summary, or str(response) as fallback."""
+        """Return assistant message text, or a tool-call summary.
+
+        A well-formed response that simply carries no content -- a content filter,
+        a refusal, or ``finish_reason="length"`` with zero output tokens -- yields
+        the empty string.  ``str(response)`` is reserved for responses this method
+        could not parse at all, where the repr is a diagnostic rather than an
+        answer; returning it for a merely empty message put the raw SDK object's
+        repr in front of the user and into ``chat_history``.
+        """
         if not response:
             return None
         try:
@@ -1226,6 +1234,17 @@ Your Goal: {self.goal}"""
                     if tool_calls:
                         names = [getattr(tc.function, "name", "?") for tc in tool_calls]
                         return f"[tool_calls: {', '.join(names)}]"
+                    # Parsed cleanly; the model returned no content.  A refusal
+                    # (safety) is carried in ``message.refusal`` independently of
+                    # ``finish_reason`` -- surface it so an empty answer isn't silent.
+                    finish_reason = getattr(choice, "finish_reason", None)
+                    refusal = getattr(msg, "refusal", None)
+                    if refusal or finish_reason not in (None, "stop"):
+                        logging.warning(
+                            f"Agent {self.name}: model returned no content "
+                            f"(finish_reason={finish_reason!r}, refused={bool(refusal)})"
+                        )
+                    return ""
         except (AttributeError, IndexError, TypeError) as e:
             logging.warning(
                 f"Failed to extract LLM response content (falling back to str): {e}"
@@ -1725,7 +1744,7 @@ Your Goal: {self.goal}"""
             return max_retries
         return 2
 
-    def _chat_completion(self, messages, temperature=1.0, tools=None, stream=None, reasoning_steps=False, task_name=None, task_description=None, task_id=None, response_format=None, _retry_depth=0, _fallback_index=0):
+    def _chat_completion(self, messages, temperature=None, tools=None, stream=None, reasoning_steps=False, task_name=None, task_description=None, task_id=None, response_format=None, _retry_depth=0, _fallback_index=0, cancel_token=None):
         start_time = time.time()
 
         # --- Proactive Context Budget Management (default-on) ---
@@ -1830,6 +1849,7 @@ Your Goal: {self.goal}"""
                 # First attempt: try with streaming enabled for better user experience
                 stream_callback = self.stream_emitter.emit if hasattr(self, 'stream_emitter') else None
                 streaming_response = self._chat_completion_with_retry(
+                    cancel_token=cancel_token,
                     messages=messages,
                     temperature=temperature,
                     tools=formatted_tools,
@@ -1849,6 +1869,11 @@ Your Goal: {self.goal}"""
                     stream = False  # Set for the main execution below
                 else:
                     raise  # Re-raise if it's a different ValueError
+            except ToolExecutionError:
+                # A tool failed during the streaming attempt. Re-raise so it is
+                # not relabelled as an LLM error and so the tool is not executed
+                # a second time by the non-streaming fallback below.
+                raise
             except Exception as e:
                 from ..errors import LLMError
                 # Don't retry if it's an LLMError that has exhausted retries
@@ -1868,6 +1893,7 @@ Your Goal: {self.goal}"""
                 final_response = streaming_response
             else:
                 final_response = self._chat_completion_with_retry(
+                    cancel_token=cancel_token,
                     messages=messages,
                     temperature=temperature,
                     tools=formatted_tools,
@@ -1953,6 +1979,8 @@ Your Goal: {self.goal}"""
 
         except BudgetExceededError:
             raise
+        except ToolExecutionError:
+            raise
         except Exception as e:
             from ..errors import LLMError
             
@@ -2017,7 +2045,8 @@ Your Goal: {self.goal}"""
                             truncated_messages, temperature, tools, stream, 
                             reasoning_steps, task_name, task_description, task_id, response_format, 
                             _retry_depth=_retry_depth + 1,
-                            _fallback_index=_fallback_index
+                            _fallback_index=_fallback_index,
+                            cancel_token=cancel_token
                         )
                 except Exception as compression_error:
                     logging.error(f"[{self.name}] Context compression failed: {compression_error}")
@@ -2063,7 +2092,8 @@ Your Goal: {self.goal}"""
                             messages, temperature, tools, stream,
                             reasoning_steps, task_name, task_description, task_id, response_format,
                             _retry_depth=_retry_depth + 1,
-                            _fallback_index=_fallback_index + 1
+                            _fallback_index=_fallback_index + 1,
+                            cancel_token=cancel_token
                         )
                     finally:
                         self.llm = original_llm
@@ -2080,7 +2110,8 @@ Your Goal: {self.goal}"""
                         messages, temperature, tools, stream, 
                         reasoning_steps, task_name, task_description, task_id, response_format, 
                         _retry_depth=_retry_depth + 1,
-                        _fallback_index=_fallback_index
+                        _fallback_index=_fallback_index,
+                        cancel_token=cancel_token
                     )
             
             # Include remediation hints for unimplemented recovery actions
@@ -2119,7 +2150,7 @@ Your Goal: {self.goal}"""
         self, 
         exc: Exception, 
         messages, 
-        temperature=1.0, 
+        temperature=None, 
         tools=None, 
         stream=True,
         reasoning_steps=False,
@@ -2309,7 +2340,7 @@ Your Goal: {self.goal}"""
     def _execute_unified_chat_completion(
         self, 
         messages, 
-        temperature=1.0, 
+        temperature=None, 
         tools=None, 
         stream=None,
         reasoning_steps=False,
@@ -2319,6 +2350,7 @@ Your Goal: {self.goal}"""
         response_format=None,
         stream_callback=None,
         emit_events=True,
+        cancel_token=None,
     ):
         """
         Execute unified chat completion using composition instead of runtime class mutation.
@@ -2351,6 +2383,7 @@ Your Goal: {self.goal}"""
                 if stream_callback is None and hasattr(self, 'stream_emitter'):
                     stream_callback = getattr(self.stream_emitter, 'emit', None)
                 final_response = self._unified_dispatcher.chat_completion(
+                    cancel_token=cancel_token,
                     messages=messages,
                     tools=tools,
                     tool_choice=getattr(self, 'tool_choice', None),
@@ -2396,6 +2429,7 @@ Your Goal: {self.goal}"""
             if stream_callback is None and hasattr(self, 'stream_emitter'):
                 stream_callback = getattr(self.stream_emitter, 'emit', None)
             final_response = self._unified_dispatcher.chat_completion(
+                cancel_token=cancel_token,
                 messages=messages,
                 tools=tools,
                 tool_choice=getattr(self, 'tool_choice', None),
@@ -2443,7 +2477,7 @@ Your Goal: {self.goal}"""
     async def _execute_unified_achat_completion(
         self, 
         messages, 
-        temperature=1.0, 
+        temperature=None, 
         tools=None, 
         stream=True,  # Async methods keep stream=True default (async adapters support streaming vs sync smart fallback)
         reasoning_steps=False,
@@ -2781,7 +2815,11 @@ Your Goal: {self.goal}"""
                 
                 model_name = self.llm if isinstance(self.llm, str) else "gpt-4o-mini"
                 model_limit = get_model_limit(model_name)
-                current_tokens = estimate_messages_tokens(optimized)
+                # Count the whole request (history + system prompt + tool schemas),
+                # otherwise a large prompt/tool block can push the call over the
+                # window while the history alone stays under the threshold.
+                overhead = self._estimate_request_overhead_tokens(system_prompt, tools)
+                current_tokens = estimate_messages_tokens(optimized) + overhead
                 
                 # If over 95% of limit, apply emergency truncation
                 if current_tokens > model_limit * 0.95:
@@ -2789,19 +2827,66 @@ Your Goal: {self.goal}"""
                         f"[{self.name}] Context at {current_tokens} tokens (limit: {model_limit}), "
                         f"applying emergency truncation"
                     )
-                    target = int(model_limit * 0.8)  # Target 80% of limit
+                    # Leave room for the fixed overhead so the full request lands
+                    # near 80% of the window rather than the history alone.
+                    target = max(1, int(model_limit * 0.8) - overhead)
                     optimized = self.context_manager.emergency_truncate(optimized, target)
                     result["emergency_truncated"] = True
-                    result["tokens_after"] = estimate_messages_tokens(optimized)
+                    result["tokens_after"] = estimate_messages_tokens(optimized) + overhead
             except Exception as e:
                 logging.debug(f"Hard limit check skipped: {e}")
             
             return optimized, result
             
         except Exception as e:
-            # Context management should never break the chat flow
-            logging.warning(f"Context management error (continuing without): {e}")
+            # Context management should never break the chat flow, but silently
+            # returning the unchanged history disables the hard-limit truncation
+            # too and sends an over-budget request. Fall back to emergency
+            # truncation so we still fit within the model window.
+            logging.error(f"Context management failed: {e}")
+            try:
+                from ..context.budgeter import get_model_limit
+                from ..context.tokens import estimate_messages_tokens
+
+                model_name = self.llm if isinstance(self.llm, str) else "gpt-4o-mini"
+                model_limit = get_model_limit(model_name)
+                # Include the system prompt and tool schemas in the budget: the
+                # request can exceed the window on those alone even when the
+                # history is under the threshold.
+                overhead = self._estimate_request_overhead_tokens(system_prompt, tools)
+                if estimate_messages_tokens(messages) + overhead > model_limit * 0.95:
+                    target = max(1, int(model_limit * 0.8) - overhead)
+                    truncated = self.context_manager.emergency_truncate(messages, target)
+                    return truncated, {"emergency_truncated": True}
+            except Exception as inner:
+                logging.debug(f"Emergency truncation fallback skipped: {inner}")
             return messages, None
+
+    def _estimate_request_overhead_tokens(
+        self,
+        system_prompt: str = "",
+        tools: Optional[list] = None,
+    ) -> int:
+        """Estimate non-history request tokens (system prompt + tool schemas).
+
+        Emergency-truncation thresholds must budget the full request, not just
+        the message history, or a large system prompt / tool block can push the
+        call over the model window undetected.
+        """
+        try:
+            from ..context.tokens import (
+                estimate_tokens_heuristic,
+                estimate_tool_schema_tokens,
+            )
+        except Exception:
+            return 0
+
+        overhead = 0
+        if system_prompt:
+            overhead += estimate_tokens_heuristic(system_prompt)
+        if tools:
+            overhead += estimate_tool_schema_tokens(tools)
+        return overhead
 
     def _truncate_tool_output(self, tool_name: str, output: str, tool_call_id: str | None = None) -> str:
         """
@@ -2862,7 +2947,14 @@ Your Goal: {self.goal}"""
                 from ..approval import get_approval_registry
 
                 registry = get_approval_registry()
-                agent_name = getattr(self, "display_name", getattr(self, "name", None))
+                # Key the grant by the unique per-instance scope id (not the
+                # display name, which defaults to "Agent" for every unnamed
+                # agent and would leak this grant onto other agents in the
+                # same process). Falls back to name/display_name for objects
+                # without a scope id.
+                agent_name = getattr(self, "_approval_scope_id", None) or getattr(
+                    self, "display_name", getattr(self, "name", None)
+                )
                 if agent_name:  # Only approve if we have a stable agent identifier
                     for _tn in tool_names:
                         try:
@@ -2888,7 +2980,7 @@ Your Goal: {self.goal}"""
             )
         return rendered
 
-    def chat(self, prompt: str, temperature: float = 1.0, tools: Optional[List[Any]] = None, output_json: Optional[Any] = None, output_pydantic: Optional[Any] = None, reasoning_steps: bool = False, stream: Optional[bool] = None, task_name: Optional[str] = None, task_description: Optional[str] = None, task_id: Optional[str] = None, config: Optional[Dict[str, Any]] = None, force_retrieval: bool = False, skip_retrieval: bool = False, attachments: Optional[List[str]] = None, tool_choice: Optional[str] = None, seed: Optional[int] = None, cancel_token: Optional[Any] = None) -> Optional[str]:
+    def chat(self, prompt: str, temperature: Optional[float] = None, tools: Optional[List[Any]] = None, output_json: Optional[Any] = None, output_pydantic: Optional[Any] = None, reasoning_steps: bool = False, stream: Optional[bool] = None, task_name: Optional[str] = None, task_description: Optional[str] = None, task_id: Optional[str] = None, config: Optional[Dict[str, Any]] = None, force_retrieval: bool = False, skip_retrieval: bool = False, attachments: Optional[List[str]] = None, tool_choice: Optional[str] = None, seed: Optional[int] = None, cancel_token: Optional[Any] = None) -> Optional[str]:
         """
         Chat with the agent.
         
@@ -2935,6 +3027,19 @@ Your Goal: {self.goal}"""
 
         # Check if external managed backend is configured
         if hasattr(self, 'backend') and self.backend is not None:
+            # Honour configured throttling and cooperative cancellation before
+            # handing off to the managed backend, so backend requests obey the
+            # same request limits and cancel token as direct-LLM calls instead
+            # of bypassing both guards (parity with the async achat() path).
+            _cancel = cancel_token if cancel_token is not None else getattr(self, "interrupt_controller", None)
+            if _cancel is not None and getattr(_cancel, "is_set", lambda: False)():
+                reason = getattr(_cancel, "reason", None) or "cancelled before backend call"
+                raise InterruptedError(f"Agent chat cancelled: {reason}")
+            if self._rate_limiter is not None:
+                self._rate_limiter.acquire()
+            if _cancel is not None and getattr(_cancel, "is_set", lambda: False)():
+                reason = getattr(_cancel, "reason", None) or "cancelled before backend call"
+                raise InterruptedError(f"Agent chat cancelled: {reason}")
             # Extract kwargs for delegation, excluding 'self' and function locals
             delegation_kwargs = {
                 'temperature': temperature,
@@ -3306,7 +3411,7 @@ Your Goal: {self.goal}"""
 
                     # Apply guardrail validation for custom LLM response
                     try:
-                        validated_response = self._apply_guardrail_with_retry(response_text, prompt, temperature, tools, task_name, task_description, task_id)
+                        validated_response = self._apply_guardrail_with_retry(response_text, prompt, temperature, tools, task_name, task_description, task_id, cancel_token=cancel_token)
                         # Execute callback and display after validation
                         self._execute_callback_and_display(prompt, validated_response, time.time() - start_time, task_name, task_description, task_id)
                         return self._trigger_after_agent_hook(prompt, validated_response, start_time)
@@ -3406,7 +3511,12 @@ Your Goal: {self.goal}"""
                                     agent_tools=agent_tools
                                 )
 
-                        response = self._chat_completion(messages, temperature=temperature, tools=tools, reasoning_steps=reasoning_steps, stream=stream, task_name=task_name, task_description=task_description, task_id=task_id, response_format=response_format)
+                        # G2 - thread the cancel token into the OpenAI-native tool
+                        # loop too. OpenAIClient.{a,}chat_completion_with_tools already
+                        # implements the between-iteration checks; without this hop they
+                        # are never armed, so /stop reports success while the remaining
+                        # tool calls keep executing.
+                        response = self._chat_completion(messages, temperature=temperature, tools=tools, reasoning_steps=reasoning_steps, stream=stream, task_name=task_name, task_description=task_description, task_id=task_id, response_format=response_format, cancel_token=cancel_token)
                         if not response:
                             # Rollback chat history on response failure
                             self._rollback_chat_history_to(chat_history_length)
@@ -3425,7 +3535,7 @@ Your Goal: {self.goal}"""
                             self._persist_message("assistant", response_text)
                             # Apply guardrail validation even for JSON output
                             try:
-                                validated_response = self._apply_guardrail_with_retry(response_text, original_prompt, temperature, tools, task_name, task_description, task_id)
+                                validated_response = self._apply_guardrail_with_retry(response_text, original_prompt, temperature, tools, task_name, task_description, task_id, cancel_token=cancel_token)
                                 # Execute callback after validation
                                 self._execute_callback_and_display(original_prompt, validated_response, time.time() - start_time, task_name, task_description, task_id)
                                 return self._trigger_after_agent_hook(original_prompt, validated_response, start_time)
@@ -3446,7 +3556,7 @@ Your Goal: {self.goal}"""
                             if reasoning_steps and hasattr(response.choices[0].message, 'reasoning_content') and response.choices[0].message.reasoning_content:
                                 # Apply guardrail to reasoning content
                                 try:
-                                    validated_reasoning = self._apply_guardrail_with_retry(response.choices[0].message.reasoning_content, original_prompt, temperature, tools, task_name, task_description, task_id)
+                                    validated_reasoning = self._apply_guardrail_with_retry(response.choices[0].message.reasoning_content, original_prompt, temperature, tools, task_name, task_description, task_id, cancel_token=cancel_token)
                                     # Execute callback after validation
                                     self._execute_callback_and_display(original_prompt, validated_reasoning, time.time() - start_time, task_name, task_description, task_id)
                                     return self._trigger_after_agent_hook(original_prompt, validated_reasoning, start_time)
@@ -3457,7 +3567,7 @@ Your Goal: {self.goal}"""
                                     return None
                             # Apply guardrail to regular response
                             try:
-                                validated_response = self._apply_guardrail_with_retry(response_text, original_prompt, temperature, tools, task_name, task_description, task_id)
+                                validated_response = self._apply_guardrail_with_retry(response_text, original_prompt, temperature, tools, task_name, task_description, task_id, cancel_token=cancel_token)
                                 # Execute callback after validation
                                 self._execute_callback_and_display(original_prompt, validated_response, time.time() - start_time, task_name, task_description, task_id)
                                 return self._trigger_after_agent_hook(original_prompt, validated_response, start_time)
@@ -3481,7 +3591,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                             if self._using_custom_llm or self._openai_client is None:
                                 # For custom LLMs, we need to handle reflection differently
                                 # Use non-streaming to get complete JSON response
-                                reflection_response = self._chat_completion(messages, temperature=temperature, tools=None, stream=False, reasoning_steps=False, task_name=task_name, task_description=task_description, task_id=task_id)
+                                reflection_response = self._chat_completion(messages, temperature=temperature, tools=None, stream=False, reasoning_steps=False, task_name=task_name, task_description=task_description, task_id=task_id, cancel_token=cancel_token)
                                 
                                 if not reflection_response or not reflection_response.choices:
                                     raise Exception("No response from reflection request")
@@ -3498,11 +3608,14 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                 reflection_output = _get_display_functions()['ReflectionOutput'](**reflection_data)
                             else:
                                 # Use OpenAI's structured output for OpenAI models
+                                _reflection_kwargs = {}
+                                if temperature is not None:
+                                    _reflection_kwargs['temperature'] = temperature
                                 reflection_response = self._openai_client.sync_client.beta.chat.completions.parse(
                                     model=self.reflect_llm if self.reflect_llm else self.llm,
                                     messages=messages,
-                                    temperature=temperature,
-                                    response_format=_get_display_functions()['ReflectionOutput']
+                                    response_format=_get_display_functions()['ReflectionOutput'],
+                                    **_reflection_kwargs
                                 )
 
                                 reflection_output = reflection_response.choices[0].message.parsed
@@ -3520,7 +3633,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                 self._append_to_chat_history({"role": "assistant", "content": response_text})
                                 # Apply guardrail validation after satisfactory reflection
                                 try:
-                                    validated_response = self._apply_guardrail_with_retry(response_text, original_prompt, temperature, tools, task_name, task_description, task_id)
+                                    validated_response = self._apply_guardrail_with_retry(response_text, original_prompt, temperature, tools, task_name, task_description, task_id, cancel_token=cancel_token)
                                     # Execute callback after validation
                                     self._execute_callback_and_display(original_prompt, validated_response, time.time() - start_time, task_name, task_description, task_id)
                                     self._end_run(validated_response, "completed", {"duration_ms": (time.time() - start_time) * 1000})
@@ -3540,7 +3653,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                 self._append_to_chat_history({"role": "assistant", "content": response_text})
                                 # Apply guardrail validation after max reflections
                                 try:
-                                    validated_response = self._apply_guardrail_with_retry(response_text, original_prompt, temperature, tools, task_name, task_description, task_id)
+                                    validated_response = self._apply_guardrail_with_retry(response_text, original_prompt, temperature, tools, task_name, task_description, task_id, cancel_token=cancel_token)
                                     # Execute callback after validation
                                     self._execute_callback_and_display(original_prompt, validated_response, time.time() - start_time, task_name, task_description, task_id)
                                     return self._trigger_after_agent_hook(original_prompt, validated_response, start_time)
@@ -3556,7 +3669,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                             # For reflection, always use non-streaming to ensure compatibility with sync adapters
                             # and to avoid streaming complexity during regeneration process
                             use_stream = False
-                            response = self._chat_completion(messages, temperature=temperature, tools=None, stream=use_stream, task_name=task_name, task_description=task_description, task_id=task_id)
+                            response = self._chat_completion(messages, temperature=temperature, tools=None, stream=use_stream, task_name=task_name, task_description=task_description, task_id=task_id, cancel_token=cancel_token)
                             content = response.choices[0].message.content
                             response_text = content.strip() if content else ""
                             reflection_count += 1
@@ -3567,6 +3680,22 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                 logging.error("Reflection parsing failed.", exc_info=True)
                                 messages.append({"role": "assistant", "content": "Self Reflection failed."})
                                 reflection_count += 1
+                                if reflection_count >= self.max_reflect:
+                                    # Bound the retry, as the async path does. Without this
+                                    # a persistently unparseable reflection (e.g. a
+                                    # structured-output refusal, where message.parsed is
+                                    # None) loops forever, two LLM calls at a time.
+                                    if self.verbose:
+                                        _get_display_functions()['display_self_reflection']("Maximum reflection count reached after repeated parse errors, returning current response", console=self.console)
+                                    self._append_to_chat_history({"role": "assistant", "content": response_text})
+                                    try:
+                                        validated_response = self._apply_guardrail_with_retry(response_text, original_prompt, temperature, tools, task_name, task_description, task_id, cancel_token=cancel_token)
+                                        self._execute_callback_and_display(original_prompt, validated_response, time.time() - start_time, task_name, task_description, task_id)
+                                        return self._trigger_after_agent_hook(original_prompt, validated_response, start_time)
+                                    except Exception as guard_e:
+                                        logging.error(f"Agent {self.name}: Guardrail validation failed after reflection error: {guard_e}")
+                                        self._rollback_chat_history_to(chat_history_length)
+                                        return None
                                 continue  # Continue even after error to try again
                     except Exception:
                         # Catch any exception from the inner try block and re-raise to outer handler
@@ -3586,7 +3715,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
 
         return clean_triple_backticks(output)
 
-    async def achat(self, prompt: str, temperature: float = 1.0, tools: Optional[List[Any]] = None, output_json: Optional[Any] = None, output_pydantic: Optional[Any] = None, reasoning_steps: bool = False, stream: Optional[bool] = None, task_name: Optional[str] = None, task_description: Optional[str] = None, task_id: Optional[str] = None, config: Optional[Dict[str, Any]] = None, force_retrieval: bool = False, skip_retrieval: bool = False, attachments: Optional[List[str]] = None, tool_choice: Optional[str] = None, seed: Optional[int] = None, cancel_token: Optional[Any] = None):
+    async def achat(self, prompt: str, temperature: Optional[float] = None, tools: Optional[List[Any]] = None, output_json: Optional[Any] = None, output_pydantic: Optional[Any] = None, reasoning_steps: bool = False, stream: Optional[bool] = None, task_name: Optional[str] = None, task_description: Optional[str] = None, task_id: Optional[str] = None, config: Optional[Dict[str, Any]] = None, force_retrieval: bool = False, skip_retrieval: bool = False, attachments: Optional[List[str]] = None, tool_choice: Optional[str] = None, seed: Optional[int] = None, cancel_token: Optional[Any] = None):
         """Async version of chat method with self-reflection support.
         
         Args:
@@ -3633,9 +3762,12 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
             # handing off to the managed backend, so backend requests obey the
             # same request limits and cancel token as direct-LLM calls instead
             # of bypassing both guards.
+            _cancel = cancel_token if cancel_token is not None else getattr(self, "interrupt_controller", None)
+            if _cancel is not None and getattr(_cancel, "is_set", lambda: False)():
+                reason = getattr(_cancel, "reason", None) or "cancelled before backend call"
+                raise InterruptedError(f"Agent chat cancelled: {reason}")
             if self._rate_limiter is not None:
                 await self._rate_limiter.acquire_async()
-            _cancel = cancel_token if cancel_token is not None else getattr(self, "interrupt_controller", None)
             if _cancel is not None and getattr(_cancel, "is_set", lambda: False)():
                 reason = getattr(_cancel, "reason", None) or "cancelled before backend call"
                 raise InterruptedError(f"Agent chat cancelled: {reason}")
@@ -3802,7 +3934,12 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                 self._ensure_knowledge_processed()
             
             if not skip_retrieval and self.knowledge:
-                search_results = self.knowledge.search(prompt, agent_id=self.agent_id)
+                # Knowledge.search is synchronous (Mem0 embedding + vector-store
+                # I/O). Offload to a thread so it never blocks the event loop for
+                # other coroutines sharing the loop.
+                search_results = await asyncio.to_thread(
+                    self.knowledge.search, prompt, agent_id=self.agent_id
+                )
                 if search_results:
                     if isinstance(search_results, dict) and 'results' in search_results:
                         knowledge_content = "\n".join([result['memory'] for result in search_results['results']])
@@ -4147,11 +4284,14 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                             self._rollback_chat_history_to(chat_history_length)
                                             return None
                                     
+                                    _areflection_kwargs = {}
+                                    if temperature is not None:
+                                        _areflection_kwargs['temperature'] = temperature
                                     reflection_response = await self._openai_client.async_client.beta.chat.completions.parse(
                                         model=self.reflect_llm if self.reflect_llm else self.llm,
                                         messages=reflection_messages,
-                                        temperature=temperature,
-                                        response_format=_get_display_functions()['ReflectionOutput']
+                                        response_format=_get_display_functions()['ReflectionOutput'],
+                                        **_areflection_kwargs
                                     )
                                     
                                     reflection_output = reflection_response.choices[0].message.parsed
@@ -4265,9 +4405,10 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                             tool_call_kwargs = dict(
                                 model=self.llm,
                                 messages=messages,
-                                temperature=temperature,
                                 tools=formatted_tools,
                             )
+                            if temperature is not None:
+                                tool_call_kwargs['temperature'] = temperature
                             if effective_tool_choice:
                                 tool_call_kwargs['tool_choice'] = effective_tool_choice
                             response = await self._openai_client.async_client.chat.completions.create(
@@ -4281,11 +4422,14 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                             self._execute_callback_and_display(original_prompt, result, time.time() - start_time, task_name, task_description, task_id)
                             return await self._atrigger_after_agent_hook(original_prompt, result, start_time)
                         elif output_json or output_pydantic:
+                            _json_kwargs = {}
+                            if temperature is not None:
+                                _json_kwargs['temperature'] = temperature
                             response = await self._openai_client.async_client.chat.completions.create(
                                 model=self.llm,
                                 messages=messages,
-                                temperature=temperature,
-                                response_format={"type": "json_object"}
+                                response_format={"type": "json_object"},
+                                **_json_kwargs
                             )
                             response_text = response.choices[0].message.content
                             if get_logger().getEffectiveLevel() == logging.DEBUG:
@@ -4295,10 +4439,13 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                             self._execute_callback_and_display(original_prompt, response_text, time.time() - start_time, task_name, task_description, task_id)
                             return await self._atrigger_after_agent_hook(original_prompt, response_text, start_time)
                         else:
+                            _plain_kwargs = {}
+                            if temperature is not None:
+                                _plain_kwargs['temperature'] = temperature
                             response = await self._openai_client.async_client.chat.completions.create(
                                 model=self.llm,
                                 messages=messages,
-                                temperature=temperature
+                                **_plain_kwargs
                             )
                         
                         response_text = response.choices[0].message.content
@@ -4335,11 +4482,14 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                             logging.debug(f"Agent.achat completed in {total_time:.2f} seconds")
                                         return await self._atrigger_after_agent_hook(original_prompt, response_text, start_time)
                                     
+                                    _areflection_kwargs = {}
+                                    if temperature is not None:
+                                        _areflection_kwargs['temperature'] = temperature
                                     reflection_response = await self._openai_client.async_client.beta.chat.completions.parse(
                                         model=self.reflect_llm if self.reflect_llm else self.llm,
                                         messages=reflection_messages,
-                                        temperature=temperature,
-                                        response_format=_get_display_functions()['ReflectionOutput']
+                                        response_format=_get_display_functions()['ReflectionOutput'],
+                                        **_areflection_kwargs
                                     )
                                     
                                     reflection_output = reflection_response.choices[0].message.parsed
@@ -4365,10 +4515,13 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                         {"role": "user", "content": "Now regenerate your response using the reflection you made"}
                                     ]
                                     
+                                    _regen_kwargs = {}
+                                    if temperature is not None:
+                                        _regen_kwargs['temperature'] = temperature
                                     new_response = await self._openai_client.async_client.chat.completions.create(
                                         model=self.llm,
                                         messages=regenerate_messages,
-                                        temperature=temperature
+                                        **_regen_kwargs
                                     )
                                     response_text = new_response.choices[0].message.content
                                     reflection_count += 1
@@ -4863,6 +5016,10 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                     
                     # Handle any tool calls that were accumulated
                     if tool_calls_data:
+                        # Mark where the tool turns begin so the follow-up can
+                        # append exactly the assistant tool-call and tool-result
+                        # messages onto the original request context below.
+                        tool_turn_start = len(self.chat_history)
                         # Add assistant message with tool calls to chat history
                         assistant_message = {"role": "assistant", "content": response_text}
                         if tool_calls_data:
@@ -4956,6 +5113,86 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                         # Flush deferred media follow-ups after all tool replies.
                         for _m in _deferred_media_followups:
                             self._append_to_chat_history(_m)
+
+                        # Ask the model for the answer now that the tools have
+                        # run. Without this the generator ends here: the tool
+                        # results sit in chat history, nothing is yielded, and
+                        # the caller receives an empty stream with no error --
+                        # indistinguishable from a model that had nothing to
+                        # say. The non-streaming path already does this round
+                        # trip, so the two disagreed about whether an answer
+                        # existed at all.
+                        #
+                        # Reuse the original `messages` (system prompt, output
+                        # constraints, memory context and the user turn) rather
+                        # than `self.chat_history`, which omits the system turn
+                        # and would let the follow-up ignore the agent role and
+                        # output format. Append only the tool turns produced by
+                        # this round -- everything added to chat history since
+                        # the completion began.
+                        followup_args = dict(completion_args)
+                        followup_args['messages'] = (
+                            list(messages) + self.chat_history[tool_turn_start:]
+                        )
+                        followup_args['stream'] = True
+                        # No tools on the follow-up: the model has its results
+                        # and should now answer, not call another tool. That
+                        # also bounds the turn to a single round of tools.
+                        followup_args.pop('tools', None)
+                        followup_args.pop('tool_choice', None)
+                        followup_args.pop('parallel_tool_calls', None)
+
+                        # Bracket the follow-up with stream events so consumers
+                        # see request/terminal telemetry for the answer too --
+                        # the STREAM_END above referred only to the tool-call
+                        # round, before any answer existed.
+                        self.stream_emitter.emit(StreamEvent(
+                            type=StreamEventType.REQUEST_START,
+                            timestamp=time_module.perf_counter(),
+                            metadata={
+                                "model": self.llm,
+                                "message_count": len(followup_args['messages']),
+                                "phase": "post_tool_answer",
+                            }
+                        ))
+
+                        followup_text = ""
+                        followup_last_content_time = None
+                        for followup_chunk in self._openai_client.sync_client.chat.completions.create(
+                            **followup_args
+                        ):
+                            if not followup_chunk.choices:
+                                continue
+                            piece = followup_chunk.choices[0].delta.content
+                            if piece:
+                                followup_text += piece
+                                followup_last_content_time = time_module.perf_counter()
+                                yield piece
+                        if followup_last_content_time:
+                            self.stream_emitter.emit(StreamEvent(
+                                type=StreamEventType.LAST_TOKEN,
+                                timestamp=followup_last_content_time
+                            ))
+                        self.stream_emitter.emit(StreamEvent(
+                            type=StreamEventType.STREAM_END,
+                            timestamp=time_module.perf_counter(),
+                            metadata={"response_length": len(followup_text)}
+                        ))
+                        if followup_text:
+                            self._append_to_chat_history(
+                                {"role": "assistant", "content": followup_text}
+                            )
+                        else:
+                            # Tools ran and the model then said nothing. Simply
+                            # returning here is indistinguishable from a model
+                            # that had nothing to say, and that is exactly how
+                            # this reached users: the generator ended having
+                            # yielded not one character, and the caller could
+                            # only report "no output" for a turn whose tools
+                            # had all succeeded. Fail loudly instead.
+                            raise RuntimeError(
+                                "the model called {} tool(s) and then returned "
+                                "no answer".format(len(tool_calls_data)))
                     else:
                         # Add complete response to chat history (text-only response)
                         if response_text:
@@ -5256,18 +5493,111 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
             agent_id=getattr(self, 'name', None),
         )
 
-    def _chat_completion_with_retry(self, messages, temperature=1.0, tools=None, stream=None, reasoning_steps=False, task_name=None, task_description=None, task_id=None, response_format=None, stream_callback=None, emit_events=True):
+    def _get_model_middleware_manager(self):
+        """Return a MiddlewareManager if user model-call hooks are registered.
+
+        Companion to ``_get_tool_middleware_manager`` for the model-call side of
+        the ``hooks/middleware.py`` surface (``before_model``/``after_model``/
+        ``wrap_model_call``). Reuses the same lazily-built manager and returns
+        ``None`` when no model hooks are present, preserving the zero-overhead
+        fast path.
+        """
+        hooks = getattr(self, '_hooks', None)
+        if not hooks:
+            return None
+        manager = getattr(self, '_middleware_manager', None)
+        if manager is None:
+            from ..hooks import MiddlewareManager
+            manager = MiddlewareManager(hooks)
+            self._middleware_manager = manager
+        return manager if manager.has_model_hooks else None
+
+    @staticmethod
+    def _unwrap_model_response(response):
+        """Unwrap a middleware ModelResponse back to the agent's return shape.
+
+        Preserves ``after_model``/``wrap_model_call`` mutations: if a hook
+        rewrote ``response.content``, that string wins. The original SDK object
+        stashed in ``extra["raw"]`` is only returned when the hook left content
+        untouched (so non-string provider payloads pass through unchanged on the
+        no-transform fast path).
+        """
+        from ..hooks import ModelResponse
+        if not isinstance(response, ModelResponse):
+            return response
+        raw = response.extra.get("raw")
+        if isinstance(raw, str):
+            # Content was derived from a string raw; hook edits live on content.
+            return response.content
+        # Non-string raw: return raw only if content still matches the value we
+        # synthesized from it (i.e. hook didn't rewrite content).
+        synthesized = raw if isinstance(raw, str) else (raw or "")
+        if response.content == synthesized:
+            return raw
+        return response.content
+
+    def _chat_completion_with_retry(self, messages, temperature=None, tools=None, stream=None, reasoning_steps=False, task_name=None, task_description=None, task_id=None, response_format=None, stream_callback=None, emit_events=True, cancel_token=None):
         """
         Wrapper for _execute_unified_chat_completion that adds jittered exponential backoff retry logic.
         
         This method wraps the unified chat completion call and adds retry capability for 
         transient failures like rate limits, network errors, and service outages.
         """
+        # Route through user-supplied model middleware (Agent(hooks=[...])) when
+        # before_model/after_model/wrap_model_call hooks are registered. The
+        # retry/backoff logic below becomes the middleware chain's final handler.
+        manager = self._get_model_middleware_manager()
+        if manager is not None:
+            from ..hooks import ModelRequest, ModelResponse, InvocationContext
+
+            def _model_fn(req):
+                # Honor before_model/wrap_model_call mutations by threading the
+                # (possibly rewritten) request fields into the retry core rather
+                # than the outer captured values.
+                effective_temperature = req.temperature if req.temperature is not None else temperature
+                effective_tools = req.tools if req.tools is not None else tools
+                result = self._chat_completion_with_retry_core(
+                    req.messages, effective_temperature, effective_tools, stream,
+                    reasoning_steps, task_name, task_description, task_id,
+                    response_format, stream_callback=stream_callback,
+                    emit_events=emit_events, cancel_token=cancel_token,
+                )
+                return ModelResponse(
+                    content=result if isinstance(result, str) else (result or ""),
+                    model=str(getattr(self, 'llm', '') or ''),
+                    extra={"raw": result},
+                )
+
+            request = ModelRequest(
+                messages=messages,
+                model=str(getattr(self, 'llm', '') or ''),
+                temperature=temperature if temperature is not None else 1.0,
+                tools=tools,
+                context=InvocationContext(
+                    agent_id=self.name,
+                    run_id=getattr(self, '_current_run_id', 'unknown'),
+                    session_id=getattr(self, '_session_id', None) or 'default',
+                    model_name=str(getattr(self, 'llm', '') or ''),
+                ),
+            )
+            response = manager.execute_model_call(request, _model_fn)
+            return self._unwrap_model_response(response)
+
+        return self._chat_completion_with_retry_core(
+            messages, temperature, tools, stream, reasoning_steps,
+            task_name, task_description, task_id, response_format,
+            stream_callback=stream_callback, emit_events=emit_events,
+            cancel_token=cancel_token,
+        )
+
+    def _chat_completion_with_retry_core(self, messages, temperature=None, tools=None, stream=None, reasoning_steps=False, task_name=None, task_description=None, task_id=None, response_format=None, stream_callback=None, emit_events=True, cancel_token=None):
+        """Retry/backoff core for chat completion (middleware-agnostic)."""
         retry_config = getattr(self, '_retry_config', None)
         if not retry_config:
             return self._execute_unified_chat_completion(messages, temperature, tools, stream, reasoning_steps, 
                                        task_name, task_description, task_id, response_format,
-                                       stream_callback=stream_callback, emit_events=emit_events)
+                                       stream_callback=stream_callback, emit_events=emit_events,
+                                       cancel_token=cancel_token)
         
         from .retry_utils import jittered_backoff
         from ..hooks import HookEvent, OnRetryInput
@@ -5280,7 +5610,8 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                 # Call the underlying unified chat completion directly to avoid infinite recursion
                 return self._execute_unified_chat_completion(messages, temperature, tools, stream, reasoning_steps, 
                                            task_name, task_description, task_id, response_format,
-                                           stream_callback=stream_callback, emit_events=emit_events)
+                                           stream_callback=stream_callback, emit_events=emit_events,
+                                           cancel_token=cancel_token)
             
             except Exception as e:
                 from ..errors import LLMError
@@ -5343,13 +5674,69 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
         # This should never be reached, but just in case
         raise RuntimeError("Retry loop completed without returning or raising an exception")
 
-    async def _achat_completion_with_retry(self, messages, temperature=1.0, tools=None, stream=None, reasoning_steps=False, task_name=None, task_description=None, task_id=None, response_format=None, stream_callback=None, emit_events=True):
+    async def _achat_completion_with_retry(self, messages, temperature=None, tools=None, stream=None, reasoning_steps=False, task_name=None, task_description=None, task_id=None, response_format=None, stream_callback=None, emit_events=True):
         """
         Async wrapper for _execute_unified_achat_completion that adds jittered exponential backoff retry logic.
         
         This method wraps the async chat completion call and adds retry capability for 
         transient failures like rate limits, network errors, and service outages.
         """
+        # Route through user-supplied model middleware (Agent(hooks=[...])) when
+        # before_model/after_model/wrap_model_call hooks are registered, mirroring
+        # the sync path so achat() honors the same hooks. The middleware chain is
+        # synchronous; run it in an executor and bridge back to the async retry
+        # core via the running loop so we never block or nest event loops.
+        manager = self._get_model_middleware_manager()
+        if manager is not None:
+            import asyncio
+            from ..hooks import ModelRequest, ModelResponse, InvocationContext
+
+            loop = asyncio.get_running_loop()
+
+            def _model_fn(req):
+                effective_temperature = req.temperature if req.temperature is not None else temperature
+                effective_tools = req.tools if req.tools is not None else tools
+                fut = asyncio.run_coroutine_threadsafe(
+                    self._achat_completion_with_retry_core(
+                        req.messages, effective_temperature, effective_tools, stream,
+                        reasoning_steps, task_name, task_description, task_id,
+                        response_format, stream_callback=stream_callback,
+                        emit_events=emit_events,
+                    ),
+                    loop,
+                )
+                result = fut.result()
+                return ModelResponse(
+                    content=result if isinstance(result, str) else (result or ""),
+                    model=str(getattr(self, 'llm', '') or ''),
+                    extra={"raw": result},
+                )
+
+            request = ModelRequest(
+                messages=messages,
+                model=str(getattr(self, 'llm', '') or ''),
+                temperature=temperature if temperature is not None else 1.0,
+                tools=tools,
+                context=InvocationContext(
+                    agent_id=self.name,
+                    run_id=getattr(self, '_current_run_id', 'unknown'),
+                    session_id=getattr(self, '_session_id', None) or 'default',
+                    model_name=str(getattr(self, 'llm', '') or ''),
+                ),
+            )
+            response = await loop.run_in_executor(
+                None, lambda: manager.execute_model_call(request, _model_fn)
+            )
+            return self._unwrap_model_response(response)
+
+        return await self._achat_completion_with_retry_core(
+            messages, temperature, tools, stream, reasoning_steps,
+            task_name, task_description, task_id, response_format,
+            stream_callback=stream_callback, emit_events=emit_events,
+        )
+
+    async def _achat_completion_with_retry_core(self, messages, temperature=None, tools=None, stream=None, reasoning_steps=False, task_name=None, task_description=None, task_id=None, response_format=None, stream_callback=None, emit_events=True):
+        """Async retry/backoff core for chat completion (middleware-agnostic)."""
         retry_config = getattr(self, '_retry_config', None)
         if not retry_config:
             return await self._execute_unified_achat_completion(

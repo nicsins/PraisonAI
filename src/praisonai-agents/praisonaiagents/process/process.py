@@ -801,9 +801,9 @@ Subtask: {st.name}
                             decision_str = None
                             if current_task.result:
                                 if current_task.result.pydantic and hasattr(current_task.result.pydantic, "decision"):
-                                    decision_str = current_task.result.pydantic.decision.lower()
+                                    decision_str = current_task.result.pydantic.decision.lower().strip()
                                 elif current_task.result.raw:
-                                    decision_str = current_task.result.raw.lower()
+                                    decision_str = current_task.result.raw.lower().strip()
                             
                             # For loop tasks, use "done" to follow condition path
                             if current_task.task_type == "loop" and all(t.status == "completed" for t in subtasks):
@@ -894,9 +894,9 @@ Subtask: {st.name}
             if current_task and current_task.result:
                 if current_task.task_type in ["decision", "loop"]:
                     # Get decision from pydantic or raw response
-                    decision_str = current_task.result.raw.lower()
+                    decision_str = current_task.result.raw.lower().strip()
                     if current_task.result.pydantic and hasattr(current_task.result.pydantic, "decision"):
-                        decision_str = current_task.result.pydantic.decision.lower()
+                        decision_str = current_task.result.pydantic.decision.lower().strip()
 
                     # Check if task has conditions and next_tasks
                     if current_task.condition:
@@ -1022,7 +1022,13 @@ Workflow Finished: {self.workflow_finished} # ADDED: Workflow Finished Status
                     self.tasks[dep.id].status == "failed"
                     for dep in task.context if hasattr(dep, 'id') and dep.id in self.tasks
                 )
-                if deps_failed:
+                # Honor per-task graceful-degradation flags: a task that opted
+                # into skip_on_failure/on_error="continue" still runs even when
+                # an upstream dependency failed.
+                if deps_failed and not (
+                    getattr(task, 'skip_on_failure', False)
+                    or getattr(task, 'on_error', 'stop') == 'continue'
+                ):
                     task.status = "failed"
                     continue
             if task.status != "completed":
@@ -1408,9 +1414,9 @@ Subtask: {st.name}
                             decision_str = None
                             if current_task.result:
                                 if current_task.result.pydantic and hasattr(current_task.result.pydantic, "decision"):
-                                    decision_str = current_task.result.pydantic.decision.lower()
+                                    decision_str = current_task.result.pydantic.decision.lower().strip()
                                 elif current_task.result.raw:
-                                    decision_str = current_task.result.raw.lower()
+                                    decision_str = current_task.result.raw.lower().strip()
                             
                             # For loop tasks, use "done" to follow condition path
                             if current_task.task_type == "loop" and all(t.status == "completed" for t in subtasks):
@@ -1499,9 +1505,9 @@ Subtask: {st.name}
             if current_task and current_task.result:
                 if current_task.task_type in ["decision", "loop"]:
                     # Get decision from pydantic or raw response
-                    decision_str = current_task.result.raw.lower()
+                    decision_str = current_task.result.raw.lower().strip()
                     if current_task.result.pydantic and hasattr(current_task.result.pydantic, "decision"):
-                        decision_str = current_task.result.pydantic.decision.lower()
+                        decision_str = current_task.result.pydantic.decision.lower().strip()
 
                     # Check if task has conditions and next_tasks
                     if current_task.condition:
@@ -1627,7 +1633,13 @@ Workflow Finished: {self.workflow_finished} # ADDED: Workflow Finished Status
                     self.tasks[dep.id].status == "failed"
                     for dep in task.context if hasattr(dep, 'id') and dep.id in self.tasks
                 )
-                if deps_failed:
+                # Honor per-task graceful-degradation flags: a task that opted
+                # into skip_on_failure/on_error="continue" still runs even when
+                # an upstream dependency failed.
+                if deps_failed and not (
+                    getattr(task, 'skip_on_failure', False)
+                    or getattr(task, 'on_error', 'stop') == 'continue'
+                ):
                     task.status = "failed"
                     continue
             if task.status != "completed":

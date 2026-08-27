@@ -103,13 +103,18 @@ class TestG2SessionSaveAgentChatHistories:
         from praisonaiagents.session import Session
         import inspect
         
-        # Verify the method exists and has the G-2 fix comment
         source = inspect.getsource(Session._save_agent_chat_histories)
-        
-        # Check that the G-2 fix is present
-        assert "G-2 FIX" in source, "G-2 fix should be documented in the method"
-        assert "SessionStore" in source, "Method should reference SessionStore"
-        assert "get_default_session_store" in source, "Method should try to get SessionStore"
+        writer = inspect.getsource(Session._store_agent_history)
+
+        # Routed to the SessionStore, not Memory...
+        assert "_get_session_store" in source, "Method should resolve the SessionStore"
+        assert "update_session_metadata" in writer, "Method should write via metadata"
+        # ...and into the *parent* session's own record, never into a separate
+        # top-level session id (which collides with real user sessions).
+        assert "AGENT_HISTORY_KEY" in writer, "History belongs on the parent record"
+        assert 'f"{self.session_id}_{agent_key}"' not in source + writer, (
+            "Sub-agent history must not claim its own top-level session id"
+        )
 
     def test_save_agent_histories_behavioral(self):
         """Issue 3 FIX: Behavioral test - verify actual routing to SessionStore."""
@@ -308,9 +313,13 @@ class TestPersistAutoSaveNoDuplicates:
 
     def test_persist_then_auto_save_does_not_duplicate(self, tmp_path, monkeypatch):
         """memory=history + auto_save: one turn should persist exactly two messages."""
-        monkeypatch.setenv("PRAISONAI_SESSIONS_DIR", str(tmp_path))
-        import praisonaiagents.session as session_mod
-        session_mod._default_store = None
+        # PRAISONAI_HOME is the env var the paths helper actually reads, and
+        # the singleton lives on praisonaiagents.session.store -- setting a
+        # non-existent var on the package module isolated nothing, so this test
+        # used to read and write the developer's real ~/.praisonai/sessions.
+        monkeypatch.setenv("PRAISONAI_HOME", str(tmp_path))
+        import praisonaiagents.session.store as store_module
+        monkeypatch.setattr(store_module, "_default_store", None, raising=False)
 
         from praisonaiagents import Agent
         from praisonaiagents.session import get_default_session_store
@@ -338,9 +347,13 @@ class TestSessionSaveStateNoDuplicates:
     """Repeated save_state() must not append duplicate chat history."""
 
     def test_repeated_save_agent_histories_is_idempotent(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("PRAISONAI_SESSIONS_DIR", str(tmp_path))
-        import praisonaiagents.session as session_mod
-        session_mod._default_store = None
+        # PRAISONAI_HOME is the env var the paths helper actually reads, and
+        # the singleton lives on praisonaiagents.session.store -- setting a
+        # non-existent var on the package module isolated nothing, so this test
+        # used to read and write the developer's real ~/.praisonai/sessions.
+        monkeypatch.setenv("PRAISONAI_HOME", str(tmp_path))
+        import praisonaiagents.session.store as store_module
+        monkeypatch.setattr(store_module, "_default_store", None, raising=False)
 
         from unittest.mock import MagicMock
         from praisonaiagents.session import Session, get_default_session_store
@@ -356,8 +369,8 @@ class TestSessionSaveStateNoDuplicates:
         session._save_agent_chat_histories()
         session._save_agent_chat_histories()
 
-        history = get_default_session_store().get_chat_history("sess1_agent1")
-        assert len(history) == 2
+        metadata = get_default_session_store().get_session("sess1").metadata
+        assert len(metadata["agent_histories"]["agent1"]) == 2
 
 
 class TestG3PerTurnPersist:
@@ -391,3 +404,34 @@ class TestG3PerTurnPersist:
         
         # Verify SessionStore was used
         mock_store.add_user_message.assert_called_once_with("test_session", "Hello")
+
+
+class TestStoreAgentHistoryFailureReporting:
+    """Regression #4165: _store_agent_history must report failure honestly.
+
+    When the verify loop exhausts, nothing was persisted. Returning True made
+    the caller's 'history was lost' branch unreachable.
+    """
+
+    def test_store_agent_history_reports_failure_when_the_write_never_lands(self):
+        from types import SimpleNamespace
+        from praisonaiagents.session import Session
+
+        class _StoreThatAcceptsWritesAndDropsThem:
+            """update_session_metadata says yes but persists nothing."""
+
+            def update_session_metadata(self, session_id, **metadata):
+                return True
+
+            def get_session(self, session_id):
+                return SimpleNamespace(metadata={})
+
+        store = _StoreThatAcceptsWritesAndDropsThem()
+        session = Session(session_id="parent")
+
+        result = session._store_agent_history(
+            store, "helper", [{"role": "user", "content": "hi"}]
+        )
+
+        assert result is False
+        assert store.get_session("parent").metadata.get("agent_histories", {}) == {}

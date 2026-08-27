@@ -2,25 +2,31 @@
 Session persistence module for PraisonAI Agents.
 
 Provides automatic session persistence with zero configuration.
-When a session_id is provided to an Agent, conversation history
+When a session_id is configured on an Agent, conversation history
 is automatically persisted to disk and restored on subsequent runs.
 
+The session_id is set through the Agent's memory configuration; Agent itself
+has no top-level session_id parameter.
+
 Usage:
-    from praisonaiagents import Agent
-    
+    from praisonaiagents import Agent, MemoryConfig
+
     # With session persistence (auto-enabled)
     agent = Agent(
         name="Assistant",
-        session_id="my-session-123"
+        memory=MemoryConfig(session_id="my-session-123"),
     )
     agent.start("Hello")
-    
+
     # Later, new process - history is restored
     agent = Agent(
-        name="Assistant", 
-        session_id="my-session-123"
+        name="Assistant",
+        memory=MemoryConfig(session_id="my-session-123"),
     )
     agent.start("What did I say before?")  # Remembers!
+
+    # The plain-dict spelling is equivalent:
+    #   Agent(name="Assistant", memory={"session_id": "my-session-123"})
 
 Default storage: ~/.praisonai/sessions/{session_id}.json
 """
@@ -97,6 +103,16 @@ def __getattr__(name: str):
         from .protocols import SessionMirrorProtocol
         _module_cache[name] = SessionMirrorProtocol
         return SessionMirrorProtocol
+
+    if name == "PortableSessionStoreProtocol":
+        from .protocols import PortableSessionStoreProtocol
+        _module_cache[name] = PortableSessionStoreProtocol
+        return PortableSessionStoreProtocol
+
+    if name == "ImportReport":
+        from .protocols import ImportReport
+        _module_cache[name] = ImportReport
+        return ImportReport
 
     if name == "SessionHit":
         from .protocols import SessionHit
@@ -191,6 +207,8 @@ __all__ = [
     "SessionStoreProtocol",
     "SearchableSessionStoreProtocol",
     "SessionMirrorProtocol",
+    "PortableSessionStoreProtocol",
+    "ImportReport",
     "SessionHit",
     "SessionSummary",
     "HierarchicalSessionStore",

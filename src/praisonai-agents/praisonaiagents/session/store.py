@@ -32,8 +32,42 @@ logger = get_logger(__name__)
 # Module-level sentinel to track if we've warned about degraded locking
 _WARNED_NO_FCNTL = False
 
-# Default session directory (uses centralized paths - DRY)
-DEFAULT_SESSION_DIR = str(get_sessions_dir())
+# Default session directory (uses centralized paths - DRY).
+#
+# Deliberately NOT a module constant. Evaluating ``get_sessions_dir()`` at
+# import time froze the store root to whatever ``PRAISONAI_HOME`` resolved to
+# during the first import of this module, so any later override -- a container
+# exporting ``PRAISONAI_HOME`` after the package was imported, a test
+# monkeypatching ``get_sessions_dir`` -- was silently ignored and reads/writes
+# went to the wrong store. It is resolved live instead.
+#
+# ``DEFAULT_SESSION_DIR`` remains readable as a module attribute (resolved at
+# access time via the PEP 562 ``__getattr__`` below) and remains assignable as
+# an explicit override, so existing importers and tests keep working.
+
+
+def _resolve_default_session_dir() -> str:
+    """Resolve the default session directory *now*.
+
+    An explicit ``praisonaiagents.session.store.DEFAULT_SESSION_DIR = ...``
+    assignment still wins (a documented test/embedding hook); with no
+    assignment the value is resolved live from :func:`get_sessions_dir`.
+    """
+    override = globals().get("DEFAULT_SESSION_DIR")
+    if override:
+        return str(override)
+    return str(get_sessions_dir())
+
+
+def __getattr__(name: str):
+    """Module-level attribute hook (PEP 562).
+
+    Keeps ``from praisonaiagents.session.store import DEFAULT_SESSION_DIR``
+    working, but resolves the value at access time instead of at import time.
+    """
+    if name == "DEFAULT_SESSION_DIR":
+        return _resolve_default_session_dir()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 # Default limits
 DEFAULT_MAX_MESSAGES = 100
@@ -590,7 +624,7 @@ class DefaultSessionStore:
                 local write always happens first and a mirror outage never
                 blocks or fails the turn). Left ``None`` there is zero overhead.
         """
-        self.session_dir = session_dir or DEFAULT_SESSION_DIR
+        self.session_dir = session_dir or _resolve_default_session_dir()
         self.max_messages = max_messages
         self.lock_timeout = lock_timeout
 
@@ -2114,6 +2148,219 @@ class DefaultSessionStore:
         """Check if a session exists."""
         filepath = self._get_session_path(session_id)
         return os.path.exists(filepath)
+
+    # ── Portable export / import / migration (Issue #4267) ────────────────
+    #
+    # Store-agnostic backup/restore/migration for the gateway's own store.
+    # The payload is a simple, versioned envelope carrying the same portable
+    # session dicts that ``SessionData.to_dict`` already produces, so it
+    # round-trips through ``from_dict`` and is symmetric across the built-in
+    # stores (``SqliteSessionStore`` inherits this behaviour unchanged).
+
+    # Bumped only on a breaking payload-shape change; import tolerates older/
+    # unversioned payloads (best-effort) rather than rejecting them.
+    PORTABLE_VERSION = 1
+
+    # Live routing / activity fields cleared on import (unless opted out) so a
+    # restored record is inert until re-bound and cannot masquerade as an active
+    # connection. Kept intentionally small: transcript + identity survive; only
+    # the gateway's live wiring is reset.
+    _LIVE_FIELDS = ("gateway_session_id", "agent_id")
+
+    def export_session(
+        self, session_id: str, *, include_lineage: bool = True
+    ) -> Dict[str, Any]:
+        """Export a single session to a portable, versioned payload.
+
+        Reuses the existing ``SessionData.to_dict`` shape (so the payload
+        round-trips through ``import_sessions``). When ``include_lineage`` is
+        set, any compacted/rotated ancestors sharing this session's lineage id
+        are included so the conversation restores as one logical session.
+        """
+        session = self._read_session_fresh(session_id)
+        if not self.session_exists(session_id):
+            return {"version": self.PORTABLE_VERSION, "sessions": []}
+
+        sessions = [session.to_dict()]
+        if include_lineage:
+            for extra in self._collect_lineage(session, exclude=session_id):
+                sessions.append(extra)
+        return {"version": self.PORTABLE_VERSION, "sessions": sessions}
+
+    def export_all(self) -> Dict[str, Any]:
+        """Export every stored session to a portable, versioned payload."""
+        sessions: List[Dict[str, Any]] = []
+        try:
+            filenames = os.listdir(self.session_dir)
+        except (IOError, OSError):
+            filenames = []
+        for filename in filenames:
+            if not filename.endswith(".json"):
+                continue
+            filepath = os.path.join(self.session_dir, filename)
+            try:
+                with open(filepath, "r", encoding="utf-8") as f:
+                    sessions.append(json.load(f))
+            except (json.JSONDecodeError, IOError, OSError):
+                continue
+        return {"version": self.PORTABLE_VERSION, "sessions": sessions}
+
+    def _collect_lineage(
+        self, session: SessionData, *, exclude: str
+    ) -> List[Dict[str, Any]]:
+        """Return other on-disk sessions sharing this session's lineage id.
+
+        Uses the same *chain* identifiers as recall's lineage dedup
+        (``lineage_id`` / ``root_session_id`` / ``thread_id``) so a compacted /
+        rotated continuation exports alongside its logical session. Returns the
+        raw session dicts (already portable). Empty when no lineage is known.
+        """
+        lineage = self._lineage_key(session.to_dict())
+        if not lineage:
+            return []
+        out: List[Dict[str, Any]] = []
+        try:
+            filenames = os.listdir(self.session_dir)
+        except (IOError, OSError):
+            return []
+        for filename in filenames:
+            if not filename.endswith(".json"):
+                continue
+            filepath = os.path.join(self.session_dir, filename)
+            try:
+                with open(filepath, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except (json.JSONDecodeError, IOError, OSError):
+                continue
+            if data.get("session_id") == exclude:
+                continue
+            if self._lineage_key(data) == lineage:
+                out.append(data)
+        return out
+
+    def _save_imported_session(self, session: SessionData) -> bool:
+        """Persist a restored session verbatim (no retention/window applied).
+
+        Mirrors ``_save_session`` (timestamp + atomic, file-locked write) but
+        deliberately skips ``_enforce_window`` so importing a valid larger
+        export is not truncated/compacted by the destination's own retention
+        settings before it lands on disk.
+        """
+        filepath = self._get_session_path(session.session_id)
+        session.updated_at = datetime.now(timezone.utc).isoformat()
+        with FileLock(filepath, self.lock_timeout):
+            if not self._atomic_write_json(filepath, session.to_dict()):
+                logger.error(f"Failed to save imported session {session.session_id}")
+                return False
+            return True
+
+    def import_sessions(
+        self,
+        payload: Dict[str, Any],
+        *,
+        max_sessions: int = 10_000,
+        reset_live_fields: bool = True,
+        overwrite: bool = False,
+    ) -> "ImportReport":
+        """Import sessions from an exported payload (hardened).
+
+        Validates the payload shape, caps ingest at ``max_sessions``, skips
+        malformed / duplicate records (reported, not silently dropped) and —
+        unless opted out — resets live routing/activity fields so restored
+        state is inert until re-bound.
+        """
+        from .protocols import ImportReport
+
+        report = ImportReport(version=self.PORTABLE_VERSION)
+        if not isinstance(payload, dict):
+            return report
+        # Reject payloads from a newer, breaking export format: a future shape
+        # could otherwise slip through ``from_dict`` with silently defaulted
+        # fields and corrupt restored state. Older/unversioned payloads are
+        # still accepted (best-effort) since v1 is the compatible baseline.
+        payload_version = payload.get("version")
+        if isinstance(payload_version, int) and payload_version > self.PORTABLE_VERSION:
+            report.skipped.append(
+                {
+                    "session_id": "",
+                    "reason": (
+                        f"unsupported payload version {payload_version} "
+                        f"(supported <= {self.PORTABLE_VERSION})"
+                    ),
+                }
+            )
+            return report
+        raw_sessions = payload.get("sessions")
+        if not isinstance(raw_sessions, list):
+            return report
+
+        seen_ids: set = set()
+        for index, raw in enumerate(raw_sessions):
+            if report.imported >= max_sessions:
+                report.skipped.append(
+                    {"session_id": "", "reason": f"max_sessions={max_sessions} cap reached"}
+                )
+                # Everything after the cap is skipped for the same reason; stop.
+                break
+            if not isinstance(raw, dict):
+                report.skipped.append(
+                    {"session_id": "", "reason": f"malformed record at index {index}"}
+                )
+                continue
+            session_id = str(raw.get("session_id") or "").strip()
+            if not session_id:
+                report.skipped.append(
+                    {"session_id": "", "reason": f"missing session_id at index {index}"}
+                )
+                continue
+            # Cycle / duplicate guard: the same id appearing twice in one payload
+            # is ingested once (first wins) so a self-referential lineage export
+            # cannot double-write.
+            if session_id in seen_ids:
+                report.skipped.append(
+                    {"session_id": session_id, "reason": "duplicate in payload"}
+                )
+                continue
+            seen_ids.add(session_id)
+
+            if not overwrite and self.session_exists(session_id):
+                report.skipped.append(
+                    {"session_id": session_id, "reason": "already exists (use overwrite)"}
+                )
+                continue
+
+            try:
+                data = dict(raw)
+                if reset_live_fields:
+                    for field_name in self._LIVE_FIELDS:
+                        data.pop(field_name, None)
+                    meta = data.get("metadata")
+                    if isinstance(meta, dict):
+                        # Copy before mutating so the caller's payload (and any
+                        # later import with reset_live_fields=False) keeps its
+                        # original live fields intact (data = dict(raw) is shallow).
+                        meta = dict(meta)
+                        for field_name in self._LIVE_FIELDS:
+                            meta.pop(field_name, None)
+                        data["metadata"] = meta
+                session = SessionData.from_dict(data)
+                session.session_id = session_id
+                # Persist the imported record verbatim: an import is a restore,
+                # so the destination's retention/active_window must not truncate
+                # or compact a valid larger export before it lands on disk.
+                if not self._save_imported_session(session):
+                    report.skipped.append(
+                        {"session_id": session_id, "reason": "write failed"}
+                    )
+                    continue
+                with self._lock:
+                    self._cache[session_id] = session
+                report.imported += 1
+            except Exception as e:  # pragma: no cover - defensive; one bad record
+                report.skipped.append(
+                    {"session_id": session_id, "reason": f"import error: {e}"}
+                )
+        return report
     
     def invalidate_cache(self, session_id: Optional[str] = None) -> None:
         """Invalidate cache for a session or all sessions."""
@@ -2226,6 +2473,18 @@ class DefaultSessionStore:
 _default_store: Optional[DefaultSessionStore] = None
 _store_lock = threading.Lock()
 
+# Attribute stamped on any store this module auto-created, recording the session
+# directory it was built for. A store injected by a caller
+# (``store._default_store = my_store`` -- a widely used test/embedding hook)
+# never carries this marker and so is honoured verbatim, while one we created
+# ourselves is rebuilt when the resolved session directory changes.
+#
+# The marker lives on the *instance* rather than a single module-level identity
+# pointer so a partial teardown that restores ``_default_store`` without also
+# restoring an out-of-band tracking variable cannot misclassify a previously
+# auto-created store as caller-injected (and pin it to a stale directory).
+_AUTOCREATED_DIR_ATTR = "_praison_autocreated_session_dir"
+
 def get_default_session_store() -> DefaultSessionStore:
     """Get the global default session store instance.
 
@@ -2237,31 +2496,63 @@ def get_default_session_store() -> DefaultSessionStore:
     - ``PRAISONAI_SESSION_ACTIVE_WINDOW``: int, recent turns kept live
     """
     global _default_store
-    
-    if _default_store is None:
-        with _store_lock:
-            if _default_store is None:
-                retention = os.environ.get("PRAISONAI_SESSION_RETENTION")
-                active_window_env = os.environ.get("PRAISONAI_SESSION_ACTIVE_WINDOW")
-                active_window: Optional[int] = None
-                if active_window_env:
-                    try:
-                        active_window = int(active_window_env)
-                    except ValueError:
-                        logger.warning(
-                            "Invalid PRAISONAI_SESSION_ACTIVE_WINDOW=%r; ignoring",
-                            active_window_env,
-                        )
-                try:
-                    _default_store = DefaultSessionStore(
-                        retention=retention,
-                        active_window=active_window,
-                    )
-                except ValueError:
-                    logger.warning(
-                        "Invalid PRAISONAI_SESSION_RETENTION=%r; using default",
-                        retention,
-                    )
-                    _default_store = DefaultSessionStore(active_window=active_window)
-    
+
+    # The singleton is keyed on the *currently* resolved session directory. A
+    # process that changes PRAISONAI_HOME (or a test that repoints
+    # get_sessions_dir) must not keep reading and deleting sessions in the
+    # directory that happened to be active when this module was first imported.
+    resolved_dir = _resolve_default_session_dir()
+
+    def _usable(candidate: Optional["DefaultSessionStore"]) -> bool:
+        if candidate is None:
+            return False
+        # A store we auto-created carries a marker recording the directory it
+        # was built for; only rebuild when that directory no longer matches.
+        # Any store without the marker was injected by a caller -- honour it
+        # verbatim (never second-guess an explicit ``_default_store = ...``).
+        autocreated_dir = getattr(candidate, _AUTOCREATED_DIR_ATTR, None)
+        if autocreated_dir is None:
+            return True
+        return autocreated_dir == resolved_dir
+
+    store = _default_store
+    if _usable(store):
+        return store
+
+    with _store_lock:
+        store = _default_store
+        if _usable(store):
+            return store
+
+        retention = os.environ.get("PRAISONAI_SESSION_RETENTION")
+        active_window_env = os.environ.get("PRAISONAI_SESSION_ACTIVE_WINDOW")
+        active_window: Optional[int] = None
+        if active_window_env:
+            try:
+                active_window = int(active_window_env)
+            except ValueError:
+                logger.warning(
+                    "Invalid PRAISONAI_SESSION_ACTIVE_WINDOW=%r; ignoring",
+                    active_window_env,
+                )
+        try:
+            _default_store = DefaultSessionStore(
+                session_dir=resolved_dir,
+                retention=retention,
+                active_window=active_window,
+            )
+        except ValueError:
+            logger.warning(
+                "Invalid PRAISONAI_SESSION_RETENTION=%r; using default",
+                retention,
+            )
+            _default_store = DefaultSessionStore(
+                session_dir=resolved_dir,
+                active_window=active_window,
+            )
+        # Stamp the auto-created store with the directory it was built for so a
+        # later resolved-dir change rebuilds it, while a caller-injected store
+        # (which never carries this marker) is always honoured verbatim.
+        setattr(_default_store, _AUTOCREATED_DIR_ATTR, resolved_dir)
+
     return _default_store

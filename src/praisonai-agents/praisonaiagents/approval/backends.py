@@ -80,13 +80,44 @@ class AutoApproveBackend:
 class ConsoleBackend:
     """Interactive Rich terminal prompt.  Default for CLI usage."""
 
-    def _prompt_user(self, request: ApprovalRequest):
-        """Show Rich panel and ask once/session/always/no.
+    @staticmethod
+    def _render_diff_markup(diff: str, max_lines: int = 40) -> str:
+        """Return Rich-markup for a unified *diff* with coloured +/- hunks.
 
-        Returns a ``(approved, scope, scope_pattern)`` tuple where ``scope`` is
-        one of ``"once"`` / ``"session"`` / ``"always"`` and ``scope_pattern``
-        is the reusable target to persist for ``always`` (``None`` otherwise).
-        A denial returns ``(False, "once", None)``.
+        Escapes any literal ``[`` in the diff so raw file content can never be
+        interpreted as Rich markup. Added lines are green, removed lines red,
+        hunk headers cyan and context lines dimmed. Bounded to ``max_lines``.
+        """
+        from rich.markup import escape
+
+        lines = diff.splitlines()
+        rendered = []
+        for i, line in enumerate(lines):
+            if i >= max_lines:
+                rendered.append("[dim]... (diff truncated)[/dim]")
+                break
+            safe = escape(line)
+            if line.startswith("+++") or line.startswith("---"):
+                rendered.append(f"[bold]{safe}[/bold]")
+            elif line.startswith("@@"):
+                rendered.append(f"[cyan]{safe}[/cyan]")
+            elif line.startswith("+"):
+                rendered.append(f"[green]{safe}[/green]")
+            elif line.startswith("-"):
+                rendered.append(f"[red]{safe}[/red]")
+            else:
+                rendered.append(f"[dim]{safe}[/dim]")
+        return "\n".join(rendered) + "\n"
+
+    def _prompt_user(self, request: ApprovalRequest):
+        """Show Rich panel and ask once/session/always/no/deny-with-guidance.
+
+        Returns a ``(approved, scope, scope_pattern, feedback)`` tuple where
+        ``scope`` is one of ``"once"`` / ``"session"`` / ``"always"`` and
+        ``scope_pattern`` is the reusable target to persist for ``always``
+        (``None`` otherwise). ``feedback`` carries optional free-text guidance
+        captured by the "deny & redirect" choice (``None`` otherwise).
+        A plain denial returns ``(False, "once", None, None)``.
         """
         Console = _get_rich_console()
         Panel = _get_rich_panel()
@@ -106,12 +137,22 @@ class ConsoleBackend:
         tool_info += f"[bold]Risk Level:[/] [{risk_color}]{request.risk_level.upper()}[/{risk_color}]\n"
         if request.agent_name:
             tool_info += f"[bold]Agent:[/] {request.agent_name}\n"
-        tool_info += "[bold]Arguments:[/]\n"
-        for key, value in request.arguments.items():
-            str_value = str(value)
-            if len(str_value) > 100:
-                str_value = str_value[:97] + "..."
-            tool_info += f"  {key}: {str_value}\n"
+
+        # For file-mutating tools a rendered unified diff is attached to the
+        # request context so the reviewer sees the actual change (path plus
+        # +/- hunks) instead of a truncated argument dump. Fall back to the
+        # argument summary when no diff is present (non-edit tools).
+        diff = (request.context or {}).get("diff")
+        if diff:
+            tool_info += "[bold]Diff:[/]\n"
+            tool_info += self._render_diff_markup(diff)
+        else:
+            tool_info += "[bold]Arguments:[/]\n"
+            for key, value in request.arguments.items():
+                str_value = str(value)
+                if len(str_value) > 100:
+                    str_value = str_value[:97] + "..."
+                tool_info += f"  {key}: {str_value}\n"
 
         console.print(Panel(
             tool_info.strip(),
@@ -126,28 +167,35 @@ class ConsoleBackend:
         try:
             console.print(
                 f"[{risk_color}]Allow {request.tool_name}?[/{risk_color}]  "
-                f"[o] once   [s] this session   [a] {always_label}   [n] no"
+                f"[o] once   [s] this session   [a] {always_label}   "
+                f"[n] no   [d] deny & redirect"
             )
             choice = Prompt.ask(
                 "Choice",
-                choices=["o", "s", "a", "n"],
+                choices=["o", "s", "a", "n", "d"],
                 default="n",
             )
         except (KeyboardInterrupt, EOFError):
-            return (False, "once", None)
+            return (False, "once", None, None)
 
         if choice == "n":
-            return (False, "once", None)
+            return (False, "once", None, None)
+        if choice == "d":
+            try:
+                feedback = Prompt.ask("What should the agent do instead?").strip()
+            except (KeyboardInterrupt, EOFError):
+                feedback = ""
+            return (False, "once", None, feedback or None)
         if choice == "s":
-            return (True, "session", None)
+            return (True, "session", None, None)
         if choice == "a":
-            return (True, "always", suggested or None)
-        return (True, "once", None)
+            return (True, "always", suggested or None, None)
+        return (True, "once", None, None)
 
     def request_approval_sync(self, request: ApprovalRequest) -> ApprovalDecision:
         """Synchronous approval via Rich console prompt."""
         try:
-            approved, scope, scope_pattern = self._prompt_user(request)
+            approved, scope, scope_pattern, feedback = self._prompt_user(request)
             if approved:
                 return ApprovalDecision(
                     approved=True,
@@ -156,7 +204,13 @@ class ConsoleBackend:
                     scope=scope,
                     scope_pattern=scope_pattern,
                 )
-            return ApprovalDecision(approved=False, reason="User denied", approver="console")
+            reason = f"User denied: {feedback}" if feedback else "User denied"
+            return ApprovalDecision(
+                approved=False,
+                reason=reason,
+                approver="console",
+                feedback=feedback,
+            )
         except Exception as e:
             logger.error("Console approval error: %s", e)
             return ApprovalDecision(approved=False, reason=f"Approval error: {e}")

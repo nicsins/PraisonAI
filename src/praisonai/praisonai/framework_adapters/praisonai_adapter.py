@@ -153,17 +153,10 @@ class PraisonAIAdapter(BaseFrameworkAdapter):
         if 'backend' in global_config:
             return global_config['backend']
         
-        # 7. Check CLI backend override (legacy with warning)
-        if 'cli_backend' in details:
-            import warnings
-            warnings.warn(
-                "Agent-level 'cli_backend' in YAML is deprecated. "
-                "Use 'runtime' parameter or model-scoped runtime configuration instead.",
-                DeprecationWarning,
-                stacklevel=3
-            )
-            return details['cli_backend']
-        
+        # 7. ``cli_backend`` is NOT a runtime id — it is resolved to a backend
+        # instance and passed as the ``cli_backend`` kwarg instead (see the
+        # agent construction path). Returning it here would send a CLI-backend
+        # id into the runtime registry, which fails closed on unknown ids.
         return None
     
     def _resolve_agent_approval(self, details: Dict[str, Any], config: Dict[str, Any]):
@@ -390,6 +383,27 @@ class PraisonAIAdapter(BaseFrameworkAdapter):
                 'toolsets': agent_toolsets,
                 'runtime': agent_runtime,
             }
+
+            # Agent-level ``cli_backend`` in YAML delegates this agent's turns
+            # to an external coding CLI. Core Agent refuses raw string ids, so
+            # resolve to an instance here in the wrapper layer.
+            cli_backend_config = details.get('cli_backend')
+            if cli_backend_config is not None:
+                from praisonai.agents_generator import _resolve_yaml_cli_backend
+                resolved_backend = _resolve_yaml_cli_backend(
+                    cli_backend_config, logger
+                )
+                if resolved_backend is None:
+                    # Fail closed: an explicitly requested backend that cannot
+                    # be resolved must not silently fall back to the native
+                    # LLM path (different tools, credentials, and billing).
+                    raise ValueError(
+                        f"Agent {role_filled!r} requests cli_backend="
+                        f"{cli_backend_config!r} but it could not be "
+                        "resolved. Install praisonai-code and use an id from "
+                        "'praisonai backends', or remove the cli_backend field."
+                    )
+                agent_kwargs['cli_backend'] = resolved_backend
             
             # Forward agent-level fields that core Agent already accepts as-is
             # so CLI/YAML flags (--planning, --web, --autonomy, ...) are
@@ -675,21 +689,32 @@ class PraisonAIAdapter(BaseFrameworkAdapter):
             Execution result as string
         """
         # Single source of truth: sync goes through the async bridge.
-        # Use run_sync_or_offload so this flagship sync entry point is safe
-        # from ANY calling context (plain sync, FastAPI handler, async test,
-        # notebook). A bare run_sync would raise RuntimeError inside a running
-        # loop, crashing praisonai.run(...) deep in the adapter.
-        from praisonai._async_bridge import run_sync_or_offload
-        return run_sync_or_offload(
-            self.arun(
-                config, llm_config, topic,
-                tools_dict=tools_dict,
-                agent_callback=agent_callback,
-                task_callback=task_callback,
-                cli_config=cli_config,
-            ),
-            thread_name="praisonai-adapter-sync",
+        # Plain sync callers get the shared background loop via run_sync. Callers
+        # already inside a running event loop (FastAPI handler, Jupyter, async
+        # test) must not take the sync path — blocking the loop for the full
+        # agent run is the "async-safe" pathology this project forbids — so we
+        # fail loudly and point them at the awaitable ``arun``.
+        import asyncio
+
+        coro = self.arun(
+            config, llm_config, topic,
+            tools_dict=tools_dict,
+            agent_callback=agent_callback,
+            task_callback=task_callback,
+            cli_config=cli_config,
         )
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            from praisonai._async_bridge import run_sync
+            return run_sync(coro)
+
+        # Inside a running loop: run_sync_or_offload enforces the strict
+        # no-loop-blocking policy (and honours PRAISONAI_ALLOW_LOOP_BLOCKING for
+        # callers that opt back into the legacy blocking behaviour), raising a
+        # RuntimeError that steers callers to ``await adapter.arun(...)``.
+        from praisonai._async_bridge import run_sync_or_offload
+        return run_sync_or_offload(coro, thread_name="praisonai-adapter-sync")
 
     async def arun(
         self,

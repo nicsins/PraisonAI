@@ -4,7 +4,16 @@ YAML schema validation for deploy configurations.
 import yaml
 from pathlib import Path
 from typing import Optional
-from .models import DeployConfig, DeployType, CloudProvider, APIConfig, DockerConfig, CloudConfig
+from .models import (
+    DeployConfig,
+    DeployType,
+    CloudProvider,
+    CloudProviderLike,
+    APIConfig,
+    DockerConfig,
+    CloudConfig,
+    coerce_cloud_provider,
+)
 
 
 def validate_agents_yaml(file_path: str) -> Optional[DeployConfig]:
@@ -32,7 +41,31 @@ def validate_agents_yaml(file_path: str) -> Optional[DeployConfig]:
         return None
     
     deploy_data = data['deploy']
-    
+
+    # The `deploy` section must be a mapping; a scalar or list here means the
+    # YAML is malformed (e.g. `deploy: docker`) and would otherwise blow up with
+    # a confusing error further down.
+    if not isinstance(deploy_data, dict):
+        raise ValueError(
+            "Invalid deploy config: 'deploy' must be a mapping, got "
+            f"{type(deploy_data).__name__}"
+        )
+
+    # Reject unknown keys in the deploy section so that a misspelled *section*
+    # name (e.g. `dockerr:` instead of `docker:`) is not silently discarded and
+    # deployed with all-default values. Keys are coerced to str for the error
+    # message so a non-string YAML key (e.g. `1:` or `true:`) still produces a
+    # clean ValueError rather than a TypeError from sorted()/join().
+    _known_deploy_keys = {'type', 'api', 'docker', 'cloud', 'agents'}
+    _unknown = [k for k in deploy_data if k not in _known_deploy_keys]
+    if _unknown:
+        raise ValueError(
+            "Unknown deploy config key(s): "
+            + ", ".join(sorted(map(str, _unknown)))
+            + ". Allowed keys: "
+            + ", ".join(sorted(_known_deploy_keys))
+        )
+
     # Parse deploy type
     deploy_type_str = deploy_data.get('type')
     if not deploy_type_str:
@@ -68,10 +101,10 @@ def validate_agents_yaml(file_path: str) -> Optional[DeployConfig]:
         if not provider_str:
             raise ValueError("Cloud provider is required")
         
-        try:
-            cloud_data['provider'] = CloudProvider(provider_str)
-        except ValueError:
-            raise ValueError(f"Invalid cloud provider: {provider_str}. Must be one of: aws, azure, gcp, fly, railway, render")
+        # Validate against the provider registry, not against the built-in
+        # enum: providers contributed through the "praisonai.deploy.providers"
+        # entry-point group are deployable and must validate.
+        cloud_data['provider'] = coerce_cloud_provider(provider_str)
         
         config_dict['cloud'] = CloudConfig(**cloud_data)
     
@@ -82,7 +115,7 @@ def validate_agents_yaml(file_path: str) -> Optional[DeployConfig]:
     return DeployConfig(**config_dict)
 
 
-def generate_sample_yaml(deploy_type: DeployType, provider: Optional[CloudProvider] = None) -> str:
+def generate_sample_yaml(deploy_type: DeployType, provider: Optional[CloudProviderLike] = None) -> str:
     """
     Generate sample agents.yaml with deploy configuration.
     
@@ -179,11 +212,20 @@ agents:
     max_instances: 10
     # image: gcr.io/your-project-id/praisonai-app:latest
 """
-        else:
+        elif provider is None:
             deploy_yaml = """deploy:
   type: cloud
   cloud:
     provider: aws  # or azure, gcp
+    region: us-east-1
+    service_name: praisonai-service
+"""
+        else:
+            provider_name = getattr(provider, "value", provider)
+            deploy_yaml = f"""deploy:
+  type: cloud
+  cloud:
+    provider: {provider_name}
     region: us-east-1
     service_name: praisonai-service
 """
@@ -194,7 +236,7 @@ agents:
     return base_yaml + deploy_yaml
 
 
-def save_sample_yaml(file_path: str, deploy_type: DeployType, provider: Optional[CloudProvider] = None):
+def save_sample_yaml(file_path: str, deploy_type: DeployType, provider: Optional[CloudProviderLike] = None):
     """
     Save sample agents.yaml to file.
     

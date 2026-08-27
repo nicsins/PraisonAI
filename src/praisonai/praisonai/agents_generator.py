@@ -1399,6 +1399,29 @@ class AgentsGenerator:
         # 'praisonai'.
         self._validate_cli_backend_compatibility(config, workflow_framework or 'praisonai')
 
+        # The framework-level check above passes for 'praisonai' because the
+        # sequential/hierarchical adapter does support cli_backend — but
+        # workflow YAMLs run through YAMLWorkflowParser, which builds agents
+        # natively and has no cli_backend wiring. Fail fast instead of
+        # silently executing on the native LLM path with different tools,
+        # credentials, and workspace behavior than the declared backend.
+        workflow_entities = {
+            **(config.get('roles') or {}),
+            **(config.get('agents') or {}),
+        }
+        cli_backend_entities = sorted(
+            name
+            for name, details in workflow_entities.items()
+            if isinstance(details, dict) and details.get('cli_backend')
+        )
+        if cli_backend_entities:
+            raise ValueError(
+                f"cli_backend (declared by: {', '.join(cli_backend_entities)}) is not "
+                "supported for 'process: workflow' YAMLs; the workflow engine runs "
+                "agents natively. Remove cli_backend or convert to a "
+                "sequential/hierarchical process."
+            )
+
         # tool_timeout is enforced by _wrap_tool_with_timeout on the
         # sequential/hierarchical path via tools_dict. The native workflow engine
         # resolves its own tools by name, so that wrapper hook does not apply
@@ -1504,21 +1527,23 @@ class AgentsGenerator:
 def safe_format(template, **kwargs):
     """
     Safe string formatting that preserves JSON/dict literals while substituting variables.
-    
+
     This function only substitutes placeholders that look like identifiers (e.g., {topic})
     while preserving JSON structures like {"level": 2}.
-    
+
+    Delegates to the single source of truth,
+    ``BaseFrameworkAdapter._format_template`` in the core SDK, so the wrapper
+    and core cannot drift (non-string short-circuit, regex, missing-key
+    handling). ``_format_template`` is stateless; a fresh instance is free.
+
     Args:
         template (str): Template string with placeholders
         **kwargs: Values to substitute
-        
+
     Returns:
         str: Formatted string with safe substitutions
     """
-    # Use the same regex-based substitution logic as BaseFrameworkAdapter._format_template
-    def replace_placeholder(match):
-        placeholder = match.group(1)
-        return str(kwargs.get(placeholder, match.group(0)))
-    
-    # Only replace placeholders that look like identifiers
-    return re.sub(r'\{([a-zA-Z_][a-zA-Z0-9_]*)\}', replace_placeholder, template)
+    from praisonaiagents.frameworks.base import BaseFrameworkAdapter
+    return BaseFrameworkAdapter._format_template(
+        BaseFrameworkAdapter(), template, **kwargs
+    )

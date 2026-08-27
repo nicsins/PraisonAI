@@ -30,23 +30,123 @@ def train_callback():
     pass
 
 
+# The knobs worth a flag. Everything else stays in the config file, which is
+# now reachable -- `llm` was the only command that would not accept --config,
+# though `export` and `serve` both do, so changing a LoRA rank meant editing a
+# YAML file the CLI gave you no way to point at.
+_TRAIN_FLAGS = (
+    ("method", "--method", "sft | cpt | dpo | orpo | kto"),
+    ("max_seq_length", "--max-seq-length", "Sequence length."),
+    ("num_train_epochs", "--epochs", "Epochs. Ignored if --max-steps is set."),
+    ("max_steps", "--max-steps", "Stop after this many steps."),
+    ("learning_rate", "--learning-rate", "Learning rate."),
+    ("per_device_train_batch_size", "--batch-size", "Per-device batch size."),
+    ("gradient_accumulation_steps", "--grad-accum", "Gradient accumulation steps."),
+    ("lora_r", "--lora-r", "LoRA rank."),
+    ("lora_alpha", "--lora-alpha", "LoRA alpha."),
+    ("output_dir", "--output-dir", "Where checkpoints go."),
+    ("chat_template", "--chat-template", "Chat template name."),
+)
+
+
 @app.command("llm")
 def train_llm(
-    dataset: str = typer.Argument(..., help="Training dataset path"),
+    dataset: Optional[str] = typer.Argument(
+        None, help="Training dataset path. Optional when --config names one."),
+    config: Optional[Path] = typer.Option(
+        None, "--config", "-c", exists=True,
+        help="Training config YAML. Flags below override it."),
     model: Optional[str] = typer.Option(None, "--model", "-m", help="Base model to fine-tune"),
+    method: Optional[str] = typer.Option(None, "--method", help="sft | cpt | dpo | orpo | kto"),
+    max_seq_length: Optional[int] = typer.Option(None, "--max-seq-length"),
+    num_train_epochs: Optional[float] = typer.Option(None, "--epochs"),
+    max_steps: Optional[int] = typer.Option(None, "--max-steps"),
+    learning_rate: Optional[float] = typer.Option(None, "--learning-rate"),
+    per_device_train_batch_size: Optional[int] = typer.Option(None, "--batch-size"),
+    gradient_accumulation_steps: Optional[int] = typer.Option(None, "--grad-accum"),
+    lora_r: Optional[int] = typer.Option(None, "--lora-r"),
+    lora_alpha: Optional[int] = typer.Option(None, "--lora-alpha"),
+    output_dir: Optional[str] = typer.Option(None, "--output-dir"),
+    chat_template: Optional[str] = typer.Option(None, "--chat-template"),
+    dry_run: bool = typer.Option(
+        False, "--dry-run",
+        help="Print the resolved config and exit, without training."),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
 ):
     """
     Fine-tune LLM models using Unsloth.
-    
+
     Examples:
-        praisonai train llm dataset.json
-        praisonai train llm --model llama-3.1 dataset.json
+        praisonai-train llm dataset.json
+        praisonai-train llm dataset.json --lora-r 32 --epochs 2
+        praisonai-train llm -c config.yaml --dry-run
     """
     import sys
 
+    # Typer fills these in when Click invokes the command, but `train_llm` is
+    # also called directly as a plain function -- by tests, and by anything
+    # importing it. Unfilled parameters then arrive as OptionInfo objects and
+    # Path(config) raises. Unwrap them to their declared defaults first.
+    def _v(value):
+        return getattr(value, "default", value) if type(value).__name__ == "OptionInfo" \
+            else value
+
+    config = _v(config)
+    model = _v(model)
+    method = _v(method)
+    max_seq_length = _v(max_seq_length)
+    num_train_epochs = _v(num_train_epochs)
+    max_steps = _v(max_steps)
+    learning_rate = _v(learning_rate)
+    per_device_train_batch_size = _v(per_device_train_batch_size)
+    gradient_accumulation_steps = _v(gradient_accumulation_steps)
+    lora_r = _v(lora_r)
+    lora_alpha = _v(lora_alpha)
+    output_dir = _v(output_dir)
+    chat_template = _v(chat_template)
+    dry_run = _v(dry_run) or False
+    verbose = _v(verbose) or False
+
     from ..output.console import get_output_controller
     from praisonai_train._code_bridge import code_available, import_code_module
+
+    # File first, flags on top -- the same precedence the dry-run preview shows.
+    # Snapshot locals() BEFORE the comprehension: a comprehension has its own
+    # scope, so calling locals() inside it sees the comprehension's names, not
+    # this function's parameters, and every tuning flag would be dropped.
+    supplied = locals()
+    overrides = {name: value for name, _flag, _help in _TRAIN_FLAGS
+                 if (value := supplied.get(name)) is not None}
+    if model:
+        overrides["model_name"] = model
+    if dataset:
+        overrides["dataset"] = dataset
+
+    if dry_run:
+        # Answering "what are you about to do?" before an hour of rented GPU is
+        # the difference between a caught typo and a wasted run. Resolved and
+        # printed WITHOUT loading the (heavy, optional) runner, so a preview
+        # never depends on the training deps being installed.
+        _print_resolved_config(config, overrides)
+        return
+
+    if not dataset and not config:
+        get_output_controller().print_error(
+            "No dataset given",
+            remediation="Pass a dataset path, or --config a file that names one.",
+        )
+        raise typer.Exit(1)
+
+    # The legacy `train` dispatcher reads ONLY ./config.yaml in the cwd and
+    # parses argv with parse_known_args(), so --config and every tuning flag
+    # (--lora-r, --epochs, ...) it does not declare are silently dropped -- the
+    # real run would then train from a different config than the --dry-run
+    # preview showed. Resolve the config here (file + flags, same precedence as
+    # the preview) and write it to the ./config.yaml the dispatcher (and the
+    # trainer subprocess it launches) actually loads, so the previewed config
+    # IS the one that trains. Pass a bare `train` so the dispatcher takes its
+    # "file exists, no model/dataset override" branch and reads our file as-is.
+    resolved = _resolve_config(config, overrides)
 
     try:
         PraisonAI = import_code_module("praisonai_code.cli.main").PraisonAI
@@ -63,22 +163,117 @@ def train_llm(
             )
         raise typer.Exit(1)
 
-    argv = ['train', dataset]
-    if model:
-        argv.extend(['--model', model])
+    _materialize_config(resolved)
+
+    argv = ['train']
+    # Deliberately NOT forwarding --dataset or --model.
+    #
+    # I added them as "belt and braces" and they were the opposite. The legacy
+    # dispatcher branches on `args.model or args.dataset != <default>`
+    # (praisonai_code/cli/legacy/praison_ai.py:676) and, on that branch, calls
+    # generate_config() with every tuning parameter None -- which REWRITES
+    # config.yaml from defaults. Measured effect of forwarding them:
+    #
+    #     lora_r 64 -> 16,  epochs 5 -> 1,  lr 1e-4 -> 2e-4,
+    #     max_seq_length 8192 -> 2048,  method dpo -> sft (not even a
+    #     generate_config parameter), and worst of all
+    #     huggingface_save false -> TRUE with hf_model_name defaulted to
+    #     someone else's Hub repo.
+    #
+    # So a --dry-run preview showed one config and a completely different one
+    # trained, and the run tried to publish to a third party's account. The
+    # materialised config.yaml above is the single source of truth; passing a
+    # bare `train` keeps the dispatcher on its "file exists, no override"
+    # branch, which reads that file as-is.
     if verbose:
         argv.append('--verbose')
-    
+
     original_argv = sys.argv
     sys.argv = ['praisonai'] + argv
-    
+
     try:
         praison = PraisonAI()
         praison.main()
-    except SystemExit:
-        pass
+    except SystemExit as exc:
+        # Propagate a non-zero exit (e.g. missing training dependencies) so
+        # callers and CI gating on ``$?`` see the failure. A clean exit is
+        # swallowed so the command returns 0 as before.
+        if exc.code:
+            raise typer.Exit(exc.code if isinstance(exc.code, int) else 1) from exc
     finally:
         sys.argv = original_argv
+
+
+def _resolve_config(config_path, overrides):
+    """Merge the config file (baseline) with the flags (on top), and return it.
+
+    Single source of truth for both the ``--dry-run`` preview and the real run,
+    so what is previewed is exactly what trains -- they cannot drift.
+    """
+    import yaml
+
+    from ..output.console import get_output_controller
+
+    resolved = {}
+    if config_path:
+        loaded = yaml.safe_load(Path(config_path).read_text()) or {}
+        if not isinstance(loaded, dict):
+            get_output_controller().print_error(
+                f"{config_path} is not a mapping",
+                remediation="A training config is a YAML mapping of key: value.")
+            raise typer.Exit(1)
+        resolved.update(loaded)
+    resolved.update(overrides)
+    return resolved
+
+
+def _print_resolved_config(config_path, overrides):
+    """Show the config the run would use: the file, then the flags on top."""
+    import yaml
+
+    resolved = _resolve_config(config_path, overrides)
+    typer.echo(yaml.safe_dump(resolved, sort_keys=True, default_flow_style=False).rstrip())
+    if overrides:
+        typer.echo(f"\n# {len(overrides)} value(s) came from flags: "
+                   f"{', '.join(sorted(overrides))}")
+
+
+def _materialize_config(resolved):
+    """Write the resolved config to ./config.yaml (the file the legacy `train`
+    dispatcher and its trainer subprocess both read) and return its path.
+
+    A `dataset` given as a plain string (from the positional argument or a flag)
+    is normalised to the ``[{name: ...}]`` shape the trainer requires; the
+    trainer iterates ``config["dataset"]`` expecting a mapping per entry, so a
+    bare string would otherwise be read character by character.
+    """
+    import yaml
+
+    to_write = dict(resolved)
+    dataset = to_write.get("dataset")
+    if isinstance(dataset, str):
+        to_write["dataset"] = [{"name": dataset}]
+
+    config_path = Path.cwd() / "config.yaml"
+    # Back up whatever was there. This writes into the invocation directory
+    # unconditionally, so it has silently destroyed hand-written configs --
+    # including one in this repo's own working tree. The dispatcher only reads
+    # ./config.yaml, so the write has to happen; losing the previous contents
+    # does not.
+    if config_path.exists():
+        backup = config_path.with_suffix(".yaml.bak")
+        try:
+            previous = config_path.read_text()
+        except OSError:
+            previous = None
+        if previous is not None and previous != yaml.safe_dump(
+                to_write, sort_keys=True, default_flow_style=False):
+            backup.write_text(previous)
+            print(f"NOTE: {config_path.name} already existed; the previous "
+                  f"contents were saved to {backup.name}.")
+    config_path.write_text(
+        yaml.safe_dump(to_write, sort_keys=True, default_flow_style=False))
+    return config_path
 
 
 @app.command("agents")
@@ -896,3 +1091,28 @@ def _load_scenarios_from_file(file_path: str, output) -> Optional[list]:
     except json.JSONDecodeError as e:
         output.print_error(f"Invalid JSON: {e}")
         return None
+
+
+# --- sibling command registration -------------------------------------------
+#
+# Every other command module does `from ...commands.train import app` and
+# registers onto that object as an import side effect. `praisonai_train/cli/
+# app.py` imports them all — but the integrated CLI
+# (praisonai_code/cli/app.py:429) imports THIS module directly and never that
+# one, so `praisonai train` exposed 6 of 15 commands and the whole `remote`
+# group was unreachable.
+#
+# Imported at the bottom, after `app` exists, so the siblings' own
+# `from ...train import app` resolves. Failures are swallowed per module: a
+# missing optional dependency in one command must not take down the others.
+def _register_sibling_commands() -> None:
+    import importlib
+
+    for name in ("data", "benchmark", "serve", "remote", "run", "catalog"):
+        try:
+            importlib.import_module(f"praisonai_train.cli.commands.{name}")
+        except Exception:  # noqa: BLE001 - one bad command must not hide the rest
+            pass
+
+
+_register_sibling_commands()

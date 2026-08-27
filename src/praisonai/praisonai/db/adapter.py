@@ -1,8 +1,14 @@
 """
 PraisonAIDB adapter - implements the DbAdapter protocol from praisonaiagents.
 
-This module provides the bridge between the core Agent's db interface
-and the wrapper's persistence layer (PersistenceOrchestrator).
+This is the single owner of the "agent lifecycle -> conversation/state/knowledge
+store" hooks for the wrapper. It is the live path core routes to via
+``MemoryConfig(db=PraisonAIDB(...))`` (see ``praisonaiagents/db/__init__.py``).
+
+``PersistenceOrchestrator`` (``persistence/orchestrator.py``) is a thin,
+higher-level façade that delegates its message-write and session-end hooks to an
+instance of this adapter (built through :meth:`PraisonAIDB._from_stores`) so the
+store-write logic lives here in one place instead of being duplicated.
 """
 
 import asyncio
@@ -23,12 +29,15 @@ class PraisonAIDB:
     Implements the DbAdapter protocol expected by praisonaiagents.Agent.
     
     Example:
-        from praisonaiagents import Agent
+        from praisonaiagents import Agent, MemoryConfig
         from praisonai.db import PraisonAIDB
-        
+
         # Simple usage with PostgreSQL
         db = PraisonAIDB(database_url="postgresql://localhost/mydb")
-        agent = Agent(name="Assistant", db=db, session_id="my-session")
+        agent = Agent(
+            name="Assistant",
+            memory=MemoryConfig(db=db, session_id="my-session"),
+        )
         agent.chat("Hello!")
         
         # With multiple backends
@@ -83,6 +92,36 @@ class PraisonAIDB:
         self._init_failed_at: float = 0.0
         # Seconds to suppress retries after an init failure before re-attempting.
         self._init_retry_cooldown: float = float(init_retry_cooldown)
+
+    @classmethod
+    def _from_stores(
+        cls,
+        conversation_store: Any = None,
+        state_store: Any = None,
+        knowledge_store: Any = None,
+    ) -> "PraisonAIDB":
+        """Build an adapter around already-constructed store instances.
+
+        Used by :class:`~praisonai.persistence.orchestrator.PersistenceOrchestrator`
+        so it can reuse this adapter's lifecycle-hook + dispatch logic without
+        re-parsing URLs or re-building stores. The stores are treated as fully
+        initialised, so the lazy URL-based construction path is bypassed.
+        """
+        self = cls.__new__(cls)
+        self._database_url = None
+        self._state_url = None
+        self._knowledge_url = None
+        self._options = {}
+        self._conversation_store = conversation_store
+        self._state_store = state_store
+        self._knowledge_store = knowledge_store
+        self._initialized = True
+        self._init_lock = threading.Lock()
+        self._ainit_lock = None
+        self._init_failed = None
+        self._init_failed_at = 0.0
+        self._init_retry_cooldown = 30.0
+        return self
 
     def _build_stores(self):
         """Construct the backing stores (blocking I/O). Caller handles locking."""
@@ -886,7 +925,7 @@ class PraisonAIDB:
             await self._dispatch_async(
                 self._state_store,
                 "set",
-                "aset",
+                "async_set",
                 f"agent:{session_id}",
                 {
                     "agent_name": agent_name,
@@ -1036,7 +1075,7 @@ class PraisonAIDB:
             # instead of overwriting it with a disconnected "ended" record.
             agent_key = f"agent:{session_id}"
             agent_data = await self._dispatch_async(
-                self._state_store, "get", "aget", agent_key
+                self._state_store, "get", "async_get", agent_key
             ) or {}
             agent_data.update({
                 "status": "ended",
@@ -1044,7 +1083,7 @@ class PraisonAIDB:
                 "metadata": {**agent_data.get("metadata", {}), **(metadata or {})},
             })
             await self._dispatch_async(
-                self._state_store, "set", "aset", agent_key, agent_data
+                self._state_store, "set", "async_set", agent_key, agent_data
             )
 
     async def aon_run_start(
@@ -1062,7 +1101,7 @@ class PraisonAIDB:
             await self._dispatch_async(
                 self._state_store,
                 "set",
-                "aset",
+                "async_set",
                 run_key,
                 {
                     "run_id": run_id,
@@ -1089,7 +1128,7 @@ class PraisonAIDB:
         if self._state_store:
             run_key = f"run:{session_id}:{run_id}"
             run_data = await self._dispatch_async(
-                self._state_store, "get", "aget", run_key
+                self._state_store, "get", "async_get", run_key
             ) or {}
             run_data.update({
                 "ended_at": time.time(),
@@ -1099,7 +1138,7 @@ class PraisonAIDB:
                 "metadata": {**run_data.get("metadata", {}), **(metadata or {})},
             })
             await self._dispatch_async(
-                self._state_store, "set", "aset", run_key, run_data
+                self._state_store, "set", "async_set", run_key, run_data
             )
 
     async def aclose(self) -> None:

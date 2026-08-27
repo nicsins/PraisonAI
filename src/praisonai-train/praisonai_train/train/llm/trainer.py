@@ -12,27 +12,338 @@ import sys
 import yaml
 import shutil
 import difflib
+import textwrap
 import contextlib
 import subprocess
 from functools import partial
 
+# Preference-tuning methods. Unsloth patches TRL's DPO, ORPO and KTO trainers
+# alongside SFT (unsloth/__init__.py lists them in the trainers it rewrites), but
+# this module could only ever run SFT -- so a dataset of chosen/rejected pairs had
+# nowhere to go and the whole preference-tuning half of the library was
+# unreachable from PraisonAI.
+#
+# Each entry names the TRL trainer and config class, the columns the dataset must
+# provide, and whether the method needs a frozen reference model. Adding a method
+# is one entry plus its import.
+TRAINING_METHODS = {
+    "sft": {
+        "trainer": "SFTTrainer", "config": "SFTConfig",
+        "columns": (), "needs_ref_model": False,
+        "summary": "supervised fine-tuning on completions",
+    },
+    "cpt": {
+        # Continued pretraining. Same trainer as SFT, but the embedding layers
+        # need their own, much lower learning rate -- which lives on
+        # UnslothTrainer, not SFTTrainer (unsloth/trainer.py:445-524).
+        "trainer": "UnslothTrainer", "config": "UnslothTrainingArguments",
+        "columns": ("text",), "needs_ref_model": False,
+        "summary": "continued pretraining on a raw-text corpus",
+    },
+    "dpo": {
+        "trainer": "DPOTrainer", "config": "DPOConfig",
+        "columns": ("prompt", "chosen", "rejected"), "needs_ref_model": True,
+        "summary": "direct preference optimisation on chosen/rejected pairs",
+    },
+    "orpo": {
+        "trainer": "ORPOTrainer", "config": "ORPOConfig",
+        # ORPO folds the reference model into its loss, so there is none to hold.
+        "columns": ("prompt", "chosen", "rejected"), "needs_ref_model": False,
+        "summary": "odds-ratio preference optimisation, no reference model",
+    },
+    "grpo": {
+        "trainer": "GRPOTrainer", "config": "GRPOConfig",
+        # GRPO generates its own completions, so the corpus is prompts only.
+        "columns": ("prompt",), "needs_ref_model": False,
+        "needs_rewards": True,
+        "summary": "group-relative policy optimisation, scored by reward functions",
+    },
+    "reward": {
+        "trainer": "RewardTrainer", "config": "RewardConfig",
+        "columns": ("chosen", "rejected"), "needs_ref_model": False,
+        "summary": "train a reward model on preference pairs",
+    },
+    "cpo": {
+        "trainer": "CPOTrainer", "config": "CPOConfig",
+        "columns": ("prompt", "chosen", "rejected"), "needs_ref_model": False,
+        "summary": "contrastive preference optimisation, no reference model",
+    },
+    "kto": {
+        "trainer": "KTOTrainer", "config": "KTOConfig",
+        "columns": ("prompt", "completion", "label"), "needs_ref_model": True,
+        "summary": "Kahneman-Tversky optimisation on thumbs-up/down labels",
+    },
+}
+
+# Turn markers for masking the prompt out of the loss.
+#
+# TRL's `assistant_only_loss` needs `{% generation %}` in the chat template, and
+# NONE of unsloth's 43 templates contain it (verified: grep -c "generation %}"
+# unsloth/chat_templates.py -> 0). So `assistant_only_loss: auto` resolved to
+# False for every template a user can actually select, and every instruction
+# run trained on the prompt as well as the answer -- a quality loss with no
+# error, announced only by a summary line reading "Loss mask: full sequence".
+#
+# Unsloth's own answer is `train_on_responses_only(trainer, instruction_part,
+# response_part)` (unsloth/chat_templates.py:58-87), which masks by locating
+# literal marker strings and works on any template. It needs the two markers,
+# which vary by family -- hence this table.
+RESPONSE_MARKERS = {
+    "llama-3": ("<|start_header_id|>user<|end_header_id|>\n\n",
+                "<|start_header_id|>assistant<|end_header_id|>\n\n"),
+    "chatml": ("<|im_start|>user\n", "<|im_start|>assistant\n"),
+    "gemma": ("<start_of_turn>user\n", "<start_of_turn>model\n"),
+    "mistral": ("[INST]", "[/INST]"),
+    "phi": ("<|user|>\n", "<|assistant|>\n"),
+    "zephyr": ("<|user|>\n", "<|assistant|>\n"),
+}
+
+# Which markers a chat_template name uses. Matched longest-first so "llama-3.1"
+# does not fall through to a shorter, wrong prefix.
+TEMPLATE_TO_MARKERS = {
+    "llama-3": "llama-3", "llama3": "llama-3", "llama-3.1": "llama-3",
+    "llama-31": "llama-3", "llama": "llama-3",
+    "chatml": "chatml", "qwen-2.5": "chatml", "qwen25": "chatml",
+    "qwen2.5": "chatml", "qwen-25": "chatml", "qwen-3": "chatml",
+    "qwen3": "chatml", "qwen3-instruct": "chatml", "qwen3-thinking": "chatml",
+    "phi-4": "chatml", "gptoss": "chatml", "gpt-oss": "chatml",
+    "yi-chat": "chatml", "unsloth": "chatml",
+    "gemma": "gemma", "gemma2": "gemma", "gemma-3": "gemma", "gemma3": "gemma",
+    "gemma-3n": "gemma", "gemma3n": "gemma", "gemma-4": "gemma", "gemma4": "gemma",
+    "gemma_chatml": "chatml", "gemma2_chatml": "chatml",
+    "mistral": "mistral",
+    "phi-3": "phi", "phi-35": "phi", "phi-3.5": "phi",
+    "zephyr": "zephyr",
+}
+
+
+# The summary line has to name *which* route masked, because the two have very
+# different coverage and "assistant replies only" hid that distinction.
+_MASK_LABELS = {
+    False: "full sequence (training on prompts too)",
+    "assistant_only_loss": "assistant replies only (TRL assistant_only_loss)",
+    "train_on_responses_only": "assistant replies only (unsloth turn markers)",
+}
+
+
+# Phrasings the four runtimes use for the same condition. `torch.cuda.OutOfMemoryError`
+# subclasses RuntimeError, so the CLI's catch-all swallowed it into a single ERROR
+# line carrying torch's raw allocator dump -- the most common fine-tuning failure,
+# and the one where a first-time user has no idea which number to change.
+_OOM_MARKERS = (
+    "out of memory",
+    "cuda out of memory",
+    "hip out of memory",
+    "outofmemoryerror",
+)
+
+# Ordered cheapest-first: sequence length is usually the biggest lever and the
+# least destructive to change. Same ordering unsloth validated in its studio
+# backend (studio/backend/core/training/worker.py:4834-4845).
+OOM_REMEDIATION = (
+    "The GPU ran out of memory. In order of what usually helps most:\n"
+    "  1. Lower max_seq_length (try 2048, or 4096 if you were higher)\n"
+    "  2. Set use_gradient_checkpointing: unsloth (if it is off)\n"
+    "  3. Lower per_device_train_batch_size, raising gradient_accumulation_steps\n"
+    "     by the same factor to keep the effective batch size\n"
+    "  4. Use a smaller model, or a 4-bit one (load_in_4bit: true)"
+)
+
+
+def is_out_of_memory(exc):
+    """True when this exception is a GPU OOM, whatever runtime raised it.
+
+    The class name is folded into the searched text rather than checked
+    separately: `torch.cuda.OutOfMemoryError` is matched by the
+    "outofmemoryerror" marker, so a separate `type(exc).__name__` branch was
+    code no test could distinguish from its absence.
+    """
+    text = f"{type(exc).__name__} {exc}".lower()
+    return any(marker in text for marker in _OOM_MARKERS)
+
+
+def _accepted_config_fields(cfg_cls):
+    """Every key `cfg_cls` will accept, from its dataclass fields AND __init__.
+
+    `__dataclass_fields__` is inherited, so a plain __init__ subclass of a
+    dataclass reports its PARENT's fields and none of its own.
+    UnslothTrainingArguments is exactly that (unsloth/trainer.py:445), so the
+    drop-unknown filter deleted embedding_learning_rate -- the single value
+    continued pretraining exists to set -- along with max_seq_length and
+    packing. Nothing failed; the run just used the wrong learning rate.
+    """
+    import inspect
+
+    fields = set(getattr(cfg_cls, "__dataclass_fields__", None) or ())
+    try:
+        params = inspect.signature(cfg_cls.__init__).parameters
+    except (TypeError, ValueError):
+        return fields or None
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return None          # **kwargs: it accepts anything, filter nothing
+    fields.update(n for n in params if n != "self")
+    return fields or None
+
+
+# LoRA options forwarded verbatim to get_peft_model. A module constant rather
+# than a literal in the loop, so a test can read the list instead of grepping
+# the method for each name -- the shape that let eight mutations survive.
+PEFT_PASSTHROUGH = (
+    "modules_to_save", "rank_pattern", "alpha_pattern", "use_dora",
+    "finetune_last_n_layers", "layers_to_transform", "layers_pattern",
+    "target_parameters", "init_lora_weights",
+)
+
+
+def model_access_kwargs(config, flag):
+    """Everything that decides WHICH weights load, and how they are reached.
+
+    A function rather than two inline blocks so a test can call it. The first
+    version of its test reimplemented this assembly -- in the very change that
+    banned reimplementing tested logic -- and would have passed with the
+    forwarding deleted.
+
+    `token` is the unsloth keyword; the config name is `hf_token` so it cannot
+    collide with the trainer's own token handling.
+    """
+    kwargs = {}
+    for key in ("trust_remote_code", "revision"):
+        if config.get(key) is not None:
+            kwargs[key] = config[key]
+    if config.get("hf_token"):
+        kwargs["token"] = config["hf_token"]
+    # vLLM rollouts, which GRPO wants and never had.
+    if flag(config.get("fast_inference"), default=False):
+        kwargs["fast_inference"] = True
+        for key in ("gpu_memory_utilization", "max_lora_rank"):
+            if config.get(key) is not None:
+                kwargs[key] = config[key]
+    return kwargs
+
+
+def resolve_mask_setting(mask_setting, supports_mask, markers, flag):
+    """Turn the configured value into "should we mask at all".
+
+    Extracted so a test can CALL it. Its test used to hold a copy of this
+    expression, which meant reverting the real line to the pre-fix
+    `supports_mask` alone changed nothing the suite could see -- the one defect
+    that whole PR existed to fix was undetectable by its own test file.
+
+    `auto` enables masking when EITHER route is usable; decide_masking then
+    picks which.
+    """
+    if isinstance(mask_setting, str) and mask_setting.strip().lower() == "auto":
+        return supports_mask or bool(markers)
+    return flag(mask_setting)
+
+
+def decide_masking(use_mask, supports_mask, markers):
+    """Which masking route to take: False, or the name of the mechanism.
+
+    Separate from the trainer so the decision can be tested directly. A test
+    that reads `train_model`'s source for the string "train_on_responses_only"
+    passes even when the branch that calls it is disabled -- which is how this
+    defect survived in the first place.
+    """
+    if not use_mask:
+        return False
+    if supports_mask:
+        return "assistant_only_loss"
+    if markers:
+        return "train_on_responses_only"
+    return None      # asked for, and neither route available
+
+
+def resolve_response_markers(chat_template, model_name=""):
+    """(instruction_part, response_part) for a template, or None if unknown.
+
+    Falls back to the model name when no explicit chat_template is configured,
+    because the model's own template is then in use. Returns None rather than
+    guessing: masking on the wrong markers silently trains on nothing, which is
+    worse than not masking at all.
+    """
+    for source, is_model in ((chat_template, False), (model_name, True)):
+        if not source:
+            continue
+        key = str(source).strip().lower()
+        if is_model:
+            # Match the repo name, not the org. Every unsloth model is
+            # "unsloth/<name>", and "unsloth" is itself a template key -- so
+            # scanning the full id sent every one of them to the chatml markers,
+            # including Gemma and Llama models whose real markers are different.
+            key = key.rsplit("/", 1)[-1]
+        if key in TEMPLATE_TO_MARKERS:
+            return RESPONSE_MARKERS[TEMPLATE_TO_MARKERS[key]]
+        for name in sorted(TEMPLATE_TO_MARKERS, key=len, reverse=True):
+            # Longest-first so "llama-3.1" beats "llama". Hyphens and dots are
+            # written both ways in the wild ("gemma-2" vs "gemma2").
+            if name in key or name.replace("-", "") in key.replace("-", ""):
+                return RESPONSE_MARKERS[TEMPLATE_TO_MARKERS[name]]
+    return None
+
+
 # GGUF / Ollama quantization methods supported by Unsloth's exporter. Validated up
 # front so a typo (e.g. "q4km") fails fast with a clear message instead of after a
 # long training run when the export step finally rejects it.
-VALID_QUANTIZATION_METHODS = frozenset({
-    "q4_k_m", "q5_k_m", "q8_0", "q4_0", "q4_1", "q5_0", "q5_1",
-    "q3_k_m", "q6_k", "f16", "bf16", "q2_k",
+# Every quant unsloth's exporter accepts, not a hand-picked twelve.
+#
+# The old list rejected half of unsloth's own: q3_k_l, q4_k_s, q5_k_s,
+# f32 and the aliases were all legal upstream and refused here before
+# unsloth was ever asked. The IQ family was unreachable entirely, which
+# is how a 30B model fits on a laptop.
+#
+# A literal, not an import: this validates a config long before the ML
+# stack loads, and importing unsloth here would pull torch into
+# `praisonai-train llm --dry-run`. A test asserts the two agree.
+ALLOWED_QUANTS = frozenset({
+    "bf16", "f16", "f32", "fast_quantized", "not_quantized", "q2_k",
+    "q2_k_l", "q3_k_l", "q3_k_m", "q3_k_s", "q3_k_xs", "q4_0",
+    "q4_1", "q4_k", "q4_k_m", "q4_k_s", "q5_0", "q5_1",
+    "q5_k", "q5_k_m", "q5_k_s", "q6_k", "q8_0", "quantized",
 })
+
+# Importance-matrix quants. unsloth resolves the matrix itself,
+# downloading it from unsloth/<base>-GGUF when none is supplied.
+IMATRIX_QUANTS = frozenset({
+    "iq1_m", "iq1_s", "iq2_m", "iq2_s", "iq2_xs", "iq2_xxs",
+    "iq3_m", "iq3_s", "iq3_xxs", "iq4_nl", "iq4_xs",
+})
+
+VALID_QUANTIZATION_METHODS = ALLOWED_QUANTS | IMATRIX_QUANTS
 
 
 def _lazy_import_training_deps():
     """Import heavy training dependencies only when needed."""
+    # Check the floors first. They were pip metadata only, and pip is routinely
+    # bypassed -- --no-deps, a hand-built conda env, setup_conda_env.sh pinning
+    # its own torch. Without this the failure arrives as whatever traceback the
+    # mismatched package happens to raise, several imports deep.
+    from praisonai_train.preflight import check, describe
+    problems = check()
+    if problems:
+        raise ImportError(
+            "Training dependencies are missing or too old.\n" + describe(problems))
+
     try:
         import torch
         from transformers import TextStreamer, TrainingArguments
         from unsloth import FastLanguageModel, is_bfloat16_supported
         from unsloth.chat_templates import standardize_sharegpt, get_chat_template
         from trl import SFTTrainer, SFTConfig
+        try:
+            from unsloth import UnslothTrainer, UnslothTrainingArguments
+        except ImportError:      # older unsloth; cpt then reports what to upgrade
+            UnslothTrainer = UnslothTrainingArguments = None
+        # Imported lazily and individually: a TRL old enough to lack one of these
+        # should still be able to run the others rather than failing at import.
+        _pref = {}
+        for _name in ("DPOTrainer", "DPOConfig", "ORPOTrainer", "ORPOConfig",
+                      "KTOTrainer", "KTOConfig", "GRPOTrainer", "GRPOConfig",
+                      "RewardTrainer", "RewardConfig", "CPOTrainer", "CPOConfig"):
+            try:
+                _pref[_name] = getattr(__import__("trl", fromlist=[_name]), _name)
+            except (ImportError, AttributeError):
+                pass
         from datasets import load_dataset, concatenate_datasets
         from psutil import virtual_memory
         # Make available in global scope for the rest of the module
@@ -43,6 +354,9 @@ def _lazy_import_training_deps():
             'is_bfloat16_supported': is_bfloat16_supported,
             'SFTTrainer': SFTTrainer,
             'SFTConfig': SFTConfig,
+            'UnslothTrainer': UnslothTrainer,
+            'UnslothTrainingArguments': UnslothTrainingArguments,
+            **_pref,
             'TrainingArguments': TrainingArguments,
             'load_dataset': load_dataset,
             'concatenate_datasets': concatenate_datasets,
@@ -72,6 +386,20 @@ def formatting_prompts_func(examples, tokenizer):
     if _dbg:
         print("DEBUG: formatting_prompts_func() received batch with keys:", list(examples.keys()))
     texts = []
+    # A corpus that is already plain text needs no formatting at all.
+    #
+    # Without this branch a `text`-only dataset fell through to the Alpaca
+    # path, where examples.get("instruction", []) returns [], every row
+    # formatted to "", and the run died with "All examples formatted to empty
+    # text -- check dataset schema / chat_template". That message blames the
+    # dataset for a shape this function simply did not handle, and it made
+    # continued pretraining and domain adaptation impossible.
+    if "conversations" not in examples and "instruction" not in examples \
+            and "text" in examples:
+        if _dbg:
+            print("DEBUG: raw-text corpus; passing rows through unchanged.")
+        return {"text": [t if isinstance(t, str) else "" for t in examples["text"]]}
+
     # Check if the example has a "conversations" field.
     if "conversations" in examples:
         for convo in examples["conversations"]:
@@ -177,6 +505,14 @@ class TrainModel:
         # training validate_config, so an invalid --quant would otherwise only
         # fail deep inside Unsloth / `ollama create`.
         q = obj.config.get("quantization_method")
+        # Configs written against older templates carry the single-element
+        # list form. Accepting it costs one line and avoids failing a run for a
+        # shape the project itself shipped. Normalize back into config so the
+        # GGUF exporter (which re-reads self.config) receives the method string,
+        # not the list.
+        if isinstance(q, (list, tuple)) and len(q) == 1:
+            q = q[0]
+            obj.config["quantization_method"] = q
         if q is not None and str(q).lower() not in VALID_QUANTIZATION_METHODS:
             raise ValueError(
                 f"quantization_method '{q}' is not valid. Choose one of: "
@@ -209,6 +545,23 @@ class TrainModel:
         "optim", "weight_decay", "lr_scheduler_type", "seed", "output_dir",
         "assistant_only_loss", "train_on_responses_only", "save_steps",
         "train", "huggingface_save", "huggingface_save_gguf", "ollama_save",
+        "method", "beta", "max_prompt_length", "desirable_weight", "undesirable_weight",
+        "reward_funcs", "num_generations", "max_completion_length",
+        "embedding_learning_rate",
+        "hf_private", "save_method", "commit_message", "tags",
+        # Model access: a gated repo (Llama, Gemma) needs a token, a
+        # custom-code model needs trust_remote_code, and a multi-day run needs
+        # a pinned revision to be reproducible. All three were unreachable.
+        "hf_token", "trust_remote_code", "revision",
+        # vLLM rollouts. GRPO always ran the slow HF-generate path because
+        # fast_inference was never passed (unsloth/models/loader.py:429).
+        "fast_inference", "gpu_memory_utilization", "max_lora_rank",
+        # PEFT selectors. The target-module list was hardcoded to seven names,
+        # so last-N-layer tuning and MoE expert adapters were impossible.
+        "finetune_last_n_layers", "layers_to_transform", "layers_pattern",
+        "target_parameters", "init_lora_weights",
+        # Offline merged export; merged weights could only be PUSHED before.
+        "merged_save_dir", "imatrix_file",
         "hf_model_name", "ollama_model", "quantization_method", "remove_unused_columns",
         # quantization / precision
         "dtype", "load_in_8bit", "full_finetuning",
@@ -231,7 +584,31 @@ class TrainModel:
         "mtp_draft", "mtp_draft_repo", "mtp_draft_file", "spec_draft_n_max",
     })
 
+    @staticmethod
+    def resolve_method(config):
+        """Normalise and check `method`, returning it. Kept separate from
+        `validate_config` so it can be exercised without a CUDA import."""
+        method = str(config.get("method", "sft")).lower()
+        if method not in TRAINING_METHODS:
+            raise ValueError(
+                f"method '{method}' is not supported. Choose one of: "
+                + ", ".join(f"{k} ({v['summary']})" for k, v in TRAINING_METHODS.items()))
+        config["method"] = method
+        return method
+
     def validate_config(self):
+        self.resolve_method(self.config)
+
+        # A warning, not a refusal: unsloth loads plenty of models it does not
+        # map (loader.py falls through to a generic path), so refusing would
+        # block working configurations. But "I typed it wrong" should not cost
+        # a download to discover.
+        name = self.config.get("model_name")
+        if name:
+            from praisonai_train.models import describe_unknown, is_known
+            if not is_known(name):
+                print(f"WARNING: {describe_unknown(name)}")
+
         required = ["model_name", "max_seq_length", "dataset"]
         missing = [k for k in required if not self.config.get(k)]
         if missing:
@@ -302,6 +679,14 @@ class TrainModel:
             self.config.get("ollama_save")
         ):
             q = self.config.get("quantization_method")
+            # Configs written against older templates carry the single-element
+            # list form. Accepting it costs one line and avoids failing a run
+            # for a shape the project itself shipped. Normalize back into config
+            # so the GGUF exporter (which re-reads self.config) receives the
+            # method string, not the list.
+            if isinstance(q, (list, tuple)) and len(q) == 1:
+                q = q[0]
+                self.config["quantization_method"] = q
             if q is not None and str(q).lower() not in VALID_QUANTIZATION_METHODS:
                 raise ValueError(
                     f"quantization_method '{q}' is not valid. Choose one of: "
@@ -317,6 +702,24 @@ class TrainModel:
                 suggestion = f"  (did you mean '{match[0]}'?)" if match else ""
                 lines.append(f"  - {key}{suggestion}")
             print("\n".join(lines))
+
+    @staticmethod
+    def _require_columns(dataset, columns, method):
+        """Fail before the run starts, naming the columns that are missing.
+
+        TRL's own error for a wrongly-shaped preference dataset surfaces deep in
+        the collator -- minutes in, after the model is loaded and quantised, and
+        worded in terms of tensors rather than the file the user pointed at.
+        """
+        if not columns:
+            return
+        have = set(getattr(dataset, "column_names", None) or [])
+        missing = [c for c in columns if c not in have]
+        if missing:
+            raise ValueError(
+                f"method '{method}' needs the column(s) {missing} and the dataset has "
+                f"{sorted(have) or 'none'}. A {method} dataset needs "
+                f"{list(columns)} per row.")
 
     @staticmethod
     def _flag(value, default=False):
@@ -411,6 +814,7 @@ class TrainModel:
         )
         if self.config.get("load_in_8bit") is not None:
             load_kwargs["load_in_8bit"] = self._flag(self.config["load_in_8bit"])
+        load_kwargs.update(model_access_kwargs(self.config, self._flag))
         if self.config.get("full_finetuning") is not None:
             load_kwargs["full_finetuning"] = self._flag(self.config["full_finetuning"])
         if load_kwargs.get("load_in_4bit") and load_kwargs.get("load_in_8bit"):
@@ -469,7 +873,7 @@ class TrainModel:
             loftq_config=self.config.get("loftq_config", None),
         )
         # Optional advanced LoRA knobs (only passed when set).
-        for opt in ("modules_to_save", "rank_pattern", "alpha_pattern", "use_dora"):
+        for opt in PEFT_PASSTHROUGH:
             if self.config.get(opt) is not None:
                 peft_kwargs[opt] = self.config[opt]
         self.model = FastLanguageModel.get_peft_model(self.model, **peft_kwargs)
@@ -530,14 +934,29 @@ class TrainModel:
                 print("NOTE: num_samples takes the FIRST N rows before shuffle; "
                       "add shuffle: true to sample randomly.")
         print("DEBUG: Dataset columns:", dataset.column_names)
+
+        # SFT flattens every row to a single `text` column. A preference dataset
+        # must keep prompt/chosen/rejected (or prompt/completion/label) — the
+        # trainer reads those columns by name, and flattening them destroyed the
+        # dataset before the method ever saw it.
+        if self.config.get("method", "sft") not in ("sft", "cpt"):
+            method = self.config["method"]
+            if self._flag(dataset_info.get("shuffle"), default=False):
+                dataset = dataset.shuffle(
+                    seed=int(dataset_info.get("seed", self.config.get("seed", 3407))))
+            print(f"DEBUG: method={method}; keeping preference columns "
+                  f"{dataset.column_names} as-is.")
+            return dataset
+
+        if self._flag(dataset_info.get("shuffle"), default=False):
+            dataset = dataset.shuffle(
+                seed=int(dataset_info.get("seed", self.config.get("seed", 3407))))
         if "conversations" in dataset.column_names:
             print("DEBUG: Standardizing dataset (ShareGPT style)...")
             dataset = standardize_sharegpt(dataset)
         else:
             print("DEBUG: Dataset does not have 'conversations'; assuming Alpaca format.")
-        if self._flag(dataset_info.get("shuffle"), default=False):
-            dataset = dataset.shuffle(
-                seed=int(dataset_info.get("seed", self.config.get("seed", 3407))))
+        columns_before = list(dataset.column_names)
         print("DEBUG: Applying formatting function to dataset...")
         format_func = partial(formatting_prompts_func, tokenizer=self.chat_tokenizer)
         dataset = dataset.map(format_func, batched=True, remove_columns=dataset.column_names)
@@ -550,12 +969,25 @@ class TrainModel:
                   f"formatted to empty text.")
         if len(dataset) == 0:
             raise ValueError(
-                "All examples formatted to empty text — check dataset schema / chat_template.")
+                "All examples formatted to empty text. The dataset columns are "
+                f"{columns_before}; this trainer understands ShareGPT "
+                "('conversations'), Alpaca ('instruction'/'input'/'output') and "
+                "raw text ('text'). Rename your columns to one of those shapes, "
+                "or set chat_template to match your data.")
         return dataset
 
     def load_datasets(self):
         datasets = []
         for dataset_info in self.config["dataset"]:
+            # Advertised in the shipped templates but never read. Saying so beats
+            # silently discarding a formatter the user believed was running.
+            if dataset_info.get("processing_func"):
+                print(
+                    f"WARNING: dataset.processing_func "
+                    f"({dataset_info['processing_func']}) is not supported and will "
+                    f"be ignored; formatting is chosen automatically from the "
+                    f"dataset's columns."
+                )
             print("DEBUG: Processing dataset info:", dataset_info)
             # A validation/test split loaded here is CONCATENATED into training, not
             # held out — an easy way to contaminate eval without noticing. Warn, and
@@ -607,7 +1039,10 @@ class TrainModel:
             "report_to": self.config.get("report_to", default_report),
             "dataset_text_field": self.config.get("dataset_text_field", "text"),
             "max_length": self.config["max_seq_length"],
-            "dataset_num_proc": self.config.get("dataset_num_proc", 1),
+            # None, not 1: unsloth sizes this from available memory
+            # (rl.py:3396-3420). An explicit 1 defeated that policy and made
+            # map() single-process on every corpus, however large.
+            "dataset_num_proc": self.config.get("dataset_num_proc"),
             "packing": self._flag(self.config.get("packing"), default=False),
         }
         if self.config.get("run_name") or os.getenv("PRAISON_WANDB_RUN_NAME"):
@@ -705,27 +1140,59 @@ class TrainModel:
             if os.getenv("HF_TOKEN"):
                 sft_params["hub_token"] = os.getenv("HF_TOKEN")
         # Response-only loss: compute loss only on the assistant's replies (better
-        # instruction tuning). Default "auto" enables it only when the model's chat
-        # template actually supports masking, so beginners get the quality win with
-        # zero risk of TRL's "no assistant tokens" crash. true/false force it.
+        # instruction tuning). Default "auto" enables it whenever a masking route is
+        # available -- TRL's assistant_only_loss when the template supports it, else
+        # unsloth's turn-marker masking -- so beginners get the quality win with zero
+        # risk of TRL's "no assistant tokens" crash. true/false force it.
         # `train_on_responses_only` is accepted as a familiar alias.
-        mask_setting = self.config.get(
-            "assistant_only_loss", self.config.get("train_on_responses_only", "auto"))
-        supports_mask = self._supports_assistant_mask()
-        if isinstance(mask_setting, str) and mask_setting.strip().lower() == "auto":
-            use_mask = supports_mask
-        else:
-            use_mask = self._flag(mask_setting)
-        if use_mask and not supports_mask:
-            raise ValueError(
-                f"assistant_only_loss is enabled but the chat template for "
-                f"'{self.config['model_name']}' has no assistant-turn markers "
-                f"({{% generation %}}). Set assistant_only_loss: auto (recommended) or "
-                f"false, or use a chat_template that supports masking."
-            )
-        if use_mask:
-            sft_params["assistant_only_loss"] = True
-        self._masking_on = use_mask
+        # Two ways to mask, and the second is why this is not a one-liner.
+        #
+        # TRL's assistant_only_loss needs `{% generation %}` in the template.
+        # None of unsloth's 43 templates have it, so on its own that setting
+        # resolves to False for every template a user can pick -- and the run
+        # trains on the prompt with no error. Unsloth's own
+        # train_on_responses_only() masks by locating literal turn markers
+        # instead and works on any template; it is applied to the built trainer
+        # rather than through the config.
+        self._response_markers = None
+        self._masking_on = False
+
+        # Response-only masking is an SFT-only mechanism: it rewrites the label
+        # tensors of a completion-tokenised dataset. Preference trainers (DPO,
+        # ORPO, KTO) build their own labels from chosen/rejected pairs, so both
+        # masking routes are meaningless there and `train_on_responses_only`
+        # would corrupt the run. Skip the whole decision for those methods.
+        method = self.config.get("method", "sft")
+        if method == "sft":
+            markers = resolve_response_markers(
+                self.config.get("chat_template"), self.config.get("model_name", ""))
+
+            mask_setting = self.config.get(
+                "assistant_only_loss", self.config.get("train_on_responses_only", "auto"))
+            supports_mask = self._supports_assistant_mask()
+            # `auto` means "mask if we can". Keying it off `supports_mask` alone sent
+            # every unsloth template (which lacks {% generation %}) down the unmasked
+            # path even when valid turn markers were available -- defeating the whole
+            # fallback. Enable it when EITHER route is usable, and let decide_masking
+            # pick which one.
+            use_mask = resolve_mask_setting(
+                mask_setting, supports_mask, markers, self._flag)
+            route = decide_masking(use_mask, supports_mask, markers)
+            if route == "assistant_only_loss":
+                sft_params["assistant_only_loss"] = True
+                self._masking_on = route
+            elif route == "train_on_responses_only":
+                self._response_markers = markers
+                self._masking_on = route
+            elif route is None:
+                raise ValueError(
+                    f"assistant_only_loss is enabled but neither masking route is "
+                    f"available for '{self.config['model_name']}': the chat template has "
+                    f"no {{% generation %}} markers, and no turn markers are known for it. "
+                    f"Set assistant_only_loss: false to train on the full sequence, or "
+                    f"choose a chat_template from: "
+                    f"{', '.join(sorted(set(TEMPLATE_TO_MARKERS)))}."
+                )
 
         # --- Early stopping (optional; needs an eval set) ---
         callbacks = []
@@ -791,15 +1258,94 @@ class TrainModel:
             print(f"WARNING: SFTConfig (this TRL version) does not accept {dropped}; ignoring.")
             sft_params = {k: v for k, v in sft_params.items() if k in valid_fields}
 
-        training_args = SFTConfig(**sft_params)
-        trainer = SFTTrainer(
-            model=self.model,
-            processing_class=self.hf_tokenizer,
-            train_dataset=raw_dataset,
-            eval_dataset=eval_dataset,
-            args=training_args,
-            callbacks=callbacks or None,
-        )
+        spec = TRAINING_METHODS[method]
+
+        if method == "cpt":
+            # modules_to_save is what makes this continued pretraining rather
+            # than plain LoRA: the embeddings have to be trainable. Exposing it
+            # while giving it the adapters' learning rate is the known-bad
+            # recipe, so the embedding LR is set here and defaults to a tenth.
+            lr = float(sft_params.get("learning_rate", 2e-4))
+            sft_params["embedding_learning_rate"] = float(
+                self.config.get("embedding_learning_rate", lr / 10))
+            if not self.config.get("modules_to_save"):
+                print("NOTE: method: cpt without modules_to_save trains no "
+                      "embeddings. Set modules_to_save: [embed_tokens, lm_head] "
+                      "to adapt the vocabulary.")
+
+        if method not in ("sft", "cpt"):
+            # SFT-only fields are not on a preference config and would be
+            # rejected; the shared TrainingArguments fields are.
+            for only_sft in ("dataset_text_field", "packing", "dataset_num_proc"):
+                sft_params.pop(only_sft, None)
+            sft_params["max_length"] = self.config["max_seq_length"]
+            sft_params["max_prompt_length"] = int(self.config.get(
+                "max_prompt_length", self.config["max_seq_length"] // 2))
+            if self.config.get("beta") is not None:
+                sft_params["beta"] = float(self.config["beta"])
+            if method == "kto":
+                for w in ("desirable_weight", "undesirable_weight"):
+                    if self.config.get(w) is not None:
+                        sft_params[w] = float(self.config[w])
+            self._require_columns(raw_dataset, spec["columns"], method)
+
+        reward_fns = []
+        if spec.get("needs_rewards"):
+            # Resolved before the model loads: a bad import path is a typo, and
+            # finding it after a multi-gigabyte load is the difference between
+            # a five-second fix and a lost session.
+            from praisonai_train.rewards import RewardError, require, resolve_all
+            try:
+                reward_fns = require(method, resolve_all(self.config.get("reward_funcs")))
+            except RewardError as exc:
+                raise ValueError(f"method '{method}': {exc}") from exc
+            for key in ("num_generations", "max_completion_length"):
+                if self.config.get(key) is not None:
+                    sft_params[key] = int(self.config[key])
+
+        cfg_cls = globals().get(spec["config"])
+        trainer_cls = globals().get(spec["trainer"])
+        if cfg_cls is None or trainer_cls is None:
+            raise RuntimeError(
+                f"method '{method}' needs {spec['trainer']} and {spec['config']} from TRL, "
+                f"which this TRL version does not provide. Upgrade trl, or use method: sft.")
+
+        # The same drop-unknown-fields guard the SFT path uses: a preference
+        # config is a different class with a different field set.
+        valid = _accepted_config_fields(cfg_cls)
+        if valid:
+            dropped = [k for k in sft_params if k not in valid]
+            if dropped:
+                print(f"WARNING: {spec['config']} does not accept "
+                      f"{sorted(dropped)}; ignoring.")
+                sft_params = {k: v for k, v in sft_params.items() if k in valid}
+
+        training_args = cfg_cls(**sft_params)
+        trainer_kwargs = {
+            "model": self.model,
+            "processing_class": self.hf_tokenizer,
+            "train_dataset": raw_dataset,
+            "eval_dataset": eval_dataset,
+            "args": training_args,
+            "callbacks": callbacks or None,
+        }
+        if reward_fns:
+            trainer_kwargs["reward_funcs"] = reward_fns
+        if spec["needs_ref_model"]:
+            # None means "use the frozen base weights". With a PEFT adapter that
+            # is exactly right, and it avoids a second full model in VRAM.
+            trainer_kwargs["ref_model"] = None
+        trainer = trainer_cls(**trainer_kwargs)
+
+        if self._response_markers:
+            # Applied to the trainer, not the config: this rewrites the label
+            # tensors on the already-tokenised dataset.
+            from unsloth.chat_templates import train_on_responses_only
+            instruction_part, response_part = self._response_markers
+            trainer = train_on_responses_only(
+                trainer, instruction_part=instruction_part, response_part=response_part)
+            print(f"DEBUG: masking prompt tokens via train_on_responses_only "
+                  f"(instruction={instruction_part!r}, response={response_part!r})")
         final_dir = self.config.get("final_model_dir", "lora_model")
         # One clear summary of what will run — so people and agents can confirm the
         # config resolved as intended without reading the DEBUG noise.
@@ -814,7 +1360,7 @@ class TrainModel:
             "\n──────────── PraisonAI Train ────────────\n"
             f"  Model:       {self.config['model_name']}\n"
             f"  Examples:    {len(raw_dataset)}{eval_str}\n"
-            f"  Loss mask:   {'assistant replies only' if self._masking_on else 'full sequence'}\n"
+            f"  Loss mask:   {_MASK_LABELS[self._masking_on]}\n"
             f"  Steps:       {steps}  ·  batch {sft_params['per_device_train_batch_size']}"
             f" × accum {sft_params['gradient_accumulation_steps']}{gpu_str}\n"
             f"  Checkpoints: {ckpt_str}  ·  Output: {final_dir}/\n"
@@ -896,6 +1442,7 @@ class TrainModel:
             load_kwargs["load_in_8bit"] = self._flag(self.config["load_in_8bit"])
             if load_kwargs["load_in_8bit"]:
                 load_kwargs["load_in_4bit"] = False
+        load_kwargs.update(model_access_kwargs(self.config, self._flag))
         if self.config.get("full_finetuning") is not None:
             load_kwargs["full_finetuning"] = self._flag(self.config["full_finetuning"])
         model, tokenizer = FastLanguageModel.from_pretrained(**load_kwargs)
@@ -927,6 +1474,29 @@ class TrainModel:
         if "/" not in name.strip("/") and os.path.isdir(name):
             shutil.rmtree(name)
 
+    def hub_push_kwargs(self):
+        """Options shared by every Hub push. See praisonai_train/_hub.py."""
+        from praisonai_train._hub import hub_push_kwargs
+        return hub_push_kwargs(self.config, flag=self._flag)
+
+    def save_merged_locally(self):
+        """Write merged weights to a directory instead of a Hub repo.
+
+        `save_pretrained_merged` (unsloth/save.py:2356) was never called, so the
+        only way to get merged weights was to push them -- which needs a Hub
+        account, a token, and a network. "Merge my adapter into a folder on this
+        disk" is the most common post-training request and was impossible.
+        """
+        target = self.config.get("merged_save_dir")
+        if not target:
+            return None
+        method = self.config.get("save_method", "merged_16bit")
+        print(f"DEBUG: writing {method} weights to {target}")
+        self.model.save_pretrained_merged(
+            target, self.hf_tokenizer, save_method=method)
+        print(f"Merged model written to {target}")
+        return target
+
     def save_model_merged(self):
         from huggingface_hub.utils import HfHubHTTPError
         repo = self.config["hf_model_name"]
@@ -935,8 +1505,8 @@ class TrainModel:
             self.model.push_to_hub_merged(
                 repo,
                 self.hf_tokenizer,
-                save_method="merged_16bit",
-                token=os.getenv("HF_TOKEN")
+                save_method=self.config.get("save_method", "merged_16bit"),
+                **self.hub_push_kwargs()
             )
         except HfHubHTTPError as exc:
             self._raise_hf_push_error(exc, repo)
@@ -949,7 +1519,9 @@ class TrainModel:
                 repo,
                 self.hf_tokenizer,
                 quantization_method=self.config.get("quantization_method", "q4_k_m"),
-                token=os.getenv("HF_TOKEN")
+                **({"imatrix_file": self.config["imatrix_file"]}
+                   if self.config.get("imatrix_file") else {}),
+                **self.hub_push_kwargs()
             )
         except HfHubHTTPError as exc:
             self._raise_hf_push_error(exc, repo)
@@ -1186,11 +1758,21 @@ class TrainModel:
         num_ctx_line = ""
         if "num_ctx" in chosen:
             num_ctx_line = f"PARAMETER num_ctx {chosen['num_ctx']}\n"
-        # Assemble and return the modelfile content.
-        return f"""FROM {output_model}
-    TEMPLATE \"\"\"{chosen['template']}\"\"\"
-    {system_line}{num_ctx_line}{stop_params}
-    """
+        # The template literals above are written at source indentation, so every
+        # continuation line carries a leading four spaces that would otherwise be
+        # baked into the served TEMPLATE (e.g. "\n    <start_of_turn>model"). That
+        # tokenizes differently from training and degrades a correct fine-tune, so
+        # strip the common leading indent from the template before embedding it.
+        # `dedent` needs a uniform indent, but the first line (right after `"""`)
+        # has none — normalise by indenting the first line, dedenting, then
+        # restoring it.
+        template = textwrap.dedent("    " + chosen["template"])
+        # Assemble and return the modelfile content at column 0.
+        return (
+            f"FROM {output_model}\n"
+            f'TEMPLATE """{template}"""\n'
+            f"{system_line}{num_ctx_line}{stop_params}\n"
+        )
 
     def create_and_push_ollama_model(self):
         from .._ollama import create_and_push_ollama_model
@@ -1226,6 +1808,7 @@ class TrainModel:
         # of crashing on a missing repo name or pushing to someone else's account.
         if self._flag(self.config.get("huggingface_save")) and self.config.get("hf_model_name"):
             self.save_model_merged()
+        self.save_merged_locally()
         if self._flag(self.config.get("huggingface_save_gguf")) and self.config.get("hf_model_name"):
             self.push_model_gguf()
         if self._flag(self.config.get("ollama_save")) and self.config.get("ollama_model"):
@@ -1251,7 +1834,12 @@ def main():
             trainer_obj = TrainModel(config_path=args.config)
             trainer_obj.run()
         except (ValueError, RuntimeError, subprocess.CalledProcessError) as exc:
-            print(f"\nERROR: {exc}\n", file=sys.stderr)
+            # OutOfMemoryError is a RuntimeError, so without this the user got
+            # torch's allocator dump as one ERROR line and no idea what to change.
+            if is_out_of_memory(exc):
+                print(f"\nERROR: {exc}\n\n{OOM_REMEDIATION}\n", file=sys.stderr)
+            else:
+                print(f"\nERROR: {exc}\n", file=sys.stderr)
             sys.exit(1)
         except KeyboardInterrupt:
             print("\nInterrupted.", file=sys.stderr)

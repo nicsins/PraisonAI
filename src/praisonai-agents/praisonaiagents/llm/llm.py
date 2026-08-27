@@ -28,6 +28,14 @@ from ..tools.call_executor import ToolCall, create_tool_call_executor
 from ..tools.schema import build_tool_definition
 
 
+# Sentinel returned as the "arguments" value when a tool call's argument string
+# cannot be parsed (e.g. truncated by max_tokens or a dropped connection).
+# It is distinct from {} ("no arguments"): {} would silently execute the tool
+# with the WRONG arguments and report success. Callers must detect this sentinel
+# and surface a tool-error so the model can re-emit the call instead.
+_TOOL_ARGUMENTS_PARSE_FAILED = object()
+
+
 def _durable_iteration_kwargs(execute_tool_fn: Callable, index: int) -> Dict[str, int]:
     if getattr(execute_tool_fn, "_accepts_durable_iteration", False):
         return {"_durable_iteration_index": index}
@@ -534,7 +542,18 @@ Respond with ONLY a valid JSON tool call in this format:
         if self._failover_manager:
             self._current_profile = self._failover_manager.get_next_profile()
             if self._current_profile:
-                self._switch_to_profile(self._current_profile)
+                # Apply the initial profile's values to the instance attributes
+                # (backward compatible with the documented llm.api_key/model
+                # surface). Later failover rotations are per-call only and do
+                # not mutate these attributes (issue #3613 gap 2).
+                profile = self._current_profile
+                if profile.api_key:
+                    self.api_key = profile.api_key
+                if profile.base_url:
+                    self.base_url = profile.base_url
+                if profile.model and profile.model != self.model:
+                    logging.info(f"Failover: using profile model {profile.model}")
+                    self.model = profile.model
 
         # Cache for formatted tools and messages
         self._formatted_tools_cache = {}
@@ -626,6 +645,16 @@ Respond with ONLY a valid JSON tool call in this format:
         base_urls = [self.base_url, os.getenv("OPENAI_BASE_URL", ""), os.getenv("OPENAI_API_BASE", "")]
         if any(url and ("ollama" in url.lower() or ":11434" in url) for url in base_urls):
             return "ollama"
+        
+        # Substring fallback for routed models whose provider is not the first
+        # path segment (e.g. bedrock/anthropic.claude-*, vertex_ai/claude-*,
+        # openrouter/anthropic/*, vertex_ai/gemini-*). Mirrors the substring
+        # fallback in get_provider_adapter so these get the correct adapter
+        # (and its streaming guard) instead of falling through to "openai".
+        if "claude" in model_lower or "anthropic" in model_lower:
+            return "anthropic"
+        if "gemini" in model_lower:
+            return "gemini"
         
         # Default fallback
         return "openai"
@@ -974,18 +1003,58 @@ Respond with ONLY a valid JSON tool call in this format:
 
     def _switch_to_profile(self, profile: "AuthProfile") -> None:
         """Switch to a new auth profile for failover.
-        
+
+        The profile's credentials are threaded through the per-call kwargs of
+        the retry loop instead of being written onto the shared instance. The
+        old behaviour mutated ``self.api_key``/``self.base_url``/``self.model``
+        on a shared ``LLM`` (issue #3613 gap 2), so concurrent requests on one
+        instance could silently cross-talk credentials and model after a
+        failover rotation. Keeping the instance attributes on the initial
+        profile preserves single-profile behaviour and the documented
+        ``llm.api_key``/``llm.model`` surface.
+
         Args:
             profile: AuthProfile to switch to
         """
+        # NOTE: profile values are applied to the per-call kwargs by
+        # _handle_retry_exception when it rotates. This method is kept as a
+        # no-op placeholder so any out-of-tree callers that invoke it directly
+        # keep working; it intentionally no longer mutates shared state.
+        if profile is None:
+            return
+
+    def _response_model_for_tracking(self, response: Any) -> str:
+        """Model to attribute token usage to for a completed call.
+
+        Prefers the model carried on the response itself, which reflects the
+        provider/profile that actually served the request. This is race-free
+        under concurrency (unlike reading the shared ``self._current_profile``)
+        and stays correct after a failover rotation. Falls back to
+        ``self.model`` when the response does not expose a model.
+        """
+        model = None
+        if isinstance(response, dict):
+            model = response.get("model")
+        else:
+            model = getattr(response, "model", None)
+        return model or self.model
+
+    def _apply_profile_to_kwargs(self, profile: "AuthProfile", kwargs: dict) -> dict:
+        """Return a new kwargs dict with profile overrides applied.
+
+        Never mutates ``self``: the active profile is a per-call concern, so
+        its credentials travel in the request kwargs only. Callers that pass
+        an explicit per-call override (e.g. ``api_key=``) keep it; profile
+        values fill in the gaps.
+        """
+        kwargs = dict(kwargs)
         if profile.api_key:
-            self.api_key = profile.api_key
+            kwargs["api_key"] = profile.api_key
         if profile.base_url:
-            self.base_url = profile.base_url
-        if profile.model and profile.model != self.model:
-            # Only log if model actually changes
-            logging.info(f"Failover: switching from {self.model} to {profile.model}")
-            self.model = profile.model
+            kwargs["base_url"] = profile.base_url
+        if profile.model:
+            kwargs["model"] = profile.model
+        return kwargs
 
     def _resolve_subscription_creds(self):
         """Lazy resolve + cache subscription credentials, checking expiration."""
@@ -1055,7 +1124,7 @@ Respond with ONLY a valid JSON tool call in this format:
             )
             return None
 
-    def _handle_retry_exception(self, e, attempt, kwargs, refreshed_creds=None):
+    def _handle_retry_exception(self, e, attempt, kwargs, refreshed_creds=None, active_profile=None):
         """Decide retry vs raise from a failover decision. No sleep/await.
 
         Shared decision logic used by both the sync (`_call_with_retry`) and
@@ -1069,21 +1138,34 @@ Respond with ONLY a valid JSON tool call in this format:
         blocks the event loop. The already-refreshed credentials (if any) are
         passed in via ``refreshed_creds``.
 
+        The active failover profile is a *per-call* value threaded in via
+        ``active_profile`` and returned back in the result tuple. It is never
+        read from or written to ``self._current_profile`` here, so concurrent
+        requests sharing one ``LLM`` instance cannot corrupt each other's
+        failover bookkeeping or cost attribution (issue #3613 gap 2).
+
         Args:
             e: The exception raised by the wrapped call.
             attempt: Zero-based attempt index for the current iteration.
             kwargs: Keyword arguments for the wrapped call (may be updated).
             refreshed_creds: Credentials already refreshed by the caller (off
                 the event loop for async), or ``None`` if no refresh was done.
+            active_profile: The profile this call is currently using, or
+                ``None``. Defaults to the initial profile for backward compat.
 
         Returns:
-            Tuple of (should_raise, category, retry_delay, error_str, kwargs):
+            Tuple of (should_raise, category, retry_delay, error_str, kwargs,
+            active_profile):
                 should_raise: Whether the caller should re-raise immediately.
                 category: The error category/reason from the decision.
                 retry_delay: Seconds to wait before the next attempt.
                 error_str: String form of the exception.
                 kwargs: The (possibly updated) keyword arguments.
+                active_profile: The (possibly rotated) profile for the next
+                    attempt.
         """
+        if active_profile is None:
+            active_profile = self._current_profile
         # A turn is "side-effecting" when it exposes tools the model may call:
         # a post-dispatch failure on such a turn could have already run a
         # side-effecting tool, so it must not be silently replayed. A turn with
@@ -1135,55 +1217,48 @@ Respond with ONLY a valid JSON tool call in this format:
         # immediately with fresh credentials and skip profile rotation so we
         # neither mark the current profile failed nor overwrite the new creds.
         if refreshed_auth:
-            return False, category, retry_delay, error_str, kwargs
+            return False, category, retry_delay, error_str, kwargs, active_profile
 
-        # Handle different failover decision actions
+        # Handle different failover decision actions. Rotation is a per-call
+        # concern: the active profile is a local threaded in/out of this method,
+        # never self._current_profile, so concurrent calls on one shared LLM
+        # cannot mark each other's profiles failed/healthy (issue #3613 gap 2).
         if decision.action == "rotate_profile" and self._failover_manager:
-            if self._current_profile:
+            if active_profile:
                 is_rate_limit = (category == "rate_limit")
                 self._failover_manager.mark_failure(
-                    self._current_profile, error_str, is_rate_limit=is_rate_limit
+                    active_profile, error_str, is_rate_limit=is_rate_limit
                 )
             next_profile = self._failover_manager.get_next_profile()
-            if next_profile and next_profile != self._current_profile:
-                self._switch_to_profile(next_profile)
-                self._current_profile = next_profile
-                # Update the kwargs with new profile values for the next retry
-                if "api_key" in kwargs:
-                    kwargs["api_key"] = self.api_key
-                if "base_url" in kwargs:
-                    kwargs["base_url"] = self.base_url
-                if "model" in kwargs:
-                    kwargs["model"] = self.model
+            if next_profile and next_profile != active_profile:
+                active_profile = next_profile
+                # Thread the active profile through the per-call kwargs so the
+                # shared instance state is never mutated (issue #3613 gap 2).
+                kwargs = self._apply_profile_to_kwargs(next_profile, kwargs)
                 logging.info(f"Failover: switched to profile '{next_profile.name}'")
             else:
                 # No alternate profile available - retrying would just hit the
                 # same failing profile, so surface the error instead.
                 can_retry = False
         # Legacy failover for compatibility (when decision is retry but failover is configured)
-        elif self._failover_manager and self._current_profile and decision.action == "retry":
+        elif self._failover_manager and active_profile and decision.action == "retry":
             is_rate_limit = (category == "rate_limit")
             self._failover_manager.mark_failure(
-                self._current_profile, error_str, is_rate_limit=is_rate_limit
+                active_profile, error_str, is_rate_limit=is_rate_limit
             )
             next_profile = self._failover_manager.get_next_profile()
-            if next_profile and next_profile != self._current_profile:
-                self._switch_to_profile(next_profile)
-                self._current_profile = next_profile
-                # Update the kwargs with new profile values for the next retry
-                if "api_key" in kwargs:
-                    kwargs["api_key"] = self.api_key
-                if "base_url" in kwargs:
-                    kwargs["base_url"] = self.base_url
-                if "model" in kwargs:
-                    kwargs["model"] = self.model
+            if next_profile and next_profile != active_profile:
+                active_profile = next_profile
+                # Thread the active profile through the per-call kwargs so the
+                # shared instance state is never mutated (issue #3613 gap 2).
+                kwargs = self._apply_profile_to_kwargs(next_profile, kwargs)
                 # Enable retry for profile switch even if originally non-retryable
                 can_retry = True
                 retry_delay = 0.0
                 logging.info(f"Failover: switched to profile '{next_profile.name}'")
 
         should_raise = decision.action == "surface_error" or not can_retry
-        return should_raise, category, retry_delay, error_str, kwargs
+        return should_raise, category, retry_delay, error_str, kwargs, active_profile
 
     def _call_with_retry(self, func, *args, **kwargs):
         """Call a function with automatic retry on rate limit errors and failover support.
@@ -1200,6 +1275,10 @@ Respond with ONLY a valid JSON tool call in this format:
             The original exception if max retries exceeded
         """
         last_error = None
+        # Track the failover profile per call (never self._current_profile) so
+        # concurrent calls on one shared LLM cannot corrupt each other's
+        # failover bookkeeping (issue #3613 gap 2).
+        active_profile = self._current_profile
 
         for attempt in range(self._max_retries + 1):
             try:
@@ -1210,8 +1289,8 @@ Respond with ONLY a valid JSON tool call in this format:
                 result = func(*args, **kwargs)
                 
                 # Mark success if failover is configured
-                if self._failover_manager and self._current_profile:
-                    self._failover_manager.mark_success(self._current_profile)
+                if self._failover_manager and active_profile:
+                    self._failover_manager.mark_success(active_profile)
                 
                 # Reset idle timeout circuit breaker on success
                 self._idle_timeout_breaker.reset()
@@ -1226,8 +1305,12 @@ Respond with ONLY a valid JSON tool call in this format:
                 if self._should_attempt_auth_refresh(e, attempt):
                     refreshed_creds = self._try_refresh_subscription_creds()
 
-                should_raise, category, retry_delay, error_str, kwargs = (
-                    self._handle_retry_exception(e, attempt, kwargs, refreshed_creds=refreshed_creds)
+                should_raise, category, retry_delay, error_str, kwargs, active_profile = (
+                    self._handle_retry_exception(
+                        e, attempt, kwargs,
+                        refreshed_creds=refreshed_creds,
+                        active_profile=active_profile,
+                    )
                 )
 
                 if should_raise:
@@ -1276,6 +1359,10 @@ Respond with ONLY a valid JSON tool call in this format:
             The original exception if max retries exceeded
         """
         last_error = None
+        # Track the failover profile per call (never self._current_profile) so
+        # concurrent coroutines on one shared LLM cannot corrupt each other's
+        # failover bookkeeping (issue #3613 gap 2).
+        active_profile = self._current_profile
 
         for attempt in range(self._max_retries + 1):
             try:
@@ -1286,8 +1373,8 @@ Respond with ONLY a valid JSON tool call in this format:
                 result = await func(*args, **kwargs)
                 
                 # Mark success if failover is configured
-                if self._failover_manager and self._current_profile:
-                    self._failover_manager.mark_success(self._current_profile)
+                if self._failover_manager and active_profile:
+                    self._failover_manager.mark_success(active_profile)
                 
                 # Reset idle timeout circuit breaker on success
                 self._idle_timeout_breaker.reset()
@@ -1305,8 +1392,12 @@ Respond with ONLY a valid JSON tool call in this format:
                         self._try_refresh_subscription_creds
                     )
 
-                should_raise, category, retry_delay, error_str, kwargs = (
-                    self._handle_retry_exception(e, attempt, kwargs, refreshed_creds=refreshed_creds)
+                should_raise, category, retry_delay, error_str, kwargs, active_profile = (
+                    self._handle_retry_exception(
+                        e, attempt, kwargs,
+                        refreshed_creds=refreshed_creds,
+                        active_profile=active_profile,
+                    )
                 )
 
                 if should_raise:
@@ -1358,7 +1449,7 @@ Respond with ONLY a valid JSON tool call in this format:
         import litellm
         response = self._call_with_retry(litellm.completion, **completion_params)
         if not completion_params.get("stream"):
-            self._track_token_usage(response, self.model)
+            self._track_token_usage(response, self._response_model_for_tracking(response))
         return response
 
     async def _acompletion_with_retry(self, **completion_params):
@@ -1379,7 +1470,7 @@ Respond with ONLY a valid JSON tool call in this format:
             **completion_params,
         )
         if not completion_params.get("stream"):
-            self._track_token_usage(response, self.model)
+            self._track_token_usage(response, self._response_model_for_tracking(response))
         return response
 
     def _supports_web_search(self) -> bool:
@@ -1771,7 +1862,10 @@ Respond with ONLY a valid JSON tool call in this format:
                 if isinstance(tool_call.get("function"), dict)
                 else None
             ) or tool_call.get("name", "unknown_function")
-            arguments = {}
+            # A parse failure is NOT "no arguments". Returning {} here would run
+            # the tool with the wrong arguments and report success. Signal the
+            # failure so callers surface a tool-error instead of dispatching.
+            arguments = _TOOL_ARGUMENTS_PARSE_FAILED
             tool_call_id = tool_call.get("id", f"tool_{id(tool_call)}")
             
         return function_name, arguments, tool_call_id
@@ -2326,8 +2420,8 @@ Respond with ONLY a valid JSON tool call in this format:
             # Handle Gemini internal tools (e.g., {"googleSearch": {}}, {"urlContext": {}}, {"codeExecution": {}})
             elif isinstance(tool, dict) and len(tool) == 1:
                 tool_name = next(iter(tool.keys()))
-                gemini_internal_tools = {'googleSearch', 'urlContext', 'codeExecution'}
-                if tool_name in gemini_internal_tools:
+                from .model_capabilities import GEMINI_INTERNAL_TOOLS
+                if tool_name in GEMINI_INTERNAL_TOOLS:
                     logging.debug(f"Using Gemini internal tool: {tool_name}")
                     formatted_tools.append(tool)
                 else:
@@ -2436,7 +2530,7 @@ Respond with ONLY a valid JSON tool call in this format:
         prompt: Union[str, List[Dict]],
         system_prompt: Optional[str] = None,
         chat_history: Optional[List[Dict]] = None,
-        temperature: float = 1.0,
+        temperature: Optional[float] = None,
         tools: Optional[List[Any]] = None,
         output_json: Optional[BaseModel] = None,
         output_pydantic: Optional[BaseModel] = None,
@@ -2753,10 +2847,17 @@ Respond with ONLY a valid JSON tool call in this format:
                             # Execute tool calls using ToolCallExecutor (Gap 2: parallel or sequential)
                             is_ollama = self._is_ollama_provider()
                             tool_calls_batch = []
+                            parse_error_messages = []
                             
                             # Prepare batch of ToolCall objects
                             for tool_call in tool_calls:
                                 function_name, arguments, tool_call_id = self._extract_tool_call_info(tool_call, is_ollama=is_ollama)
+                                if self._tool_arguments_parse_failed(arguments):
+                                    # Do NOT dispatch with {}: surface a retryable error.
+                                    parse_error_messages.append(
+                                        self._tool_parse_error_message(function_name, tool_call_id)
+                                    )
+                                    continue
                                 tool_calls_batch.append(ToolCall(
                                     function_name=function_name,
                                     arguments=arguments,
@@ -2829,6 +2930,11 @@ Respond with ONLY a valid JSON tool call in this format:
                                     "tool_call_id": tool_result_obj.tool_call_id,
                                     "content": content,
                                 })
+
+                            # Report any unparseable tool-call arguments so the
+                            # model can re-emit them (never dispatched with {}).
+                            for _err_msg in parse_error_messages:
+                                messages.append(_err_msg)
 
                             # Safety: break after max_iter iterations
                             if iteration_count + 1 >= max_iterations:
@@ -3533,6 +3639,11 @@ Respond with ONLY a valid JSON tool call in this format:
                             is_ollama = self._is_ollama_provider()
                             function_name, arguments, tool_call_id = self._extract_tool_call_info(tool_call, is_ollama)
 
+                            if self._tool_arguments_parse_failed(arguments):
+                                # Do NOT dispatch with {}: surface a retryable error.
+                                messages.append(self._tool_parse_error_message(function_name, tool_call_id))
+                                continue
+
                             # Validate and filter arguments for Ollama provider
                             if is_ollama and tools:
                                 # First check if any argument references a previous tool result
@@ -4092,7 +4203,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
         prompt: Union[str, List[Dict]],
         system_prompt: Optional[str] = None,
         chat_history: Optional[List[Dict]] = None,
-        temperature: float = 1.0,
+        temperature: Optional[float] = None,
         tools: Optional[List[Any]] = None,
         output_json: Optional[BaseModel] = None,
         output_pydantic: Optional[BaseModel] = None,
@@ -4277,10 +4388,17 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                         # Execute tool calls using ToolCallExecutor (Gap 2: parallel or sequential)
                         is_ollama = self._is_ollama_provider()
                         tool_calls_batch = []
+                        parse_error_messages = []
                         
                         # Prepare batch of ToolCall objects
                         for tool_call in tool_calls:
                             function_name, arguments, tool_call_id = self._extract_tool_call_info(tool_call, is_ollama)
+                            if self._tool_arguments_parse_failed(arguments):
+                                # Do NOT dispatch with {}: surface a retryable error.
+                                parse_error_messages.append(
+                                    self._tool_parse_error_message(function_name, tool_call_id)
+                                )
+                                continue
                             tool_calls_batch.append(ToolCall(
                                 function_name=function_name,
                                 arguments=arguments, 
@@ -4320,6 +4438,11 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                     tool_result.is_ollama
                                 )
                             messages.append(tool_message)
+
+                        # Report any unparseable tool-call arguments so the
+                        # model can re-emit them (never dispatched with {}).
+                        for _err_msg in parse_error_messages:
+                            messages.append(_err_msg)
                         
                         # Continue conversation after tool execution - get follow-up response
                         try:
@@ -4427,7 +4550,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
         prompt: Union[str, List[Dict]],
         system_prompt: Optional[str] = None,
         chat_history: Optional[List[Dict]] = None,
-        temperature: float = 1.0,
+        temperature: Optional[float] = None,
         tools: Optional[List[Any]] = None,
         output_json: Optional[BaseModel] = None,
         output_pydantic: Optional[BaseModel] = None,
@@ -4657,6 +4780,10 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                         
                         for tool_call in tool_calls:
                             function_name, arguments, tool_call_id = self._extract_tool_call_info(tool_call)
+                            if self._tool_arguments_parse_failed(arguments):
+                                # Do NOT dispatch with {}: surface a retryable error.
+                                messages.append(self._tool_parse_error_message(function_name, tool_call_id))
+                                continue
                             logging.debug(f"[RESPONSES_API_ASYNC] Executing tool {function_name}")
                             tool_result = await _dispatch_async_tool(
                                 execute_tool_fn,
@@ -4905,6 +5032,11 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                         # Handle both object and dict access patterns
                         is_ollama = self._is_ollama_provider()
                         function_name, arguments, tool_call_id = self._extract_tool_call_info(tool_call, is_ollama)
+
+                        if self._tool_arguments_parse_failed(arguments):
+                            # Do NOT dispatch with {}: surface a retryable error.
+                            messages.append(self._tool_parse_error_message(function_name, tool_call_id))
+                            continue
 
                         # Validate and filter arguments for Ollama provider
                         if is_ollama and tools:
@@ -5616,6 +5748,16 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
         
         # Override with any provided parameters
         params.update(override_params)
+
+        # Resolve temperature from the instance when the caller did not specify
+        # one. Public entry points now default temperature to None so a value
+        # configured via Agent(llm={'temperature': ...}) actually reaches the
+        # request instead of being silently overridden by a hardcoded 1.0.
+        if params.get("temperature") is None:
+            if self.temperature is not None:
+                params["temperature"] = self.temperature
+            else:
+                params.pop("temperature", None)
         
         # Handle structured output parameters
         output_json = override_params.get('output_json')
@@ -5948,6 +6090,19 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
         if self.timeout:
             params["timeout"] = self.timeout
 
+        # ── Subscription credentials ────────────────────────────────────
+        # Mirror _build_completion_params: without this the Responses API
+        # transport silently ignores auth= and bills the plain API key.
+        creds = self._resolve_subscription_creds()
+        if creds:
+            params["api_key"] = creds.api_key
+            if creds.base_url:
+                params["base_url"] = creds.base_url
+            if creds.headers:
+                extra_headers = dict(params.get("extra_headers") or {})
+                extra_headers.update(creds.headers)
+                params["extra_headers"] = extra_headers
+
         # ── Structured output ───────────────────────────────────────────
         output_json = kwargs.pop("output_json", None)
         output_pydantic = kwargs.pop("output_pydantic", None)
@@ -5998,7 +6153,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
         """
         import litellm
         response = await self._call_with_retry_async(litellm.aresponses, **params)
-        self._track_token_usage(response, self.model)
+        self._track_token_usage(response, self._response_model_for_tracking(response))
         return response
 
     def _extract_from_responses_output(self, response) -> tuple:
@@ -6237,6 +6392,17 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                         is_reasoning=False,
                     ))
 
+            elif evt_type == "response.reasoning_summary_text.delta":
+                delta_text = (event.get("delta", "") if isinstance(event, dict)
+                              else getattr(event, "delta", ""))
+                if _emit and delta_text:
+                    stream_callback(StreamEvent(
+                        type=StreamEventType.DELTA_TEXT,
+                        timestamp=time.perf_counter(),
+                        content=delta_text,
+                        is_reasoning=True,
+                    ))
+
             elif evt_type == "response.function_call_arguments.delta":
                 idx = (event.get("output_index", 0) if isinstance(event, dict)
                        else getattr(event, "output_index", 0))
@@ -6349,17 +6515,41 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                 tool_call_id = tool_call.id
             except (json.JSONDecodeError, AttributeError) as e:
                 logging.error(f"Error parsing object-style tool call: {e}")
-                function_name = "unknown_function"
-                arguments = {}
-                tool_call_id = f"tool_{id(tool_call)}"
+                function_name = getattr(getattr(tool_call, 'function', None), 'name', None) or "unknown_function"
+                # See _parse_tool_call_arguments: a parse failure is not {}.
+                arguments = _TOOL_ARGUMENTS_PARSE_FAILED
+                tool_call_id = getattr(tool_call, 'id', None) or f"tool_{id(tool_call)}"
             return function_name, arguments, tool_call_id
+
+    @staticmethod
+    def _tool_arguments_parse_failed(arguments) -> bool:
+        """True when tool-call arguments could not be parsed (vs. legitimately empty)."""
+        return arguments is _TOOL_ARGUMENTS_PARSE_FAILED
+
+    @staticmethod
+    def _tool_parse_error_message(function_name: str, tool_call_id: str) -> Dict[str, str]:
+        """Build a tool-role message telling the model its arguments were lost.
+
+        Surfacing this instead of dispatching with {} converts a silent
+        wrong-action-reported-as-success into a visible, retryable error.
+        """
+        return {
+            "role": "tool",
+            "tool_call_id": tool_call_id,
+            "content": (
+                f"Error: arguments for tool '{function_name}' could not be parsed "
+                f"(the argument string was invalid or truncated). "
+                f"The tool was NOT executed. Please re-emit the tool call with "
+                f"complete, valid JSON arguments."
+            ),
+        }
 
     # Response without tool calls
     def response(
         self,
         prompt: Union[str, List[Dict]],
         system_prompt: Optional[str] = None,
-        temperature: float = 1.0,
+        temperature: Optional[float] = None,
         stream: bool = True,
         verbose: bool = True,
         markdown: bool = True,
@@ -6453,7 +6643,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
         self,
         prompt: Union[str, List[Dict]],
         system_prompt: Optional[str] = None,
-        temperature: float = 1.0,
+        temperature: Optional[float] = None,
         stream: bool = True,
         verbose: bool = True,
         markdown: bool = True,

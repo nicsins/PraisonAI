@@ -32,6 +32,12 @@ class ApprovalRequest:
         approval_id: Stable correlation id that survives a process restart
                      and can be matched to an inbound channel callback.
                      Auto-generated when not supplied.
+        authorized_reviewers: Optional set of reviewer identities allowed to
+                     resolve this request. ``None`` (default) keeps today's
+                     behaviour (any scope-holder may resolve). When populated a
+                     backend may bind resolution to these reviewers so that in a
+                     multi-operator deployment a request addressed to one
+                     operator cannot be resolved by another.
     """
 
     tool_name: str
@@ -41,6 +47,7 @@ class ApprovalRequest:
     session_id: Optional[str] = None
     context: Dict[str, Any] = field(default_factory=dict)
     approval_id: str = field(default_factory=_new_approval_id)
+    authorized_reviewers: Optional[List[str]] = None
 
 
 @dataclass
@@ -65,6 +72,12 @@ class ApprovalDecision:
                        ``session``/``always`` scopes (e.g. ``"bash:git status *"``
                        or ``"edit:src/app.py"``). When ``None`` the registry
                        derives one from the tool call.
+        feedback:      Optional free-text guidance supplied by the user when
+                       denying a tool call ("deny with guidance"). When present
+                       on a denial it is surfaced back to the model as a
+                       course-correction for the next turn instead of a bare
+                       "denied" result. ``None`` (default) keeps today's
+                       terminal-deny semantics.
     """
 
     approved: bool
@@ -74,6 +87,7 @@ class ApprovalDecision:
     metadata: Dict[str, Any] = field(default_factory=dict)
     scope: str = "once"
     scope_pattern: Optional[str] = None
+    feedback: Optional[str] = None
 
 
 @dataclass

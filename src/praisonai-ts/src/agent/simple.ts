@@ -2,9 +2,54 @@ import { OpenAIService } from '../llm/openai';
 import { Logger } from '../utils/logger';
 import type { ChatCompletionTool } from 'openai/resources/chat/completions';
 import type { DbAdapter, DbMessage, DbRun } from '../db/types';
-import { randomUUID } from 'crypto';
 import type { LLMProvider } from '../llm/providers/types';
 import type { BackendResolutionResult } from '../llm/backend-resolver';
+import { ApprovalManager, createCLIApprovalPrompt } from '../ai/tool-approval';
+import { getEnv } from '../llm/openaiClientOptions';
+
+/**
+ * The default token sink for `start()` when no `onToken` is supplied.
+ *
+ * Exported so a test can call it rather than re-implementing the guard. A
+ * webview has no `stdout`: unguarded, this threw on the FIRST streamed token,
+ * so streaming died immediately even though the constructor had succeeded.
+ */
+export function writeTokenToStdout(token: string): void {
+  if (typeof process !== 'undefined' && process.stdout) {
+    process.stdout.write(token);
+  }
+}
+
+/**
+ * Generate a RFC-4122 v4 UUID using WebCrypto.
+ *
+ * Uses `globalThis.crypto.randomUUID` (available in all supported webviews and
+ * Node >= 19), falling back to a `getRandomValues`-based implementation so the
+ * Agent import graph never pulls in the Node `crypto` builtin. This keeps the
+ * module bundleable for browser/webview targets.
+ */
+function randomUUID(): string {
+  const c = globalThis.crypto;
+  if (c?.randomUUID) {
+    return c.randomUUID();
+  }
+  const bytes = new Uint8Array(16);
+  if (c?.getRandomValues) {
+    c.getRandomValues(bytes);
+  } else {
+    for (let i = 0; i < 16; i++) bytes[i] = Math.floor(Math.random() * 256);
+  }
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, '0'));
+  return (
+    hex[0] + hex[1] + hex[2] + hex[3] + '-' +
+    hex[4] + hex[5] + '-' +
+    hex[6] + hex[7] + '-' +
+    hex[8] + hex[9] + '-' +
+    hex[10] + hex[11] + hex[12] + hex[13] + hex[14] + hex[15]
+  );
+}
 
 /**
  * Agent Configuration
@@ -40,6 +85,13 @@ import type { BackendResolutionResult } from '../llm/backend-resolver';
  * await agent.chat("Hello!");
  * ```
  */
+/**
+ * Terminal reason for the most recent agent run, mirroring Python's
+ * `Agent.last_stop_reason`. Lets callers distinguish a completed run from a
+ * truncated one instead of both looking identical.
+ */
+export type StopReason = 'completed' | 'max_steps' | 'cancelled' | 'error';
+
 export interface SimpleAgentConfig {
   /** Agent instructions/system prompt (required) */
   instructions: string;
@@ -56,6 +108,22 @@ export interface SimpleAgentConfig {
    * Default: "gpt-4o-mini"
    */
   llm?: string;
+  /**
+   * API key for the LLM provider. Mirrors Python's per-agent `api_key`
+   * (agent/agent.py). Falls back to OPENAI_API_KEY when omitted.
+   */
+  apiKey?: string;
+  /**
+   * Base URL for the LLM provider. Mirrors Python's per-agent `base_url`
+   * (agent/agent.py). Useful for OpenAI-compatible endpoints.
+   */
+  baseURL?: string;
+  /**
+   * Custom fetch implementation. Lets a host route provider egress through
+   * native code (e.g. a Tauri command), keeping the API key out of the JS
+   * heap and avoiding CORS for embedded webviews. Implies browser support.
+   */
+  fetch?: typeof fetch;
   /** Enable markdown formatting in responses */
   markdown?: boolean;
   /** Enable streaming responses (default: true) */
@@ -75,6 +143,28 @@ export interface SimpleAgentConfig {
   outputSchemaName?: string;
   /** Map of tool function implementations */
   toolFunctions?: Record<string, Function>;
+  /**
+   * Human-in-the-loop approval gate for tool calls (mirrors Python's
+   * `approval`). When `true`, every tool is gated behind an interactive CLI
+   * prompt (approve/deny per call); pass an `ApprovalManager` instance to use
+   * custom handlers / auto-approve-deny rules (e.g. a UI responder). Denied
+   * calls are reported back to the model as the tool result rather than
+   * throwing, so it can course-correct.
+   */
+  approval?: boolean | ApprovalManager;
+  /**
+   * Maximum number of tool-call round-trips before the loop is aborted
+   * (default: 20, matching Python's `ExecutionConfig.max_iter`). When the cap
+   * is reached the run sets `lastStopReason = 'max_steps'` and throws instead
+   * of silently returning an empty string, so exhaustion is observable.
+   */
+  maxIterations?: number;
+  /**
+   * Maximum number of tool calls executed within a single round-trip
+   * (default: 10, matching Python's `ExecutionConfig.max_tool_calls_per_turn`).
+   * Extra tool calls beyond this cap in one turn are ignored.
+   */
+  maxToolCallsPerTurn?: number;
   /** Database adapter for persistence */
   db?: DbAdapter;
   /** Session ID for conversation persistence (auto-generated if not provided) */
@@ -94,6 +184,14 @@ export interface SimpleAgentConfig {
   /** Enable telemetry tracking (default: false, opt-in) */
   telemetry?: boolean;
   
+  /**
+   * Default abort signal for cancellation. Aborting it stops the underlying
+   * provider request (a working Stop button). An explicit signal passed to
+   * chat()/start() takes precedence over this. Mirrors Python's
+   * interrupt_controller / cancel_token.
+   */
+  signal?: AbortSignal;
+
   // Advanced mode (role/goal/backstory) - for compatibility
   /** Agent role (advanced mode) */
   role?: string;
@@ -103,6 +201,33 @@ export interface SimpleAgentConfig {
   backstory?: string;
 }
 
+/**
+ * Discriminated union emitted by {@link Agent.streamEvents}.
+ *
+ * Mirrors Python's `StreamEvent` channel (praisonaiagents streaming/events.py):
+ * structured information travels here while {@link Agent.stream} yields plain
+ * text tokens. `text` carries an incremental delta; `finish` carries the full
+ * response; `error` carries a thrown error.
+ */
+export type AgentEvent =
+  | { type: 'text'; delta: string }
+  | { type: 'finish'; text: string }
+  | { type: 'error'; error: Error };
+
+/** Options for {@link Agent.stream} / {@link Agent.streamEvents}. */
+export interface AgentStreamOptions {
+  /** Previous result to substitute for the `{{previous}}` placeholder. */
+  previousResult?: string;
+  /**
+   * Turn-scoped abort signal. Aborting it stops the underlying provider
+   * request so no further tokens are generated or billed. Independent of the
+   * agent-level `SimpleAgentConfig.signal`: cancel one turn while keeping the
+   * agent. Breaking out of the `for await` loop also aborts automatically —
+   * the iterator's `return()` is the language's own cancellation signal.
+   */
+  signal?: AbortSignal;
+}
+
 export class Agent {
   private instructions: string;
   public name: string;
@@ -110,12 +235,20 @@ export class Agent {
   private pretty: boolean;
   private llm: string;
   private markdown: boolean;
-  private stream: boolean;
+  private streamEnabled: boolean;
   private llmService: OpenAIService;
   private tools?: any[];
   private outputSchema?: Record<string, any>;
   private outputSchemaName: string = 'response';
   private toolFunctions: Record<string, Function> = {};
+  private approvalManager?: ApprovalManager;
+  private maxIterations: number;
+  private maxToolCallsPerTurn: number;
+  /**
+   * Terminal reason for the most recent run (mirrors Python's
+   * `Agent.last_stop_reason`). `null` until the agent has run at least once.
+   */
+  public lastStopReason: StopReason | null = null;
   private dbAdapter?: DbAdapter;
   private sessionId: string;
   private runId: string;
@@ -128,6 +261,7 @@ export class Agent {
   private cacheTTL: number;
   private responseCache: Map<string, { response: string; timestamp: number }> = new Map();
   private telemetryEnabled: boolean;
+  private signal?: AbortSignal;
   
   // AI SDK backend support
   private _backend: LLMProvider | null = null;
@@ -151,11 +285,11 @@ export class Agent {
     }
     
     this.name = config.name || `Agent_${Math.random().toString(36).substr(2, 9)}`;
-    this.verbose = config.verbose ?? process.env.PRAISON_VERBOSE !== 'false';
-    this.pretty = config.pretty ?? process.env.PRAISON_PRETTY === 'true';
-    this.llm = config.llm || process.env.OPENAI_MODEL_NAME || process.env.PRAISONAI_MODEL || 'gpt-4o-mini';
+    this.verbose = config.verbose ?? getEnv('PRAISON_VERBOSE') !== 'false';
+    this.pretty = config.pretty ?? getEnv('PRAISON_PRETTY') === 'true';
+    this.llm = config.llm || getEnv('OPENAI_MODEL_NAME') || getEnv('PRAISONAI_MODEL') || 'gpt-4o-mini';
     this.markdown = config.markdown ?? true;
-    this.stream = config.stream ?? true;
+    this.streamEnabled = config.stream ?? true;
     // NOTE: this.tools is rebuilt below from a snapshot of config.tools —
     // aliasing the caller's array while addAutoGeneratedToolDefinition pushes
     // into it corrupted the list (raw functions + duplicate definitions were
@@ -163,6 +297,20 @@ export class Agent {
     this.tools = undefined;
     this.outputSchema = config.outputSchema;
     this.outputSchemaName = config.outputSchemaName || 'response';
+    if (config.approval instanceof ApprovalManager) {
+      this.approvalManager = config.approval;
+    } else if (config.approval === true) {
+      // `true` shorthand: gate every tool via an interactive CLI prompt.
+      // Without a handler, requestApproval() would fall through to a Promise
+      // awaiting respond() that nobody calls — stalling every tool for the
+      // full 5-min timeout before denying. Wire the built-in prompt so the
+      // default is usable and safe (blocks until the operator answers).
+      const manager = new ApprovalManager();
+      manager.onApprovalRequest(createCLIApprovalPrompt());
+      this.approvalManager = manager;
+    }
+    this.maxIterations = config.maxIterations ?? 20;
+    this.maxToolCallsPerTurn = config.maxToolCallsPerTurn ?? 10;
     this.dbAdapter = config.db;
     this.sessionId = config.sessionId || this.generateSessionId();
     this.runId = config.runId || randomUUID();
@@ -172,6 +320,7 @@ export class Agent {
     this.cache = config.cache ?? false;
     this.cacheTTL = config.cacheTTL ?? 3600;
     this.telemetryEnabled = config.telemetry ?? false;
+    this.signal = config.signal;
     
     // Parse model string to extract provider and model ID
     // Format: "provider/model" or just "model"
@@ -181,7 +330,11 @@ export class Agent {
     // For OpenAI, use OpenAIService directly for backward compatibility
     // For other providers, we'll use the AI SDK backend via getBackend()
     this._useAISDKBackend = providerId !== 'openai';
-    this.llmService = new OpenAIService(modelId);
+    this.llmService = new OpenAIService(modelId, {
+      apiKey: config.apiKey,
+      baseURL: config.baseURL,
+      fetch: config.fetch,
+    });
 
     // Configure logging
     Logger.setVerbose(this.verbose);
@@ -309,6 +462,31 @@ export class Agent {
       type: 'json_schema',
       json_schema: { name: this.outputSchemaName, schema: this.outputSchema },
     };
+  }
+
+  /**
+   * Flatten OpenAI-shape tool definitions ({ type: 'function', function: {...} })
+   * into the provider-agnostic ToolDefinition shape the AI SDK backend expects.
+   * Tools already in the flat shape pass through unchanged. This mirrors what
+   * litellm does for the Python SDK: format once, translate at the transport —
+   * so tools are never dropped by provider.
+   */
+  private getFlatToolDefinitions(): Array<{ name: string; description?: string; parameters?: Record<string, any> }> {
+    if (!this.tools || this.tools.length === 0) return [];
+    return this.tools.map((tool: any) => {
+      if (tool && tool.type === 'function' && tool.function) {
+        return {
+          name: tool.function.name,
+          description: tool.function.description,
+          parameters: tool.function.parameters,
+        };
+      }
+      return {
+        name: tool.name,
+        description: tool.description,
+        parameters: tool.parameters,
+      };
+    });
   }
 
   /**
@@ -470,9 +648,10 @@ export class Agent {
   /**
    * Process tool calls from the model
    * @param toolCalls Tool calls from the model
+   * @param signal Optional AbortSignal; if already aborted, no tool is invoked
    * @returns Array of tool results
    */
-  private async processToolCalls(toolCalls: Array<any>): Promise<Array<{role: string, tool_call_id: string, content: string}>> {
+  private async processToolCalls(toolCalls: Array<any>, signal?: AbortSignal): Promise<Array<{role: string, tool_call_id: string, name: string, content: string}>> {
     const results = [];
     
     for (const toolCall of toolCalls) {
@@ -480,6 +659,15 @@ export class Agent {
       await Logger.debug(`Processing tool call: ${name}`, { arguments: argsString });
       
       try {
+        // Cancellation reaches the side-effecting boundary: if the caller
+        // aborts after the model returned tool calls, stop before invoking the
+        // tool rather than letting its network/process side effects run. The
+        // abort-aware catch re-throws so the run stops (not swallowed into a
+        // tool-error result).
+        if (signal?.aborted) {
+          throw (signal as any).reason ?? new Error('The operation was aborted');
+        }
+
         // Parse arguments
         const args = JSON.parse(argsString);
         
@@ -487,7 +675,28 @@ export class Agent {
         if (!this.toolFunctions[name]) {
           throw new Error(`Function ${name} not registered`);
         }
-        
+
+        // Human-in-the-loop gate: block the tool until approved. A denial is
+        // fed back to the model as the tool result so it can course-correct,
+        // rather than aborting the run.
+        if (this.approvalManager) {
+          const approved = await this.approvalManager.requestApproval({
+            toolInvocationId: id,
+            toolName: name,
+            input: args,
+          });
+          if (!approved) {
+            await Logger.debug(`Tool call denied by approval gate: ${name}`);
+            results.push({
+              role: 'tool',
+              tool_call_id: id,
+              name,
+              content: `Error: Tool call "${name}" was denied by the approval gate.`
+            });
+            continue;
+          }
+        }
+
         // Call the function - registered wrappers handle positional mapping
         const result = await this.toolFunctions[name](args);
 
@@ -501,19 +710,28 @@ export class Agent {
             ? ''
             : JSON.stringify(result);
 
-        // Add result to messages
+        // Add result to messages. `name` is required so the AI SDK adapter
+        // (toAISDKPrompt) can set a non-empty toolName on the tool-result part —
+        // without it, non-OpenAI providers reject the tool follow-up.
         results.push({
           role: 'tool',
           tool_call_id: id,
+          name,
           content
         });
         
         await Logger.debug(`Tool call result for ${name}:`, { result });
       } catch (error: any) {
+        // Cancellation is terminal: surface it to the caller instead of
+        // burying it in a tool result (which would let the loop continue).
+        if (signal?.aborted) {
+          throw (signal as any).reason ?? error;
+        }
         await Logger.error(`Error executing tool ${name}:`, error);
         results.push({
           role: 'tool',
           tool_call_id: id,
+          name,
           content: `Error: ${error.message || 'Unknown error'}`
         });
       }
@@ -522,8 +740,17 @@ export class Agent {
     return results;
   }
 
-  async start(prompt: string, previousResult?: string): Promise<string> {
+  async start(prompt: string, previousResult?: string, onToken?: (token: string) => void, signal?: AbortSignal): Promise<string> {
     await Logger.debug(`Agent ${this.name} starting with prompt: ${prompt}`);
+
+    // Token sink: when a caller (e.g. stream()) supplies onToken, tokens go
+    // there instead of the terminal. Defaulting to stdout preserves CLI
+    // behaviour without leaking process.stdout into non-terminal hosts.
+    const emitToken = onToken ?? writeTokenToStdout;
+
+    // Explicit per-call signal wins over the agent-level default (mirrors
+    // Python's resolution: cancel_token overrides interrupt_controller).
+    const abortSignal = signal ?? this.signal;
 
     try {
       // Replace placeholder with previous result if available
@@ -547,36 +774,103 @@ export class Agent {
       messages.push({ role: 'user', content: prompt });
       
       let finalResponse = '';
+      // Reset per run; set to a terminal value before returning/throwing so
+      // callers can tell a completed run from a truncated one.
+      this.lastStopReason = null;
       
       // Use AI SDK backend for non-OpenAI providers
       if (this._useAISDKBackend) {
         const backend = await this.getBackend();
 
-        // Honesty over silence: the AI SDK backend path does not yet wire
-        // tools or structured output through — say so instead of quietly
-        // answering without them.
         if (this.tools && this.tools.length > 0) {
-          await Logger.warn(
-            `Agent ${this.name}: tools are not yet supported with non-OpenAI providers (${this.llm}) — proceeding WITHOUT tools.`
-          );
-        }
-        if (this.outputSchema) {
-          await Logger.warn(
-            `Agent ${this.name}: outputSchema is not yet supported with non-OpenAI providers (${this.llm}) — proceeding without structured output.`
-          );
-        }
+          // Tools survive on every provider: format once (provider-agnostic
+          // ToolDefinition) and let the AI SDK backend translate at the
+          // transport — the same contract litellm gives the Python SDK.
+          const toolDefinitions = this.getFlatToolDefinitions();
+          let continueConversation = true;
+          let iterations = 0;
+          const maxIterations = this.maxIterations;
 
-        if (this.stream && !this.tools) {
+          while (continueConversation && iterations < maxIterations) {
+            iterations++;
+
+            // Stop between round-trips if cancelled (before another model call
+            // or another batch of tool executions).
+            if (abortSignal?.aborted) {
+              throw (abortSignal as any).reason ?? new Error('The operation was aborted');
+            }
+
+            const result = await backend.generateText({
+              messages,
+              temperature: 0.7,
+              tools: toolDefinitions,
+              toolChoice: 'auto',
+              signal: abortSignal,
+            });
+
+            messages.push({
+              role: 'assistant',
+              content: result.text || '',
+              tool_calls: result.toolCalls,
+            });
+
+            if (result.toolCalls && result.toolCalls.length > 0) {
+              const toolResults = await this.processToolCalls(result.toolCalls, abortSignal);
+              messages.push(...toolResults);
+              continueConversation = true;
+            } else {
+              // Tool loop is done. When outputSchema is also configured, honor
+              // it instead of dropping it: re-issue the final turn through
+              // generateObject so structured output survives alongside tools —
+              // mirrors the OpenAI native path threading responseFormat through
+              // the loop.
+              if (this.outputSchema) {
+                const structured = await backend.generateObject({
+                  messages,
+                  schema: this.outputSchema,
+                  temperature: 0.7,
+                  signal: abortSignal,
+                });
+                finalResponse = typeof structured.object === 'string'
+                  ? structured.object
+                  : JSON.stringify(structured.object);
+              } else {
+                finalResponse = result.text || '';
+              }
+              continueConversation = false;
+            }
+          }
+
+          if (continueConversation && iterations >= maxIterations) {
+            await Logger.warn(`Reached maximum iterations (${maxIterations}) for tool calls`);
+            throw new Error(
+              `Agent ${this.name}: reached maximum tool-call iterations (${maxIterations}) without a final answer. ` +
+              `Increase maxIterations in the agent config if the task legitimately needs more tool round-trips.`
+            );
+          }
+        } else if (this.outputSchema) {
+          // Structured output via the AI SDK backend's generateObject.
+          const result = await backend.generateObject({
+            messages,
+            schema: this.outputSchema,
+            temperature: 0.7,
+            signal: abortSignal,
+          });
+          finalResponse = typeof result.object === 'string'
+            ? result.object
+            : JSON.stringify(result.object);
+        } else if (this.streamEnabled) {
           // Streaming with AI SDK backend
           const stream = await backend.streamText({
             messages,
-            temperature: 0.7
+            temperature: 0.7,
+            signal: abortSignal
           });
           
           let accumulated = '';
           for await (const chunk of stream) {
             if (chunk.text) {
-              process.stdout.write(chunk.text);
+              emitToken(chunk.text);
               accumulated += chunk.text;
             }
           }
@@ -585,61 +879,118 @@ export class Agent {
           // Non-streaming with AI SDK backend
           const result = await backend.generateText({
             messages,
-            temperature: 0.7
+            temperature: 0.7,
+            signal: abortSignal
           });
           finalResponse = result.text;
         }
-      } else if (this.stream && !this.tools && !this.outputSchema) {
-        // Use streaming with full conversation history (OpenAI)
-        finalResponse = await this.llmService.streamChat(
-          messages,
-          0.7,
-          (token: string) => {
-            process.stdout.write(token);
-          }
-        );
       } else if (this.tools) {
-        // Use tools (non-streaming for now to simplify implementation)
+        // Unified streaming/tools loop (OpenAI). Streaming and tools are no
+        // longer mutually exclusive: when `stream` is set, text deltas, tool
+        // calls and tool results interleave on one request per round-trip via
+        // streamChatWithTools; otherwise a single blocking generateChat is used.
         let continueConversation = true;
         let iterations = 0;
-        const maxIterations = 5; // Prevent infinite loops
-        
+        const maxIterations = this.maxIterations; // Prevent infinite loops (configurable)
+
         while (continueConversation && iterations < maxIterations) {
           iterations++;
-          
-          // Get response from LLM (responseFormat constrains the final
-          // answer when outputSchema is configured)
-          const response = await this.llmService.generateChat(
-            messages, 0.7, this.tools, undefined, this.getResponseFormat()
-          );
-          
-          // Add assistant response to messages
+
+          // Stop between round-trips if cancelled (before another model call
+          // or another batch of tool executions).
+          if (abortSignal?.aborted) {
+            throw (abortSignal as any).reason ?? new Error('The operation was aborted');
+          }
+
+          // Tool rounds and the structured final response are separate concerns.
+          // OpenAI treats `tools` and `response_format` (json_schema) as mutually
+          // exclusive: sending both can make a tool round get rejected before it
+          // returns tool_calls. So during tool rounds we omit the schema and let
+          // the model decide; once the model stops calling tools we re-issue a
+          // final request with the schema applied to shape the answer.
+          const response = this.streamEnabled
+            ? await this.llmService.streamChatWithTools(
+                messages,
+                0.7,
+                this.tools,
+                (token: string) => emitToken(token),
+                undefined,
+                undefined,
+                abortSignal
+              )
+            : await this.llmService.generateChat(
+                messages, 0.7, this.tools, undefined, undefined, abortSignal
+              );
+
+          // Cap tool calls executed per turn (Python parity:
+          // ExecutionConfig.max_tool_calls_per_turn). Extra calls beyond the cap
+          // in a single round are dropped. The assistant message must list ONLY
+          // the executed calls, because every tool_call_id in an assistant
+          // message needs a matching tool result message or the next request 400s.
+          const perTurn = response.tool_calls
+            ? response.tool_calls.slice(0, this.maxToolCallsPerTurn)
+            : undefined;
+
+          // Add assistant response to messages (only the executed tool calls)
           messages.push({
             role: 'assistant',
             content: response.content || '',
-            tool_calls: response.tool_calls
+            tool_calls: perTurn
           });
-          
+
           // Check if there are tool calls to process
-          if (response.tool_calls && response.tool_calls.length > 0) {
-            // Process tool calls
-            const toolResults = await this.processToolCalls(response.tool_calls);
-            
-            // Add tool results to messages
+          if (perTurn && perTurn.length > 0) {
+            if (response.tool_calls!.length > this.maxToolCallsPerTurn) {
+              await Logger.warn(
+                `Agent ${this.name}: ${response.tool_calls!.length} tool calls in one turn exceeds ` +
+                `maxToolCallsPerTurn (${this.maxToolCallsPerTurn}); executing the first ${this.maxToolCallsPerTurn}.`
+              );
+            }
+
+            // Process tool calls and add results to messages
+            const toolResults = await this.processToolCalls(perTurn, abortSignal);
             messages.push(...toolResults);
-            
+
             // Continue conversation to get final response
             continueConversation = true;
+          } else if (this.outputSchema) {
+            // Model produced no tool calls: issue one final request that pins the
+            // structured output schema. Tools are omitted here so `tools` and
+            // `response_format` never coexist (OpenAI treats them as mutually
+            // exclusive). generateChat sends the full history.
+            const finalResp = await this.llmService.generateChat(
+              messages, 0.7, undefined, undefined, this.getResponseFormat(), abortSignal
+            );
+            finalResponse = finalResp.content || response.content || '';
+            continueConversation = false;
           } else {
             // No tool calls, we have our final response
             finalResponse = response.content || '';
             continueConversation = false;
           }
         }
-        
-        if (iterations >= maxIterations) {
+
+        if (continueConversation && iterations >= maxIterations) {
+          // Exhaustion is observable: returning finalResponse here would be
+          // '' (unresolved tool calls left no text answer), indistinguishable
+          // from the model saying nothing. Mark the stop reason and throw.
+          this.lastStopReason = 'max_steps';
           await Logger.warn(`Reached maximum iterations (${maxIterations}) for tool calls`);
+          throw new Error(
+            `Agent ${this.name}: reached maximum tool-call iterations (${maxIterations}) without a final answer. ` +
+            `Increase maxIterations in the agent config if the task legitimately needs more tool round-trips.`
+          );
         }
+      } else if (this.streamEnabled && !this.outputSchema) {
+        // Use streaming with full conversation history (OpenAI, no tools)
+        finalResponse = await this.llmService.streamChat(
+          messages,
+          0.7,
+          (token: string) => {
+            emitToken(token);
+          },
+          abortSignal
+        );
       } else if (this.outputSchema) {
         // Structured output (no tools): go through generateChat so the full
         // `messages` history (system + prior turns + current prompt) is sent.
@@ -651,7 +1002,8 @@ export class Agent {
           0.7,
           undefined,
           undefined,
-          this.getResponseFormat()
+          this.getResponseFormat(),
+          abortSignal
         );
         finalResponse = response.content || '';
       } else {
@@ -662,19 +1014,153 @@ export class Agent {
           0.7,
           undefined,
           undefined,
-          this.getResponseFormat()
+          this.getResponseFormat(),
+          abortSignal
         );
         finalResponse = response;
       }
 
+      // A run that reaches here finished normally (max_steps throws earlier).
+      if (this.lastStopReason === null) {
+        this.lastStopReason = 'completed';
+      }
       return finalResponse;
     } catch (error) {
+      // Preserve a more specific reason (e.g. 'max_steps') if already set.
+      if (this.lastStopReason === null) {
+        // A user-initiated abort is not a failure: distinguish 'cancelled'
+        // from 'error' so a Stop button and a genuine crash aren't conflated.
+        this.lastStopReason = abortSignal?.aborted ? 'cancelled' : 'error';
+      }
       await Logger.error('Error in agent execution', error);
       throw error;
     }
   }
 
-  async chat(prompt: string, previousResult?: string): Promise<string> {
+  /**
+   * Stream the agent's response token-by-token as an async iterable of plain
+   * strings — mirrors Python's `Agent.iter_stream()`, which yields bare `str`.
+   * This lets any host (browser, webview, React Native, server) render an
+   * answer as it arrives, instead of only receiving the final string.
+   *
+   * Backpressure is free (the loop pulls) and cancellation is a single path:
+   * breaking out of the `for await` runs the iterator's `return()`, which
+   * detaches the token sink so no further tokens are queued.
+   *
+   * When the underlying execution path does not stream (e.g. `stream: false`,
+   * tools, or a structured `outputSchema`), no text deltas are produced; in
+   * that case the full response from the terminal `finish` event is yielded as
+   * a single token so callers always receive the answer.
+   *
+   * @param prompt - The user prompt to send to the agent.
+   * @param opts - Optional {@link AgentStreamOptions} (e.g. `previousResult`).
+   * @returns An async iterable of plain text tokens.
+   * @example
+   * ```typescript
+   * for await (const token of agent.stream("Tell me a story")) {
+   *   process.stdout.write(token);
+   * }
+   * ```
+   */
+  async *stream(prompt: string, opts?: AgentStreamOptions): AsyncIterable<string> {
+    let sawDelta = false;
+    for await (const event of this.streamEvents(prompt, opts)) {
+      if (event.type === 'text') {
+        sawDelta = true;
+        yield event.delta;
+      } else if (event.type === 'finish') {
+        // Non-streaming paths yield only a finish event; surface its text so
+        // stream() never silently drops a successful response.
+        if (!sawDelta && event.text) {
+          yield event.text;
+        }
+      } else if (event.type === 'error') {
+        throw event.error;
+      }
+    }
+  }
+
+  /**
+   * Stream structured {@link AgentEvent}s (text deltas, finish, error) — the
+   * TypeScript analogue of Python's `stream_emitter` channel. Prefer
+   * {@link Agent.stream} when you only need the text tokens.
+   *
+   * @param prompt - The user prompt to send to the agent.
+   * @param opts - Optional {@link AgentStreamOptions} (e.g. `previousResult`).
+   * @returns An async iterable of {@link AgentEvent}s: zero or more `text`
+   * deltas followed by a single terminal `finish` (or `error`) event.
+   * @example
+   * ```typescript
+   * for await (const event of agent.streamEvents("Hi")) {
+   *   if (event.type === 'text') process.stdout.write(event.delta);
+   *   else if (event.type === 'finish') console.log('\n', event.text);
+   * }
+   * ```
+   */
+  async *streamEvents(prompt: string, opts?: AgentStreamOptions): AsyncIterable<AgentEvent> {
+    const queue: string[] = [];
+    let notify: (() => void) | null = null;
+    let done = false;
+    let cancelled = false;
+
+    // Own controller so breaking the consumer's `for await` (which runs the
+    // iterator's `return()`, landing in the finally below) aborts the upstream
+    // provider request — otherwise tokens keep generating and billing after
+    // the consumer stopped reading. A caller-supplied `opts.signal` is chained
+    // in: aborting it aborts ours, so both paths stop the same request.
+    const controller = new AbortController();
+    const callerSignal = opts?.signal;
+    if (callerSignal) {
+      if (callerSignal.aborted) {
+        controller.abort((callerSignal as any).reason);
+      } else {
+        callerSignal.addEventListener(
+          'abort',
+          () => controller.abort((callerSignal as any).reason),
+          { once: true }
+        );
+      }
+    }
+
+    const wake = () => { const n = notify; notify = null; n?.(); };
+    const onToken = (token: string) => {
+      if (cancelled) return;
+      queue.push(token);
+      wake();
+    };
+
+    const run = this.start(prompt, opts?.previousResult, onToken, controller.signal)
+      .then((text) => ({ text } as { text: string }))
+      .catch((error) => ({
+        error: error instanceof Error ? error : new Error(String(error)),
+      }))
+      .finally(() => { done = true; wake(); });
+
+    try {
+      while (!done || queue.length > 0) {
+        if (queue.length === 0) {
+          await new Promise<void>((resolve) => { notify = resolve; });
+          continue;
+        }
+        yield { type: 'text', delta: queue.shift()! };
+      }
+
+      const result = await run;
+      if ('error' in result) {
+        yield { type: 'error', error: result.error };
+        return;
+      }
+      yield { type: 'finish', text: result.text };
+    } finally {
+      // Breaking the consumer's loop lands here: stop feeding the sink and
+      // abort the in-flight request so the provider stops generating (and
+      // billing) rather than running to completion detached.
+      cancelled = true;
+      controller.abort();
+    }
+  }
+
+  async chat(prompt: string, previousResult?: string, signal?: AbortSignal): Promise<string> {
     // Lazy init: restore history on first chat (like Python SDK)
     await this.initDbSession();
     
@@ -692,7 +1178,7 @@ export class Agent {
     // start() replays this.messages AND appends the prompt itself, so the
     // user message goes into history only AFTER the call — pushing it first
     // sent every prompt to the model twice.
-    const response = await this.start(prompt, previousResult);
+    const response = await this.start(prompt, previousResult, undefined, signal);
 
     // Add user message and assistant response to history
     this.messages.push({ role: 'user', content: prompt });
@@ -927,8 +1413,8 @@ export class AgentTeam {
       : configOrAgents;
     
     this.agents = config.agents;
-    this.verbose = config.verbose ?? process.env.PRAISON_VERBOSE !== 'false';
-    this.pretty = config.pretty ?? process.env.PRAISON_PRETTY === 'true';
+    this.verbose = config.verbose ?? getEnv('PRAISON_VERBOSE') !== 'false';
+    this.pretty = config.pretty ?? getEnv('PRAISON_PRETTY') === 'true';
     this.process = config.process || 'sequential';
 
     // Auto-generate tasks if not provided

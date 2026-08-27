@@ -2,6 +2,7 @@ import os
 import sqlite3
 import json
 import time
+import asyncio
 import shutil
 import threading
 from typing import Any, Dict, List, Optional, Union, Literal
@@ -17,6 +18,7 @@ from .core import MemoryCoreMixin
 from .protocols import MemoryProtocol
 from .adapters import get_memory_adapter, get_first_available_memory_adapter
 from .adapters.sqlite_adapter import SqliteMemoryAdapter
+from .adapters.factories import sanitize_chroma_metadata
 
 # Disable litellm telemetry before any imports
 os.environ["LITELLM_TELEMETRY"] = "False"
@@ -136,16 +138,21 @@ class Memory(SearchMixin, MemoryCoreMixin):
         provider = self.cfg.get("provider", "rag").lower()
         self._log_verbose(f"Requested memory provider: {provider}")
         
-        # Map legacy provider names to adapter names
-        provider_mapping = {
-            "rag": "chroma",  # Legacy "rag" provider uses ChromaDB
-            "mem0": "mem0",
-            "mongodb": "mongodb",
-            "sqlite": "sqlite",
-            "none": "in_memory"
-        }
-        
-        adapter_name = provider_mapping.get(provider, provider)
+        # Legacy provider aliases live in memory/adapters/registry.py
+        from .adapters.registry import (
+            MEMORY_PROVIDER_ALIASES, list_memory_adapters, resolve_memory_adapter_name)
+
+        # A provider with no adapter must fail loudly: falling through landed
+        # on the SQLite fallback below, so provider="redis" silently produced a
+        # local .db file per process.
+        adapter_name = resolve_memory_adapter_name(provider)
+        if adapter_name is None:
+            from ..config.parse_utils import make_preset_error
+            raise make_preset_error(
+                "memory provider",
+                provider,
+                sorted(set(list_memory_adapters()) | set(MEMORY_PROVIDER_ALIASES)),
+            )
         
         # Try to get preferred adapter, fallback to available ones
         adapter = None
@@ -195,8 +202,15 @@ class Memory(SearchMixin, MemoryCoreMixin):
                 self.provider = adapter_name
                 return
                 
-            # Fallback to first available adapter
-            self._log_verbose(f"Provider '{adapter_name}' not available, trying fallbacks")
+            # Falling back changes where the data lives - say so out loud when
+            # the user named a specific provider.
+            _fallback_log = (
+                logger.warning if provider_explicitly_requested else self._log_verbose
+            )
+            _fallback_log(
+                f"Memory provider '{adapter_name}' is not available; falling back "
+                f"to a local store. Data will NOT be in '{adapter_name}'."
+            )
             # Try each fallback preference individually
             for fallback_provider in ["sqlite", "in_memory"]:
                 try:
@@ -204,7 +218,7 @@ class Memory(SearchMixin, MemoryCoreMixin):
                     adapter = get_memory_adapter(fallback_provider, **fallback_config)
                     if adapter:
                         adapter_name = fallback_provider
-                        self._log_verbose(f"Using fallback adapter: {adapter_name}")
+                        _fallback_log(f"Using fallback memory adapter: {adapter_name}")
                         break
                 except Exception as e:
                     self._log_verbose(f"Fallback {fallback_provider} failed: {e}")
@@ -267,6 +281,27 @@ class Memory(SearchMixin, MemoryCoreMixin):
             # Initialize use_vector_search to False for non-MongoDB providers
             self.use_vector_search = False
 
+    @staticmethod
+    def _path_safe_suffix(user_id: Any) -> str:
+        """Return a filesystem-safe ``_<user_id>`` suffix for default store paths.
+
+        The scoping ``user_id`` doubles as a metadata filter, so it may be any
+        string. When it is embedded into default sqlite/chroma paths a raw value
+        containing separators or traversal (e.g. ``a/b`` or ``../escape``) would
+        create stores outside the project-data dir or break sqlite init. Reject
+        path separators/parent refs and keep only path-safe characters; a bare
+        store with no user_id keeps the original shared defaults.
+        """
+        if not user_id:
+            return ""
+        text = str(user_id)
+        if ".." in text or "/" in text or "\\" in text or "\x00" in text:
+            raise ValueError(
+                "memory user_id must not contain path separators or parent references"
+            )
+        safe = "".join(c if (c.isalnum() or c in "-_.") else "_" for c in text.strip())
+        return f"_{safe}" if safe else ""
+
     def _get_adapter_config(self) -> Dict[str, Any]:
         """Get configuration for adapter initialization."""
         # Only include adapter-relevant configuration
@@ -284,11 +319,18 @@ class Memory(SearchMixin, MemoryCoreMixin):
         from ..paths import get_project_data_dir
         project_data = str(get_project_data_dir())
         os.makedirs(project_data, exist_ok=True)
-        
-        config["short_db"] = self.cfg.get("short_db", os.path.join(project_data, "short_term.db"))
-        config["long_db"] = self.cfg.get("long_db", os.path.join(project_data, "long_term.db"))
-        config["rag_db_path"] = self.cfg.get("rag_db_path", os.path.join(project_data, "chroma_db"))
-        config["collection_name"] = self.cfg.get("collection_name", "memory_store")
+
+        # When a user_id scopes this store, derive per-user default paths/names so
+        # two agents in one process/dir don't silently share one on-disk store.
+        # Explicit short_db/long_db/rag_db_path/collection_name always win; a bare
+        # store with no user_id keeps the original shared defaults (backwards
+        # compatible).
+        suffix = self._path_safe_suffix(self.cfg.get("user_id"))
+
+        config["short_db"] = self.cfg.get("short_db", os.path.join(project_data, f"short_term{suffix}.db"))
+        config["long_db"] = self.cfg.get("long_db", os.path.join(project_data, f"long_term{suffix}.db"))
+        config["rag_db_path"] = self.cfg.get("rag_db_path", os.path.join(project_data, f"chroma_db{suffix}"))
+        config["collection_name"] = self.cfg.get("collection_name", f"memory_store{suffix}")
         config["verbose"] = self.verbose
         
         # Add specific configurations for different adapters
@@ -325,9 +367,13 @@ class Memory(SearchMixin, MemoryCoreMixin):
         # This ensures existing code that accesses _get_stm_conn() still works
         from ..paths import get_project_data_dir
         project_data = str(get_project_data_dir())
-        
-        self.short_db = self.cfg.get("short_db", os.path.join(project_data, "short_term.db"))
-        self.long_db = self.cfg.get("long_db", os.path.join(project_data, "long_term.db"))
+
+        # Scope legacy direct-SQLite defaults by user_id so this path matches the
+        # per-user store paths derived in _get_adapter_config (explicit paths win).
+        suffix = self._path_safe_suffix(self.cfg.get("user_id"))
+
+        self.short_db = self.cfg.get("short_db", os.path.join(project_data, f"short_term{suffix}.db"))
+        self.long_db = self.cfg.get("long_db", os.path.join(project_data, f"long_term{suffix}.db"))
         
         # Only create separate SQLite adapter if primary adapter is not SQLite
         if self.provider != "sqlite":
@@ -345,6 +391,110 @@ class Memory(SearchMixin, MemoryCoreMixin):
         self._write_lock = self._sqlite_adapter._write_lock
         self._all_connections = self._sqlite_adapter._all_connections
         self._connection_lock = self._sqlite_adapter._connection_lock
+
+    @staticmethod
+    def _resolve_batch_target(method_name: str) -> str:
+        """Map a staged write name to its ``store_*`` persistence method."""
+        target = method_name.replace("add_", "store_", 1)
+        if target not in ("store_short_term", "store_long_term"):
+            raise ValueError(f"Unsupported staged memory write {method_name!r}")
+        return target
+
+    def commit_memory_batch(
+        self,
+        writes: List[tuple],
+        *,
+        deadline: float,
+        commit_guard: Any = None,
+    ) -> None:
+        """Persist a batch of staged memory writes.
+
+        Mirrors ``FileMemory.commit_memory_batch`` so the pre-compaction fact
+        flush (compaction/memory_flush.py) durably commits extracted facts for
+        sqlite/chroma/mongodb/mem0 backends instead of raising and being
+        swallowed. Each staged tuple is ``(method_name, args, kwargs)`` produced
+        by _StagedMemory; ``add_*`` names map to the ``store_*`` equivalents.
+
+        The ``store_*`` methods serialize their own SQLite writes with
+        ``_write_lock``; this method therefore must NOT hold that lock while
+        calling them (it is a non-reentrant ``threading.Lock`` and doing so
+        would deadlock). Each write goes through ``commit_guard.commit`` so a
+        write is skipped once the flush has been cancelled or the shared
+        ``deadline`` has passed, honoring the same atomic-commit contract as the
+        file backend.
+        """
+        for method_name, args, kwargs in writes:
+            target = self._resolve_batch_target(method_name)
+            store = getattr(self, target)
+            authorized = self._authorize_commit(
+                lambda store=store, args=args, kwargs=kwargs: store(*args, **kwargs),
+                deadline=deadline,
+                commit_guard=commit_guard,
+            )
+            if not authorized:
+                return
+
+    async def acommit_memory_batch(
+        self,
+        writes: List[tuple],
+        *,
+        deadline: float,
+        commit_guard: Any = None,
+    ) -> None:
+        """Async variant preferring ``store_*_async`` when available.
+
+        Blocking ``store_*`` work is offloaded to a worker thread so the event
+        loop is never blocked, and each write is gated by the same deadline /
+        cancellation guard as the sync path so late or cancelled facts are not
+        persisted after compaction resumes.
+        """
+        import inspect
+
+        for method_name, args, kwargs in writes:
+            if self._commit_expired(deadline, commit_guard):
+                return
+            target = self._resolve_batch_target(method_name)
+            async_method = getattr(self, f"{target}_async", None)
+            if async_method is not None:
+                if self._commit_expired(deadline, commit_guard):
+                    return
+                result = async_method(*args, **kwargs)
+                if inspect.isawaitable(result):
+                    await result
+                continue
+
+            store = getattr(self, target)
+            authorized = await asyncio.to_thread(
+                self._authorize_commit,
+                lambda store=store, args=args, kwargs=kwargs: store(*args, **kwargs),
+                deadline=deadline,
+                commit_guard=commit_guard,
+            )
+            if not authorized:
+                return
+
+    @staticmethod
+    def _commit_expired(deadline: float, commit_guard: Any) -> bool:
+        """True once the flush was cancelled or the shared deadline has passed."""
+        if commit_guard is not None and getattr(commit_guard, "cancelled", False):
+            return True
+        return time.monotonic() >= deadline
+
+    def _authorize_commit(
+        self, operation: Any, *, deadline: float, commit_guard: Any
+    ) -> bool:
+        """Run ``operation`` under the guard's atomic-commit gate.
+
+        Returns ``False`` (and skips the write) once cancelled or past the
+        deadline. When no guard is supplied, fall back to a plain deadline
+        check so callers outside the flush path still behave correctly.
+        """
+        if commit_guard is not None and hasattr(commit_guard, "commit"):
+            return commit_guard.commit(operation, deadline=deadline)
+        if self._commit_expired(deadline, commit_guard):
+            return False
+        operation()
+        return True
 
     def _get_stm_conn(self):
         """Get thread-local short-term memory SQLite connection."""
@@ -830,19 +980,8 @@ class Memory(SearchMixin, MemoryCoreMixin):
     # -------------------------------------------------------------------------
     def _sanitize_metadata(self, metadata: Dict) -> Dict:
         """Sanitize metadata for ChromaDB - convert to acceptable types"""
-        sanitized = {}
-        for k, v in metadata.items():
-            if v is None:
-                continue
-            if isinstance(v, (str, int, float, bool)):
-                sanitized[k] = v
-            elif isinstance(v, dict):
-                # Convert dict to string representation
-                sanitized[k] = str(v)
-            else:
-                # Convert other types to string
-                sanitized[k] = str(v)
-        return sanitized
+        from .adapters.factories import sanitize_chroma_metadata
+        return sanitize_chroma_metadata(metadata)
 
     def store_long_term(
         self,
@@ -1400,13 +1539,17 @@ class Memory(SearchMixin, MemoryCoreMixin):
         elif memory_type == "long_term":
             return self.delete_long_term(memory_id)
         
-        # Search both types
-        if self.delete_short_term(memory_id):
-            return True
-        if self.delete_long_term(memory_id):
-            return True
-        
-        return False
+        # No tier given: delete from BOTH tiers, never short-circuit on the first
+        # hit. The SQLite adapter gives each tier its own AUTOINCREMENT sequence
+        # (sqlite_adapter.py:83 and :107), so the Nth short-term row and the Nth
+        # long-term row always share an id -- collision is the norm, not an edge
+        # case. Returning on the first hit therefore deleted an unrelated
+        # short-term row and left the caller's actual target in place, while
+        # reporting success. `forget()` exposes no tier argument at all, so a
+        # caller has no way to disambiguate.
+        deleted_short = self.delete_short_term(memory_id)
+        deleted_long = self.delete_long_term(memory_id)
+        return deleted_short or deleted_long
     
     def delete_memories(self, memory_ids: List[str]) -> int:
         """
@@ -1745,13 +1888,17 @@ class Memory(SearchMixin, MemoryCoreMixin):
         into a single text block with deduplication and clean formatting.
         
         Args:
-            include_in_output: If None, memory content is only included when debug logging is enabled.
-                               If True, memory content is always included.
-                               If False, memory content is never included (only logged for debugging).
+            include_in_output: If None, memory content is included (the primary
+                               purpose of this method is to feed retrieved memory
+                               into the prompt). If True, memory content is always
+                               included. If False, memory content is never included
+                               (only logged for debugging).
         """
-        # Determine whether to include memory content in output based on logging level
+        # Include retrieved memory by default. Gating this on DEBUG-level logging
+        # meant Agent(memory=True) silently retrieved hits but never appended them
+        # to the prompt under normal usage.
         if include_in_output is None:
-            include_in_output = get_logger().getEffectiveLevel() == logging.DEBUG
+            include_in_output = True
         
         q = (task_descr + " " + additional).strip()
         lines = []
@@ -1920,6 +2067,30 @@ class Memory(SearchMixin, MemoryCoreMixin):
         result["cache_boundary"] = CACHE_BOUNDARY if include_cache_boundary else ""
             
         return result
+
+    def get_context(self, query: Optional[str] = None, **kwargs) -> str:
+        """
+        Return retrieved memory as a prompt-ready context string.
+
+        Satisfies ``AgentMemoryProtocol`` (used by ``Agent.get_memory_context()``)
+        so the non-prompt-caching code path can inject memory into the system
+        prompt. Without this, ``hasattr(memory, 'get_context')`` was False and the
+        fallback branch always returned "".
+        """
+        # A missing/empty query would make the local fallback search match every
+        # record (LIKE "%%") with no relevance ordering, leaking unrelated (and
+        # possibly other users') memories into the prompt. Retrieve nothing until
+        # there is a meaningful query.
+        if not query or not str(query).strip():
+            return ""
+        # Propagate the effective user id so user-scoped memories are included and
+        # cross-user records are not returned by a shared Memory instance.
+        user_id = kwargs.get("user_id") or self.cfg.get("user_id")
+        return self.build_context_for_task(
+            task_descr=query,
+            user_id=user_id,
+            include_in_output=True,
+        )
 
     # -------------------------------------------------------------------------
     #                      Master Reset (Everything)
@@ -2117,6 +2288,26 @@ class Memory(SearchMixin, MemoryCoreMixin):
 
     def get_all_memories(self) -> List[Dict[str, Any]]:
         """Get all memories from both short-term and long-term storage"""
+        # Delegate to the active adapter whenever one is configured, mirroring
+        # delete_short_term/reset_short_term. Data written through the adapter
+        # lives in short_term_memory/long_term_memory; the legacy SELECTs below
+        # target short_mem/long_mem, which nothing in the codebase creates, so
+        # they raise OperationalError, get swallowed, and return [] every time.
+        if (getattr(self, "memory_adapter", None)
+                and hasattr(self.memory_adapter, "get_all_memories")):
+            # Adapters expose the tier under different keys (the SQLite adapter
+            # uses `memory_type`, others may use `type`). The legacy path below
+            # returns `type`, so normalize to keep that public field populated
+            # for backward compatibility while retaining any adapter-specific
+            # keys the record already carries.
+            return [
+                {
+                    **record,
+                    "type": record.get("type") or record.get("memory_type"),
+                }
+                for record in self.memory_adapter.get_all_memories()
+            ]
+
         all_memories = []
         
         try:
