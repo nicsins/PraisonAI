@@ -71,6 +71,12 @@ from ._commands import (
     build_command_access_policy,
 )
 from ._session import BotSessionManager
+from ._streaming import (
+    StreamingConfig,
+    StreamingMode,
+    DraftStreamer,
+    build_streaming_config,
+)
 from ._debounce import InboundDebouncer
 from ._ack import AckReactor
 from ._unknown_user import UnknownUserHandler, BotContext
@@ -144,7 +150,12 @@ class SlackBot(OutboundResilienceMixin, ChatCommandMixin, MessageHookMixin):
         
         # Initialize allow_silence from config
         self._allow_silence = getattr(self.config, 'allow_silence', False)
-        
+
+        # Initialize streaming config based on BotConfig (shared with Telegram /
+        # Discord so ``streaming.mode: draft|auto`` is honoured identically
+        # across channels that support in-place edits — Issue #5415).
+        self._streaming_config = build_streaming_config(self.config)
+
         self._is_running = False
         self._bot_user: Optional[BotUser] = None
         self._app = None
@@ -186,6 +197,111 @@ class SlackBot(OutboundResilienceMixin, ChatCommandMixin, MessageHookMixin):
         # Audio capabilities
         self._stt_enabled: bool = False
     
+    def configure_streaming(self, config: StreamingConfig) -> None:
+        """Configure streaming reply mode.
+
+        Args:
+            config: Streaming configuration. Set mode=StreamingMode.OFF to disable.
+        """
+        self._streaming_config = config
+        logger.debug("SlackBot: streaming configured, mode=%s", config.mode)
+
+    def _reply_needs_thread(self, thread_id: str) -> bool:
+        """Whether a reply must be posted into a thread rather than the root.
+
+        The shared ``DraftStreamer`` posts/edits its placeholder at the channel
+        root (it only knows ``send_message(channel, text)``), so when a reply
+        belongs in a thread — the inbound message was itself in a thread, or
+        ``reply_in_thread`` is configured — streaming in place would strand the
+        answer in the main channel (Greptile #2 / #5417). In that case the
+        caller falls back to the existing threaded send path.
+        """
+        return bool(thread_id) or bool(getattr(self.config, "reply_in_thread", False))
+
+    async def _maybe_stream_reply(
+        self,
+        channel_id: str,
+        user_id: str,
+        text: str,
+        *,
+        thread_id: str = "",
+        message_id: str = "",
+    ) -> Optional[str]:
+        """Progressively stream a reply via DraftStreamer when configured.
+
+        Returns the final (hook-processed) response text when the streaming
+        path handled delivery, or ``None`` when streaming is disabled — or when
+        the reply must be threaded (the channel-agnostic streamer can only post
+        at the channel root) — so the caller falls back to its normal
+        single-message, thread-aware, media-aware send (Issue #5415).
+        """
+        streaming_enabled = (
+            self._streaming_config is not None
+            and self._streaming_config.mode != StreamingMode.OFF
+        )
+        if not streaming_enabled:
+            return None
+
+        # Defer to the standard send path when the reply must land in a thread:
+        # the shared streamer posts/edits at the channel root and would
+        # otherwise strand a threaded answer in the main channel (Greptile #2).
+        if self._reply_needs_thread(thread_id):
+            return None
+
+        streamer = DraftStreamer(
+            adapter=self,
+            channel_id=channel_id,
+            config=self._streaming_config,
+            platform="slack",
+        )
+        placeholder_message_id = await streamer.start()
+        try:
+            response = await self._session.chat(
+                self._agent, user_id, text,
+                chat_id=channel_id,
+                thread_id=thread_id,
+                message_id=message_id,
+                account=getattr(self.config, "account", "default"),
+                stream_callback=streamer.on_event,
+            )
+            send_result = self.fire_message_sending(channel_id, str(response))
+            if send_result["cancel"]:
+                try:
+                    await self.delete_message(channel_id, placeholder_message_id)
+                except Exception:
+                    pass
+                return ""
+
+            # Extract any MEDIA: directives before finalizing so an audio
+            # reply is uploaded via Slack's file path instead of being edited
+            # into the placeholder as literal "MEDIA:/path" text (Greptile #4).
+            parsed = split_media_from_output(send_result["content"])
+            text_content = parsed["text"]
+            media_urls = parsed.get("media_urls", [])
+
+            await streamer.finalize(text_content if text_content else send_result["content"])
+
+            for media_path in media_urls:
+                if not os.path.exists(media_path):
+                    logger.warning(f"Media file not found: {media_path}")
+                    continue
+                if is_audio_file(media_path) and self._client:
+                    try:
+                        await self._client.files_upload_v2(
+                            channel=channel_id,
+                            file=media_path,
+                            title=os.path.basename(media_path),
+                        )
+                    except Exception as e:
+                        logger.error(f"Failed to upload audio to Slack: {e}")
+            return send_result["content"]
+        except Exception:
+            try:
+                await self.delete_message(channel_id, placeholder_message_id)
+            except Exception:
+                pass
+            raise
+
     def enable_stt(self, enabled: bool = True) -> None:
         """Enable STT for audio file transcription."""
         self._stt_enabled = enabled
@@ -330,6 +446,7 @@ class SlackBot(OutboundResilienceMixin, ChatCommandMixin, MessageHookMixin):
         return PlatformCapabilities(
             max_message_length=40000,
             supports_edit=True,
+            supports_delete=True,  # Slack supports chat.delete of bot messages
             markdown_dialect="slack",
             reconciles_unknown_send=True,
         )
@@ -364,6 +481,13 @@ class SlackBot(OutboundResilienceMixin, ChatCommandMixin, MessageHookMixin):
             display_name=auth_response.get("bot_id", auth_response["user"]),
             is_bot=True,
         )
+        # Slack tags our own outbound posts with this ``bot_id`` when they echo
+        # back through the events API. Inbound events surface the sender via
+        # ``bot_id`` (not ``user_id``), so the self-message drop in
+        # ``_bot_sender_allowed`` must compare against this, not ``user_id``
+        # (#5062) — otherwise ``allow_bots: true`` would let the agent answer
+        # its own messages until the loop budget is exhausted.
+        self._self_bot_id = str(auth_response.get("bot_id") or "")
         
         # Initialize bot context for pairing system
         self._bot_context = BotContext(
@@ -375,7 +499,10 @@ class SlackBot(OutboundResilienceMixin, ChatCommandMixin, MessageHookMixin):
         @self._app.event("message")
         async def handle_message(event, say):
             if event.get("bot_id"):
-                return
+                # Bot-authored: drop unless the channel opts in (#5062). When it
+                # does, the BotLoopGuard breaks a runaway A<->B reply loop.
+                if not self._bot_sender_allowed(event):
+                    return
             
             bot_message = self._convert_event_to_message(event)
 
@@ -611,6 +738,26 @@ class SlackBot(OutboundResilienceMixin, ChatCommandMixin, MessageHookMixin):
                     user_id = event.get("user", "unknown")
                     logger.info(f"Message received: {text[:100]}...")
                     text = await self._debouncer.debounce(user_id, text)
+
+                    # Streaming path: progressively edit a placeholder in place
+                    # using the shared DraftStreamer, mirroring Telegram/Discord
+                    # (Issue #5415). Returns None when streaming is disabled.
+                    streamed = await self._maybe_stream_reply(
+                        str(channel_id) if channel_id else "",
+                        user_id, text,
+                        thread_id=event.get("thread_ts", "") or "",
+                        message_id=event.get("ts", ""),
+                    )
+                    if streamed is not None:
+                        if streamed:
+                            self.fire_message_sent(channel_id, streamed)
+                            if ack_ctx and self._client:
+                                await self._ack.done(
+                                    ack_ctx, react_fn=_slack_react,
+                                    unreact_fn=_slack_unreact,
+                                )
+                        return
+
                     response = await self._session.chat(
                         self._agent, user_id, text,
                         chat_id=str(channel_id) if channel_id else "",
@@ -648,7 +795,9 @@ class SlackBot(OutboundResilienceMixin, ChatCommandMixin, MessageHookMixin):
         @self._app.event("app_mention")
         async def handle_mention(event, say):
             if event.get("bot_id"):
-                return
+                # Bot-authored @mention: drop unless the channel opts in (#5062).
+                if not self._bot_sender_allowed(event):
+                    return
 
             bot_message = self._convert_event_to_message(event)
             bot_message._channel_type = "slack"
@@ -694,6 +843,21 @@ class SlackBot(OutboundResilienceMixin, ChatCommandMixin, MessageHookMixin):
                 try:
                     user_id = event.get("user", "unknown")
                     logger.info(f"@mention received: {text[:100]}...")
+
+                    # Streaming path: progressively edit a placeholder in place
+                    # using the shared DraftStreamer (Issue #5415). Returns None
+                    # when streaming is disabled so the plain path runs.
+                    streamed = await self._maybe_stream_reply(
+                        str(event.get("channel", "")),
+                        user_id, text,
+                        thread_id=event.get("thread_ts", "") or "",
+                        message_id=event.get("ts", ""),
+                    )
+                    if streamed is not None:
+                        if streamed:
+                            self.fire_message_sent(event.get("channel", ""), streamed)
+                        return
+
                     response = await self._session.chat(
                         self._agent, user_id, text,
                         chat_id=str(event.get("channel", "")),
@@ -1275,6 +1439,25 @@ class SlackBot(OutboundResilienceMixin, ChatCommandMixin, MessageHookMixin):
         extra = {cmd: "Custom command" for cmd in self._command_handlers}
         return format_help(self._agent, self.platform, extra)
     
+    def _bot_sender_allowed(self, event: Dict[str, Any]) -> bool:
+        """Whether a bot-authored Slack event may be dispatched (#5062).
+
+        Slack surfaces the sending app via ``bot_id`` (not ``user``), so the
+        loop-guard pair is keyed on that. Our own posts echo back with our
+        ``bot_id``; those are always dropped (self-messages) regardless of
+        ``allow_bots`` to avoid the agent answering itself. Otherwise returns
+        ``False`` (drop) unless the channel opted into bot-authored messages and
+        the pair is still within the ``BotLoopGuard`` budget.
+        """
+        sender_bot_id = str(event.get("bot_id") or event.get("user") or "")
+        self_id = str(getattr(self, "_self_bot_id", "") or "")
+        # Never react to ourselves: Slack echoes our own posts back with our
+        # authenticated ``bot_id`` (#5062).
+        if self_id and sender_bot_id == self_id:
+            return False
+        sender = BotUser(user_id=sender_bot_id, is_bot=True)
+        return self.bot_loop_allows(sender, self_bot_id=self_id)
+
     def _convert_event_to_message(self, event: Dict[str, Any]) -> BotMessage:
         """Convert Slack event to BotMessage."""
         sender = BotUser(

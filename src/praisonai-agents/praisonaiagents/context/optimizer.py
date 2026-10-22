@@ -10,6 +10,7 @@ from abc import ABC, abstractmethod
 from .models import ContextLedger, OptimizerStrategy, OptimizationResult
 from .tokens import estimate_messages_tokens, get_estimator
 from .compressor import ContextCompressor
+from ..llm.model_providers import default_auxiliary_model
 
 logger = logging.getLogger(__name__)
 
@@ -638,7 +639,7 @@ class LLMContextCompressorOptimizer(BaseOptimizer):
             use_accurate_tokenizer: Use model-specific tokenizer if available
         """
         self.llm_client = llm_client
-        self.auxiliary_model = auxiliary_model or "gpt-4o-mini"
+        self.auxiliary_model = default_auxiliary_model(auxiliary_model)
         self.protect_last_n_tokens = protect_last_n_tokens
         self.summary_target_tokens = summary_target_tokens
         
@@ -672,17 +673,17 @@ class LLMContextCompressorOptimizer(BaseOptimizer):
         
         try:
             # Use configured compressor with LLM (if available)
-            import asyncio
+            from ..utils.async_bridge import run_coroutine_from_any_context
             try:
-                # Try async compression with configured LLM
-                result = asyncio.run(self.compressor.compress(
-                    messages=messages,
-                    target_tokens=target_tokens,
+                # Works both with and without a running event loop
+                result = run_coroutine_from_any_context(self.compressor.compress(
+                    messages,
                     summary_target_tokens=self.summary_target_tokens,
                     protect_last_n_tokens=self.protect_last_n_tokens,
                 ))
-            except:
-                # Fallback to sync compression if async fails
+            except Exception as e:
+                # Fallback to deterministic compression if LLM compression fails
+                logger.warning("LLM compression failed, using deterministic fallback: %s", e)
                 result = self._sync_compress(messages, target_tokens)
             
             optimized_tokens = estimate_messages_tokens(result.messages)

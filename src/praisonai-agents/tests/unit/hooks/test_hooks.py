@@ -37,15 +37,16 @@ class TestHookEvent:
     """Tests for HookEvent enum - Claude Code parity."""
     
     def test_claude_code_parity_events(self):
-        """Test Claude Code parity hook events."""
-        # USER_PROMPT_SUBMIT - when user submits a prompt
-        assert HookEvent.USER_PROMPT_SUBMIT.value == "user_prompt_submit"
-        # NOTIFICATION - when notification is sent
-        assert HookEvent.NOTIFICATION.value == "notification"
-        # SUBAGENT_STOP - when subagent completes
+        """Only parity events with a real emission site are declared.
+
+        SUBAGENT_STOP is emitted from ``tools/subagent_tool.py`` when a spawned
+        subagent reaches a terminal state. USER_PROMPT_SUBMIT, NOTIFICATION and
+        SETUP were aspirational names nothing ever emitted; they were removed so
+        registering on one raises instead of silently doing nothing.
+        """
         assert HookEvent.SUBAGENT_STOP.value == "subagent_stop"
-        # SETUP - on initialization/maintenance
-        assert HookEvent.SETUP.value == "setup"
+        for removed in ("USER_PROMPT_SUBMIT", "NOTIFICATION", "SETUP"):
+            assert not hasattr(HookEvent, removed)
     
     def test_existing_events_unchanged(self):
         """Verify existing events are unchanged (backward compatibility)."""
@@ -255,6 +256,131 @@ class TestHookRegistry:
         assert len(read_hooks) == 1
         assert read_hooks[0].name == "read_hook"
     
+    def test_get_hooks_orders_by_priority(self):
+        """Lower priority runs earlier; equal priority keeps registration order."""
+        registry = HookRegistry()
+
+        registry.register_function(
+            event=HookEvent.AFTER_LLM,
+            func=lambda d: HookResult.allow(),
+            name="trace",
+            priority=90,
+        )
+        registry.register_function(
+            event=HookEvent.AFTER_LLM,
+            func=lambda d: HookResult.allow(),
+            name="redact",
+            priority=10,
+        )
+
+        hooks = registry.get_hooks(HookEvent.AFTER_LLM)
+        assert [h.name for h in hooks] == ["redact", "trace"]
+
+    def test_get_hooks_stable_tie_break(self):
+        """Equal (default) priority falls back to deterministic registration order."""
+        registry = HookRegistry()
+        for name in ("a", "b", "c"):
+            registry.register_function(
+                event=HookEvent.BEFORE_TOOL,
+                func=lambda d: HookResult.allow(),
+                name=name,
+            )
+
+        hooks = registry.get_hooks(HookEvent.BEFORE_TOOL)
+        assert [h.name for h in hooks] == ["a", "b", "c"]
+
+    def test_priority_default_is_backward_compatible(self):
+        """Unset priority uses the default bucket so old callers are unaffected."""
+        registry = HookRegistry()
+        hook_id = registry.register_function(
+            event=HookEvent.BEFORE_TOOL,
+            func=lambda d: HookResult.allow(),
+            name="default",
+        )
+        hook = registry.get_hooks(HookEvent.BEFORE_TOOL)[0]
+        assert hook.id == hook_id
+        assert hook.priority == 100
+
+    def test_list_hooks_exposes_priority_in_order(self):
+        """list_hooks() surfaces priority and reflects effective execution order."""
+        registry = HookRegistry()
+        registry.register_function(
+            event=HookEvent.AFTER_LLM,
+            func=lambda d: HookResult.allow(),
+            name="late",
+            priority=90,
+        )
+        registry.register_function(
+            event=HookEvent.AFTER_LLM,
+            func=lambda d: HookResult.allow(),
+            name="early",
+            priority=10,
+        )
+
+        listed = registry.list_hooks()[HookEvent.AFTER_LLM.value]
+        assert [h["name"] for h in listed] == ["early", "late"]
+        assert [h["priority"] for h in listed] == [10, 90]
+
+    def test_add_hook_default_priority_matches_register_function(self):
+        """Simplified add_hook and register_function share the default bucket.
+
+        A hook added via the beginner-friendly ``add_hook`` and one added via
+        ``register_function`` must not reorder relative to each other when
+        neither caller asked for a priority — both land in the 100 bucket and
+        keep registration order.
+        """
+        from praisonaiagents.hooks.registry import (
+            add_hook, get_default_registry, set_default_registry,
+        )
+        set_default_registry(HookRegistry())
+        try:
+            add_hook(HookEvent.BEFORE_TOOL, lambda d: HookResult.allow())
+            reg = get_default_registry()
+            reg.register_function(
+                event=HookEvent.BEFORE_TOOL,
+                func=lambda d: HookResult.allow(),
+                name="direct",
+            )
+            hooks = reg.get_hooks(HookEvent.BEFORE_TOOL)
+            assert [h.priority for h in hooks] == [100, 100]
+            assert hooks[1].name == "direct"
+        finally:
+            set_default_registry(HookRegistry())
+
+    def test_runner_honors_priority_across_parallel_sequential(self):
+        """A lower-priority sequential hook runs before a higher-priority parallel one.
+
+        Regression for the runner splitting all parallel hooks to the front,
+        which leaked unredacted input to a tracer that should have observed the
+        sequential redaction first.
+        """
+        registry = HookRegistry()
+        order = []
+
+        def redact(data):
+            order.append("redact")
+            return HookResult.allow()
+
+        def trace(data):
+            order.append("trace")
+            return HookResult.allow()
+
+        registry.register_function(
+            event=HookEvent.AFTER_LLM, func=redact, name="redact",
+            sequential=True, priority=10,
+        )
+        registry.register_function(
+            event=HookEvent.AFTER_LLM, func=trace, name="trace",
+            sequential=False, priority=20,
+        )
+
+        runner = HookRunner(registry)
+        input_data = HookInput(
+            session_id="s", cwd="/tmp", event_name="after_llm", timestamp="0",
+        )
+        asyncio.run(runner.execute(HookEvent.AFTER_LLM, input_data))
+        assert order == ["redact", "trace"]
+
     def test_disable_enable_hook(self):
         """Test disabling and enabling hooks."""
         registry = HookRegistry()
@@ -301,6 +427,30 @@ class TestHookRegistry:
         assert "before_tool" in hooks_list
         assert len(hooks_list["before_tool"]) == 1
         assert hooks_list["before_tool"][0]["name"] == "test_hook"
+
+    def test_has_hooks_matches_get_hooks(self):
+        """has_hooks() honours per-hook and global enable flags like get_hooks()."""
+        registry = HookRegistry()
+        assert not registry.has_hooks(HookEvent.BEFORE_TOOL)
+
+        hook_id = registry.register_function(
+            event=HookEvent.BEFORE_TOOL,
+            func=lambda data: HookResult.allow(),
+            matcher="write_*"
+        )
+        assert registry.has_hooks(HookEvent.BEFORE_TOOL)
+        assert not registry.has_hooks(HookEvent.AFTER_TOOL)
+
+        registry.disable_hook(hook_id)
+        assert not registry.has_hooks(HookEvent.BEFORE_TOOL)
+
+        registry.enable_hook(hook_id)
+        registry.enabled = False
+        assert not registry.has_hooks(HookEvent.BEFORE_TOOL)
+
+        registry.enabled = True
+        registry.unregister(hook_id)
+        assert not registry.has_hooks(HookEvent.BEFORE_TOOL)
 
 
 # =============================================================================
@@ -721,7 +871,31 @@ class TestCommandHooks:
         assert len(results) == 1
         assert results[0].exit_code == 2
         assert results[0].output.decision == "deny"
-    
+
+    def test_parse_output_allow_json_unexpected_exit_denies(self):
+        """Fail closed: allow-JSON must not bypass an unexpected exit code."""
+        runner = HookRunner(HookRegistry(), cwd="/tmp")
+        result = runner._parse_command_output(
+            '{"decision": "allow"}', "not found", 127
+        )
+        assert result.decision == "deny"
+        assert "127" in result.reason
+
+    def test_parse_output_allow_json_clean_exit_allows(self):
+        """Allow-JSON with a clean exit still allows."""
+        runner = HookRunner(HookRegistry(), cwd="/tmp")
+        result = runner._parse_command_output('{"decision": "allow"}', "", 0)
+        assert result.decision == "allow"
+
+    def test_parse_output_deny_json_unexpected_exit_keeps_reason(self):
+        """Explicit deny-JSON is respected even on an unexpected exit code."""
+        runner = HookRunner(HookRegistry(), cwd="/tmp")
+        result = runner._parse_command_output(
+            '{"decision": "deny", "reason": "policy"}', "", 127
+        )
+        assert result.decision == "deny"
+        assert result.reason == "policy"
+
     @pytest.mark.asyncio
     async def test_command_hook_timeout(self):
         """Test command hook timeout."""

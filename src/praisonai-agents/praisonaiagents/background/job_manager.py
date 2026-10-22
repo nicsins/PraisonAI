@@ -11,7 +11,8 @@ import uuid
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Protocol, runtime_checkable
 from dataclasses import dataclass, field
-from concurrent.futures import ThreadPoolExecutor, Future
+from concurrent.futures import CancelledError, ThreadPoolExecutor, Future
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 
 from praisonaiagents._logging import get_logger
 
@@ -137,6 +138,7 @@ class BackgroundJobManager:
         self._jobs: Dict[str, JobInfo] = {}
         self._futures: Dict[str, Future] = {}
         self._lock = threading.Lock()
+        self._last_gc = time.time()
 
     def _persist(self, job: JobInfo) -> None:
         """Best-effort persist of a job's current state to the store.
@@ -147,12 +149,18 @@ class BackgroundJobManager:
         """
         if self._store is None:
             return
-        try:
-            self._store.upsert(job)
-        except Exception as e:  # noqa: BLE001 — persistence must never crash worker
-            logger.debug(
-                "Persisting job %s failed (non-fatal): %s", job.job_id, e,
-            )
+        # Check-and-write under the lock: a finished job whose id was reused
+        # must not overwrite the newer job's persisted record.
+        with self._lock:
+            current = self._jobs.get(job.job_id)
+            if current is not None and current is not job:
+                return
+            try:
+                self._store.upsert(job)
+            except Exception as e:  # noqa: BLE001 — persistence must never crash worker
+                logger.debug(
+                    "Persisting job %s failed (non-fatal): %s", job.job_id, e,
+                )
     
     @property
     def active_jobs(self) -> int:
@@ -191,8 +199,22 @@ class BackgroundJobManager:
             
         Returns:
             The job ID
+
+        Raises:
+            ValueError: If ``job_id`` belongs to a job that is still pending
+                or running. Ids of terminal jobs may be reused.
         """
-        job_id = job_id or str(uuid.uuid4())[:8]
+        job_id = job_id or uuid.uuid4().hex[:12]
+        
+        # Opportunistically evict old terminal jobs so long-lived hosts
+        # (gateways, bots, servers) don't retain every finished result.
+        now = time.time()
+        with self._lock:
+            run_gc = now - self._last_gc > self._GC_INTERVAL
+            if run_gc:
+                self._last_gc = now
+        if run_gc:
+            self.cleanup_completed()
         
         job_info = JobInfo(
             job_id=job_id,
@@ -200,19 +222,63 @@ class BackgroundJobManager:
             origin=dict(origin) if origin else {},
         )
         
+        # Result handle owned by the manager (not the executor) so cancel_job
+        # can wake get_result waiters even while ``func`` is still running.
+        done: Future = Future()
         with self._lock:
+            existing = self._jobs.get(job_id)
+            if existing is not None and existing.status in (
+                JobStatus.PENDING, JobStatus.RUNNING,
+            ):
+                raise ValueError(f"Job '{job_id}' is already active")
+            # Publish job and future together so a concurrent cancel_job never
+            # sees the new job paired with the old future.
             self._jobs[job_id] = job_info
+            self._futures[job_id] = done
         # Persist the PENDING record before it starts so a crash between spawn
         # and first run still leaves a recoverable trace (reconciled as LOST).
         self._persist(job_info)
         
+        def _emit_job_completed() -> None:
+            """Emit the JOB_COMPLETED hook for a job that reached a terminal state.
+
+            Fired for every background job, not only the ones carrying a
+            ``deliver`` target: ``on_complete`` is a delivery callback the
+            gateway may or may not install, whereas ``HookEvent.JOB_COMPLETED``
+            is the observability contract plugins subscribe to. Best-effort --
+            a missing hooks package or a raising subscriber never affects the
+            job's own result.
+            """
+            info = job_info
+            try:
+                from praisonaiagents.hooks import fire_hook
+
+                fire_hook(
+                    "job_completed",
+                    {
+                        "job_id": info.job_id,
+                        "status": getattr(info.status, "value", str(info.status)),
+                        "result": info.result,
+                        "error": info.error,
+                        "agent_name": "background",
+                        "session_id": str(info.origin.get("session_id", "") or ""),
+                        "deliver": str(info.origin.get("deliver", "") or ""),
+                        "platform": str(info.origin.get("platform", "") or ""),
+                        "chat_id": str(info.origin.get("chat_id", "") or ""),
+                        "thread_id": str(info.origin.get("thread_id", "") or ""),
+                    },
+                )
+            except Exception as e:  # noqa: BLE001 - observability must not break the job
+                logger.debug(
+                    "JOB_COMPLETED hook emit for job %s failed (non-fatal): %s",
+                    job_id, e,
+                )
+
         def _fire_complete() -> None:
+            _emit_job_completed()
             if on_complete is None:
                 return
-            with self._lock:
-                info = self._jobs.get(job_id)
-            if info is None:
-                return
+            info = job_info
             try:
                 on_complete(info)
                 # Record successful deliver-back so restart reconciliation does
@@ -226,37 +292,88 @@ class BackgroundJobManager:
                     job_id, e,
                 )
 
-        def _run_job():
+        # The worker writes only to its own ``job_info`` (never re-looked-up by
+        # id) so a later job reusing the id, or eviction, cannot be corrupted.
+        job = job_info
+
+        def _abort(error: BaseException, cancelled: bool = False) -> None:
+            """Move a still-active job to a terminal state and resolve ``done``."""
             with self._lock:
-                job = self._jobs[job_id]
+                if job.status not in (JobStatus.PENDING, JobStatus.RUNNING):
+                    return
+                job.status = JobStatus.CANCELLED if cancelled else JobStatus.FAILED
+                job.completed_at = time.time()
+                if not cancelled:
+                    # Bare SystemExit()/KeyboardInterrupt() stringify to "".
+                    job.error = str(error) or type(error).__name__
+                if cancelled:
+                    done.cancel()
+                else:
+                    done.set_exception(error)
+            self._persist(job)
+            # Failures must reach deliver-back/hook subscribers like any other
+            # failure; cancellations stay silent, matching cancel_job().
+            if not cancelled:
+                _fire_complete()
+
+        def _execute():
+            with self._lock:
+                if job.status == JobStatus.CANCELLED:  # cancelled while pending
+                    return
                 job.status = JobStatus.RUNNING
                 job.started_at = time.time()
             self._persist(job)
-            
+
             try:
                 result = func()
-                with self._lock:
-                    job = self._jobs[job_id]
-                    job.status = JobStatus.COMPLETED
-                    job.completed_at = time.time()
-                    job.result = result
-                self._persist(job)
-                _fire_complete()
-                return result
             except Exception as e:
                 with self._lock:
-                    job = self._jobs[job_id]
+                    if job.status == JobStatus.CANCELLED:
+                        return
                     job.status = JobStatus.FAILED
                     job.completed_at = time.time()
                     job.error = str(e)
                 self._persist(job)
+                try:
+                    _fire_complete()
+                finally:
+                    done.set_exception(e)
+                return
+            with self._lock:
+                # Cancelled while running: discard the late outcome.
+                if job.status == JobStatus.CANCELLED:
+                    return
+                job.status = JobStatus.COMPLETED
+                job.completed_at = time.time()
+                job.result = result
+            self._persist(job)
+            try:
                 _fire_complete()
+            finally:
+                # Resolve even if on_complete raised a BaseException.
+                done.set_result(result)
+
+        def _run_job():
+            try:
+                _execute()
+            except BaseException as e:
+                # ``func`` raised a non-Exception (e.g. SystemExit); never
+                # strand get_result callers.
+                _abort(e)
                 raise
-        
-        future = self._executor.submit(_run_job)
-        with self._lock:
-            self._futures[job_id] = future
-        
+
+        try:
+            executor_future = self._executor.submit(_run_job)
+        except BaseException as e:
+            # e.g. submit after shutdown(): fail the job so its id is reusable
+            # and get_result raises instead of blocking forever.
+            _abort(e)
+            raise
+        # A queued work item dropped by the executor never runs _run_job.
+        executor_future.add_done_callback(
+            lambda f: _abort(CancelledError(), cancelled=True) if f.cancelled() else None
+        )
+
         return job_id
     
     def get_status(self, job_id: str) -> JobStatus:
@@ -315,21 +432,38 @@ class BackgroundJobManager:
         Raises:
             KeyError: If job_id is not found
             TimeoutError: If timeout is reached before completion
-            RuntimeError: If job failed
+            CancelledError: If the job was cancelled
+            Exception: If the job failed, the original exception is re-raised
+                (``RuntimeError`` with the stored error once evicted from
+                memory)
         """
         with self._lock:
-            if job_id not in self._futures:
+            future = self._futures.get(job_id)
+        if future is None:
+            # Evicted from memory: answer terminal outcomes from the durable store
+            job = self._store.get(job_id) if self._store else None
+            if job is None or job.status not in self._EVICTABLE_STATES:
                 raise KeyError(f"Job {job_id} not found")
-            future = self._futures[job_id]
+            if job.status == JobStatus.COMPLETED:
+                return job.result
+            if job.status == JobStatus.CANCELLED:
+                raise CancelledError(f"Job {job_id} was cancelled")
+            raise RuntimeError(job.error or f"Job {job_id} {job.status.value}")
         
         try:
             return future.result(timeout=timeout)
-        except TimeoutError:
+        except FuturesTimeoutError:
+            # Distinct from builtin TimeoutError on Python 3.10.
             raise TimeoutError(f"Job {job_id} did not complete within {timeout} seconds")
     
     def cancel_job(self, job_id: str) -> bool:
         """
         Attempt to cancel a job.
+
+        A pending job never runs. A running job is marked ``CANCELLED``
+        immediately and its eventual result is discarded (no ``on_complete``
+        delivery); Python threads cannot be killed, so the worker thread is
+        only released once ``func`` returns.
         
         Args:
             job_id: The job ID to cancel
@@ -338,19 +472,18 @@ class BackgroundJobManager:
             True if cancellation was successful, False otherwise
         """
         with self._lock:
-            if job_id not in self._futures:
+            job = self._jobs.get(job_id)
+            future = self._futures.get(job_id)
+            if future is None or job is None or job.status not in (
+                JobStatus.PENDING, JobStatus.RUNNING,
+            ):
                 return False
-            future = self._futures[job_id]
-            cancelled = future.cancel()
-            if cancelled:
-                self._jobs[job_id].status = JobStatus.CANCELLED
-                self._jobs[job_id].completed_at = time.time()
-                job = self._jobs[job_id]
-            else:
-                job = None
-        if job is not None:
-            self._persist(job)
-        return cancelled
+            job.status = JobStatus.CANCELLED
+            job.completed_at = time.time()
+            # Wakes any get_result waiter with CancelledError right away.
+            future.cancel()
+        self._persist(job)
+        return True
 
     def reconcile_on_start(
         self,
@@ -477,6 +610,9 @@ class BackgroundJobManager:
         JobStatus.LOST,
     )
 
+    # Minimum seconds between opportunistic cleanups triggered by start_job
+    _GC_INTERVAL = 60.0
+
     def cleanup_completed(self, max_age: float = 3600.0) -> int:
         """
         Remove terminal jobs older than max_age seconds.
@@ -502,6 +638,14 @@ class BackgroundJobManager:
                 if job_id in self._futures:
                     del self._futures[job_id]
                 removed += 1
+
+        # Prune the durable store with the same age policy so it stays bounded.
+        prune = getattr(self._store, "delete_older_than", None)
+        if prune is not None:
+            try:
+                prune(now - max_age)
+            except Exception as e:  # noqa: BLE001 — pruning is best-effort
+                logger.debug("Pruning background job store failed (non-fatal): %s", e)
         
         return removed
     
@@ -520,10 +664,47 @@ _global_job_manager: Optional[BackgroundJobManager] = None
 _global_lock = threading.Lock()
 
 
+def _build_default_store() -> Optional[BackgroundJobStore]:
+    """Best-effort construct the durable SQLite store for the global manager.
+
+    Persists to ``<runs_dir>/background_jobs.db`` alongside the run ledger so
+    ``/tasks`` and background subagents survive a restart. Any failure (missing
+    data dir, read-only filesystem, sqlite error) is swallowed and the manager
+    falls back to pure in-memory behaviour — durability is an enhancement, never
+    a hard requirement. Set ``PRAISONAI_BACKGROUND_JOB_STORE=0`` to opt out.
+    """
+    import os
+
+    if os.environ.get("PRAISONAI_BACKGROUND_JOB_STORE", "1") in ("0", "false", "False"):
+        return None
+    try:
+        from .sqlite_store import SqliteBackgroundJobStore
+
+        return SqliteBackgroundJobStore()
+    except Exception as e:  # noqa: BLE001 — store is optional, never crash startup
+        logger.debug("Durable background job store unavailable (non-fatal): %s", e)
+        return None
+
+
 def get_job_manager() -> BackgroundJobManager:
-    """Get the global job manager instance."""
+    """Get the global job manager instance.
+
+    On first construction a durable :class:`BackgroundJobStore` is attached when
+    one can be built (see :func:`_build_default_store`) and
+    :meth:`BackgroundJobManager.reconcile_on_start` is run once so jobs orphaned
+    by a prior crash are reconciled to ``LOST`` rather than silently lost.
+    """
     global _global_job_manager
     with _global_lock:
         if _global_job_manager is None:
-            _global_job_manager = BackgroundJobManager()
+            store = _build_default_store()
+            _global_job_manager = BackgroundJobManager(store=store)
+            if store is not None:
+                try:
+                    _global_job_manager.reconcile_on_start()
+                except Exception as e:  # noqa: BLE001 — never crash on startup recovery
+                    logger.debug(
+                        "Background job reconciliation on start failed "
+                        "(non-fatal): %s", e,
+                    )
         return _global_job_manager

@@ -91,6 +91,19 @@ _auto_enable_attempted: bool = False
 _auto_enable_lock = threading.Lock()
 
 
+def _plugin_name(plugin_info) -> str:
+    """Read a plugin's name from a PluginInfo, or from a dict.
+
+    list_plugins() returns PluginInfo dataclasses, which have no .get(), so
+    calling .get("name") raised AttributeError and made enable_all_plugins()
+    and disable_all_plugins() fail outright. Both shapes are accepted here so a
+    future dict-returning implementation keeps working.
+    """
+    if isinstance(plugin_info, dict):
+        return plugin_info.get("name", "")
+    return getattr(plugin_info, "name", "") or ""
+
+
 def maybe_enable_from_config() -> None:
     """Enable plugins once per process when config or env requests it."""
     global _auto_enable_attempted
@@ -172,16 +185,34 @@ def enable(plugins: list = None, options_by_name: dict = None) -> None:
     # Snapshot the names under lock to avoid TOCTOU
     with _plugins_lock:
         target_plugins = list(_enabled_plugin_names) if _enabled_plugin_names is not None else None
+
+    # Record the selective allow-list on this singleton manager so plugins
+    # registered *after* enable() default to disabled unless allow-listed.
+    # Setting it only here keeps standalone managers unrestricted.
+    manager.set_registration_allow_list(target_plugins)
     
-    # Enable specific plugins or all
+    def _plugin_name(plugin_info):
+        """Read a plugin name from either PluginInfo or legacy dict data."""
+        if isinstance(plugin_info, dict):
+            return plugin_info.get("name", "")
+        return getattr(plugin_info, "name", "")
+
+    # Enable specific plugins or all.  Registration defaults each plugin to
+    # enabled, so a selective call must also disable discovered plugins that
+    # are outside the facade's allow-list; otherwise get_all_tools() would
+    # expose tools from unselected plugins to every new Agent.
     if target_plugins is not None:
-        # Enable only specified plugins
-        for name in target_plugins:
-            manager.enable(name)
+        selected = set(target_plugins)
+        for plugin_info in manager.list_plugins():
+            name = _plugin_name(plugin_info)
+            if name in selected:
+                manager.enable(name)
+            else:
+                manager.disable(name)
     else:
         # Enable all discovered plugins
         for plugin_info in manager.list_plugins():
-            manager.enable(plugin_info.get("name", ""))
+            manager.enable(_plugin_name(plugin_info))
     
     import logging
     # Bridge enabled plugins into the runtime hook engine so their lifecycle
@@ -231,8 +262,11 @@ def disable(plugins: list = None) -> None:
         with _plugins_lock:
             _plugins_enabled = False
             _enabled_plugin_names = None
+        # Clear the singleton's late-registration allow-list so subsequent
+        # registrations return to the default (enabled) behaviour.
+        manager.set_registration_allow_list(None)
         for plugin_info in manager.list_plugins():
-            manager.disable(plugin_info.get("name", ""))
+            manager.disable(_plugin_name(plugin_info))
 
 
 def list_plugins() -> list:
@@ -344,6 +378,21 @@ def get_plugin_registry() -> list:
             return manager.is_enabled(name)
         return name in config_enabled
 
+    # Surface the least-privilege conversation boundary so an operator can see,
+    # per plugin, whether it *requested* prompt/message access (declared a
+    # conversation hook) and whether it is *granted*. Imported once and reused
+    # across all three registry sources so the capability columns are never
+    # silently omitted for a given plugin-listing path.
+    from .manager import CONVERSATION_HOOKS
+
+    def _requests_conversation(declared) -> bool:
+        for h in declared or []:
+            value = h.value if hasattr(h, "value") else h
+            for ch in CONVERSATION_HOOKS:
+                if value == ch or value == getattr(ch, "value", ch):
+                    return True
+        return False
+
     entries: list = []
     seen: set = set()
 
@@ -354,9 +403,10 @@ def get_plugin_registry() -> list:
         if not name or name in seen:
             continue
         seen.add(name)
+        declared = getattr(info, "hooks", None) or []
         hooks = [
             h.value if hasattr(h, "value") else str(h)
-            for h in (getattr(info, "hooks", None) or [])
+            for h in declared
         ]
         entries.append({
             "name": name,
@@ -365,6 +415,8 @@ def get_plugin_registry() -> list:
             "source": "registered",
             "enabled": manager.is_enabled(name) or _config_says_enabled(name),
             "hooks": hooks,
+            "requests_conversation": _requests_conversation(declared),
+            "conversation_granted": manager._granted_conversation_access(name),
         })
 
     # 2. Entry-point plugins present on the system but not yet loaded, so
@@ -381,6 +433,10 @@ def get_plugin_registry() -> list:
                 continue
             seen.add(ep.name)
             dist = getattr(getattr(ep, "dist", None), "name", None)
+            # Installed-but-not-loaded entry points: hooks are unknown without
+            # executing the plugin (which we deliberately avoid), so we report a
+            # conservative view — it has not been granted conversation access and
+            # its requested capability is unknown until loaded.
             entries.append({
                 "name": ep.name,
                 "version": "-",
@@ -388,6 +444,8 @@ def get_plugin_registry() -> list:
                 "source": f"entry_point:{dist}" if dist else "entry_point",
                 "enabled": _config_says_enabled(ep.name),
                 "hooks": [],
+                "requests_conversation": None,
+                "conversation_granted": manager._granted_conversation_access(ep.name),
             })
     except Exception as e:
         import logging
@@ -402,14 +460,17 @@ def get_plugin_registry() -> list:
             if not name or name in seen:
                 continue
             seen.add(name)
+            single_hooks = list(meta.get("hooks", []) or [])
             entries.append({
                 "name": name,
                 "version": meta.get("version", "1.0.0"),
                 "description": meta.get("description", ""),
                 "source": "single_file",
                 "enabled": manager.is_enabled(name) or _config_says_enabled(name),
-                "hooks": list(meta.get("hooks", []) or []),
+                "hooks": single_hooks,
                 "path": meta.get("path"),
+                "requests_conversation": _requests_conversation(single_hooks),
+                "conversation_granted": manager._granted_conversation_access(name),
             })
     except Exception as e:
         import logging
@@ -418,106 +479,37 @@ def get_plugin_registry() -> list:
     return entries
 
 
-def __getattr__(name: str):
-    """Lazy load module components."""
+from .._lazy import create_lazy_getattr
+
+_LAZY_IMPORTS = {
     # Core classes
-    if name == "PluginManager":
-        from .manager import PluginManager
-        return PluginManager
-    
-    if name == "get_plugin_manager":
-        from .manager import get_plugin_manager
-        return get_plugin_manager
-    
-    if name == "Plugin":
-        from .plugin import Plugin
-        return Plugin
-    
-    if name == "PluginHook":
-        from .plugin import PluginHook
-        return PluginHook
-    
-    if name == "PluginInfo":
-        from .plugin import PluginInfo
-        return PluginInfo
-    
-    if name == "FunctionPlugin":
-        from .plugin import FunctionPlugin
-        return FunctionPlugin
-    
-    if name == "PluginType":
-        from .plugin import PluginType
-        return PluginType
-
-    if name == "PluginDecision":
-        from .plugin import PluginDecision
-        return PluginDecision
-
-    if name == "GuardrailBlocked":
-        from .plugin import GuardrailBlocked
-        return GuardrailBlocked
-    
+    "PluginManager": (f"{__name__}.manager", "PluginManager"),
+    "get_plugin_manager": (f"{__name__}.manager", "get_plugin_manager"),
+    "Plugin": (f"{__name__}.plugin", "Plugin"),
+    "PluginHook": (f"{__name__}.plugin", "PluginHook"),
+    "PluginInfo": (f"{__name__}.plugin", "PluginInfo"),
+    "FunctionPlugin": (f"{__name__}.plugin", "FunctionPlugin"),
+    "PluginType": (f"{__name__}.plugin", "PluginType"),
+    "PluginDecision": (f"{__name__}.plugin", "PluginDecision"),
+    "GuardrailBlocked": (f"{__name__}.plugin", "GuardrailBlocked"),
     # Protocols
-    if name == "PluginProtocol":
-        from .protocols import PluginProtocol
-        return PluginProtocol
-    
-    if name == "ToolPluginProtocol":
-        from .protocols import ToolPluginProtocol
-        return ToolPluginProtocol
-    
-    if name == "HookPluginProtocol":
-        from .protocols import HookPluginProtocol
-        return HookPluginProtocol
-    
-    if name == "AgentPluginProtocol":
-        from .protocols import AgentPluginProtocol
-        return AgentPluginProtocol
-    
-    if name == "LLMPluginProtocol":
-        from .protocols import LLMPluginProtocol
-        return LLMPluginProtocol
-    
+    "PluginProtocol": (f"{__name__}.protocols", "PluginProtocol"),
+    "ToolPluginProtocol": (f"{__name__}.protocols", "ToolPluginProtocol"),
+    "HookPluginProtocol": (f"{__name__}.protocols", "HookPluginProtocol"),
+    "AgentPluginProtocol": (f"{__name__}.protocols", "AgentPluginProtocol"),
+    "LLMPluginProtocol": (f"{__name__}.protocols", "LLMPluginProtocol"),
     # Single-file plugin support - parser
-    if name == "PluginMetadata":
-        from .parser import PluginMetadata
-        return PluginMetadata
-    
-    if name == "PluginParseError":
-        from .parser import PluginParseError
-        return PluginParseError
-    
-    if name == "parse_plugin_header":
-        from .parser import parse_plugin_header
-        return parse_plugin_header
-    
-    if name == "parse_plugin_header_from_file":
-        from .parser import parse_plugin_header_from_file
-        return parse_plugin_header_from_file
-    
+    "PluginMetadata": (f"{__name__}.parser", "PluginMetadata"),
+    "PluginParseError": (f"{__name__}.parser", "PluginParseError"),
+    "parse_plugin_header": (f"{__name__}.parser", "parse_plugin_header"),
+    "parse_plugin_header_from_file": (f"{__name__}.parser", "parse_plugin_header_from_file"),
     # Single-file plugin support - discovery
-    if name == "discover_plugins":
-        from .discovery import discover_plugins
-        return discover_plugins
-    
-    if name == "load_plugin":
-        from .discovery import load_plugin
-        return load_plugin
-    
-    if name == "discover_and_load_plugins":
-        from .discovery import discover_and_load_plugins
-        return discover_and_load_plugins
-    
-    if name == "get_default_plugin_dirs":
-        from .discovery import get_default_plugin_dirs
-        return get_default_plugin_dirs
-    
-    if name == "get_plugin_template":
-        from .discovery import get_plugin_template
-        return get_plugin_template
-    
-    if name == "ensure_plugin_dir":
-        from .discovery import ensure_plugin_dir
-        return ensure_plugin_dir
-    
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    "discover_plugins": (f"{__name__}.discovery", "discover_plugins"),
+    "load_plugin": (f"{__name__}.discovery", "load_plugin"),
+    "discover_and_load_plugins": (f"{__name__}.discovery", "discover_and_load_plugins"),
+    "get_default_plugin_dirs": (f"{__name__}.discovery", "get_default_plugin_dirs"),
+    "get_plugin_template": (f"{__name__}.discovery", "get_plugin_template"),
+    "ensure_plugin_dir": (f"{__name__}.discovery", "ensure_plugin_dir"),
+}
+
+__getattr__ = create_lazy_getattr(_LAZY_IMPORTS, __name__)

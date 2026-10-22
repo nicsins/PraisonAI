@@ -6,6 +6,7 @@ separated from the protocol definitions for clean architecture.
 """
 from typing import List, Dict, Any, Tuple
 from .protocols import GuardrailProtocol
+from .retry import GuardrailRetry
 
 
 class GuardrailChain:
@@ -78,7 +79,22 @@ class GuardrailChain:
                         return False, arguments  # Fail closed on error
                         
         return True, arguments
-        
+
+    def validate_tool_result(self, tool_name: str, result: Any, **kwargs) -> Tuple[bool, Any]:
+        """Validate a tool result through all guardrails (fail-closed)."""
+        for guardrail in self.guardrails:
+            if hasattr(guardrail, 'validate_tool_result'):
+                try:
+                    is_valid, processed_result = guardrail.validate_tool_result(tool_name, result, **kwargs)
+                    if not is_valid:
+                        return False, result  # Failed validation
+                    result = processed_result  # Update result with processing (e.g. redaction)
+                except Exception as e:
+                    if not self.fail_open:
+                        return False, result  # Fail closed on error
+
+        return True, result
+
     def _validate_through_chain(self, method_name: str, content: str, **kwargs) -> Tuple[bool, str]:
         """Internal helper to validate content through the guardrail chain."""
         for guardrail in self.guardrails:
@@ -89,6 +105,11 @@ class GuardrailChain:
                     if not is_valid:
                         return False, processed_content  # Failed validation
                     content = processed_content  # Update content with processing
+                except GuardrailRetry as e:
+                    # Deliberate "not acceptable, here is why" signal: surface the
+                    # author's message verbatim so it can be handed to the model,
+                    # instead of burying it under the generic error wrapper below.
+                    return False, e.feedback
                 except Exception as e:
                     if not self.fail_open:
                         return False, f"Guardrail error: {str(e)}"  # Fail closed on error

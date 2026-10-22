@@ -12,7 +12,6 @@
 <a href="https://github.com/MervinPraison/PraisonAI"><img src="https://static.pepy.tech/badge/PraisonAI" alt="Total Downloads" /></a>
 <a href="https://github.com/MervinPraison/PraisonAI"><img src="https://img.shields.io/github/v/release/MervinPraison/PraisonAI" alt="Latest Stable Version" /></a>
 <a href="https://github.com/MervinPraison/PraisonAI"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License" /></a>
-<a href="https://registry.modelcontextprotocol.io/servers/io.github.MervinPraison/praisonai"><img src="https://img.shields.io/badge/MCP-Registry-blue" alt="MCP Registry" /></a>
 </p>
 
 <div align="center">
@@ -33,6 +32,19 @@ curl -fsSL https://praison.ai/install.sh | bash
   <br>
   <a href="https://x.com/elonmusk/status/1893870468249141688" target="_blank">
     <img src="https://img.shields.io/badge/Highlighted_by_Elon_Musk-000000?style=for-the-badge&logo=x&logoColor=white" alt="Highlighted by Elon Musk" />
+  </a>
+  <br>
+  <br>
+  <a href="https://github.com/MervinPraison/PraisonAI/releases/latest">
+    <img src="https://img.shields.io/badge/Download_for_macOS-000000?style=for-the-badge&logo=apple&logoColor=white" alt="Download for macOS" />
+  </a>
+  &nbsp;&nbsp;
+  <a href="https://github.com/MervinPraison/PraisonAI/releases/latest">
+    <img src="https://img.shields.io/badge/Download_for_Windows-0078D6?style=for-the-badge&logo=windows&logoColor=white" alt="Download for Windows" />
+  </a>
+  &nbsp;&nbsp;
+  <a href="https://github.com/MervinPraison/PraisonAI/releases/latest">
+    <img src="https://img.shields.io/badge/Download_for_Linux-FCC624?style=for-the-badge&logo=linux&logoColor=black" alt="Download for Linux" />
   </a>
   <br>
 </div>
@@ -452,6 +464,8 @@ Powered by 100+ LLMs (OpenAI, Anthropic, Gemini & local models).
 ---
 
 ## 📘 Using Python Code
+
+> Unsure whether a result is a bug or model randomness? Check the [SDK Behavior Matrix](https://github.com/MervinPraison/PraisonAI/blob/main/src/praisonai-agents/docs/sdk-behavior-matrix.md) for `stream`, memory prefetch, structured output, teams and AG-UI.
 
 ### 1. Single Agent
 
@@ -1099,12 +1113,38 @@ For other providers, see [Models docs](https://docs.praison.ai/docs/models).
 <summary><strong>How do I use a local model (Ollama)?</strong></summary>
 
 ```bash
-# Start Ollama server first
+# Start Ollama and pull a model
 ollama serve
-
-# Set environment variable
-export OPENAI_BASE_URL=http://localhost:11434/v1
+ollama pull llama3.2
 ```
+
+```python
+from praisonaiagents import Agent
+
+agent = Agent(instructions="You are a helpful assistant", llm="ollama/llama3.2")
+agent.start("Why is the sky blue?")
+```
+
+The `ollama/` prefix is what selects Ollama's handling — tool-call repair,
+tool-result formatting and the streaming rules small local models need. Or set
+it by environment instead:
+
+```bash
+export OPENAI_MODEL_NAME=ollama/llama3.2
+```
+
+Setting only `OPENAI_BASE_URL` is not enough: with no model named, the OpenAI
+default (`gpt-4o-mini`) is sent to Ollama, which answers
+`404 model 'gpt-4o-mini' not found`. Always name the model.
+
+Point at a non-default host with `base_url=` or `OLLAMA_HOST`:
+
+```python
+agent = Agent(instructions="...", llm="ollama/llama3.2", base_url="http://192.168.1.10:11434")
+```
+
+The same shape works for other local runtimes — `lm_studio/`, `vllm/` and
+`hosted_vllm/` with their server's `base_url`.
 
 See [Models docs](https://docs.praison.ai/docs/models) for more details.
 

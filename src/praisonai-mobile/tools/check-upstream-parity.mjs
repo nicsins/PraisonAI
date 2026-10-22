@@ -37,9 +37,26 @@ import { promisify } from "node:util";
 
 const run = promisify(execFile);
 
-const UPSTREAM = resolve(import.meta.dirname, "../../praisonai-ts");
+/** Where the sibling checkout lives.
+ *
+ *  Overridable for the same reason AGENT_API is: the SKIP path -- a standalone
+ *  clone with no praisonai-ts beside it -- had no test, and three mutations
+ *  survived in it. Dropping `process.exit(0)` makes the checker carry on
+ *  without the file it is meant to check; making `exists` answer true for a
+ *  missing path does the same from the other end. Either way a standalone
+ *  clone's CI fails for a reason that has nothing to do with drift. */
+const UPSTREAM = process.env["PARITY_UPSTREAM"] ?? resolve(import.meta.dirname, "../../praisonai-ts");
 const AGENT_SRC = join(UPSTREAM, "src/agent/simple.ts");
-const AGENT_API = resolve(import.meta.dirname, "../engines/src/praisonai-ts/agent-api.ts");
+/** The structural interface the real Agent must satisfy.
+ *
+ *  Overridable so the CLI can be driven against a deliberately-incompatible
+ *  interface in a test. Two mutations survived here -- `process.exitCode = 1`
+ *  becoming 0, so drift is PRINTED and the job passes anyway, and `--strict`
+ *  being dropped, so null-safety drift stops being detected. Neither is
+ *  observable without being able to provoke real drift. */
+const AGENT_API =
+  process.env["PARITY_AGENT_API"] ??
+  resolve(import.meta.dirname, "../engines/src/praisonai-ts/agent-api.ts");
 
 const exists = async (p) => {
   try {
@@ -77,6 +94,12 @@ await writeFile(
 const HERE = resolve(import.meta.dirname, "..");
 
 let output = "";
+/** Did the compiler actually run? A checker that reports a clean pass because
+ *  it never executed is worse than no checker -- this file's own header says
+ *  so. With `npx` off PATH the throw was `spawn npx ENOENT`, whose message
+ *  contains no "parity.ts", so the drift filter below found nothing and the
+ *  run printed success. */
+let compilerRan = false;
 try {
   // Run from THIS package: it has typescript, and praisonai-ts's own
   // dependencies are neither needed nor installable (see the header).
@@ -85,8 +108,21 @@ try {
     "--target", "es2022", "--module", "esnext", "--moduleResolution", "bundler",
     file,
   ], { cwd: HERE });
+  compilerRan = true; // exit 0: tsc ran and found nothing to say
 } catch (error) {
-  output = error.stdout || error.message || "";
+  output = error.stdout || "";
+  // A tsc that genuinely ran and failed prints diagnostics. A spawn failure,
+  // a missing binary or a killed process prints none.
+  compilerRan = /error TS\d+/.test(output);
+  if (!compilerRan) {
+    await rm(dir, { recursive: true, force: true });
+    console.error(
+      "upstream-parity: FAILED -- the typechecker did not run, so NOTHING was checked.\n" +
+      `  ${error.message || "no diagnostics and a non-zero exit"}\n` +
+      "  This is not a pass. Fix the invocation rather than trusting the green.",
+    );
+    process.exit(1);
+  }
 }
 
 // Only errors AT the generated file are drift. An assignability failure always

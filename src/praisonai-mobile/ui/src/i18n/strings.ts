@@ -62,15 +62,75 @@ export interface Strings {
   /** The app could not start at all. The detail is machine text appended, not
    *  interpolated into the middle of a sentence. */
   readonly bootFailed: (detail: string) => string;
+  /** The app started but the engine is not answering yet. Says the app is
+   *  usable and what is wrong, which is the difference between a warning
+   *  and the fatal screen this used to be. */
+  readonly engineNotReady: (detail: string) => string;
   /** The crash screen. It has to say the conversations survived, because the
    *  user's next thought is that they did not. */
   readonly crashed: string;
+  /** The engine refused the cancellation. Said out loud because the button
+   *  going quiet is indistinguishable from having worked. */
+  readonly stopRefused: string;
 
   // ---- screens -----------------------------------------------------------
   readonly routeChats: string;
   readonly routeChat: string;
   readonly routeSettings: string;
   readonly routeAbout: string;
+  /**
+   * A settings value the store would not accept.
+   *
+   * Said rather than merely undone. A field that snaps back and says nothing
+   * is indistinguishable from a mis-tap, a lost keystroke, or a save that
+   * worked -- and on the settings screen, whose whole job is to repair an
+   * engine the app cannot reach, that silence leaves someone re-typing the
+   * same refused value. It names the setting, because the field it belongs to
+   * may already have scrolled off.
+   */
+  readonly settingRejected: (label: string) => string;
+  /**
+   * The same refusal, plus a value that WOULD be accepted.
+   *
+   * `settingRejected` names the setting and stops there, which is the whole of
+   * what it can say for a def whose `validate` is a clamp. For a def that
+   * declares an `example`, stopping there leaves the user looking at the field
+   * they just typed into with no idea which part of it was wrong -- and the
+   * engine address is exactly that field: `7.0.0.1:8765` and
+   * `http://192.168.1.10:8765` differ in a scheme, and nothing on the screen
+   * said a scheme was expected.
+   */
+  readonly settingRejectedExample: (label: string, example: string) => string;
+  /**
+   * A field that is switched off, and the switch that turns it on.
+   *
+   * Not "This field is disabled" -- that describes the screen back to the
+   * person looking at it. It names the OTHER setting and the value to put it
+   * at, so the sentence is an instruction the reader can carry out on the same
+   * screen without scrolling.
+   */
+  readonly settingInactive: (label: string, value: string) => string;
+  /**
+   * A secret field's placeholder, and its accessible name.
+   *
+   * Deliberately NOT the stored value and not a masked stand-in like
+   * "sk-...abcd": the field is empty on every paint (view-model.ts rule 1 --
+   * the facade has no getter, so there is nothing to echo even if a renderer
+   * wanted to), and a placeholder describing what to type is the honest way to
+   * say so. A row that showed dots would read as "a key is already here",
+   * which is what the presence label is for and what a masked echo would make
+   * ambiguous.
+   */
+  readonly secretPlaceholder: string;
+  /** Confirmation that a key was stored. NEVER contains any part of the key --
+   *  this goes to an assertive live region, which is read aloud. */
+  readonly secretStored: (label: string) => string;
+  /** Confirmation that a key was removed. Said for the same reason a refusal
+   *  is: a control that changes nothing visible and says nothing has, for the
+   *  user, done nothing. */
+  readonly secretCleared: (label: string) => string;
+  /** The button that removes a stored key. */
+  readonly actionClearSecret: string;
 
   // ---- chat list ---------------------------------------------------------
   /** A chat whose title is blank. A blank row has no hit target and reads as a
@@ -79,6 +139,31 @@ export interface Strings {
   /** A chat file that would not parse. It is NOT hidden: see
    *  ui/src/chats/list-view-model.ts. */
   readonly chatUnreadable: (id: string) => string;
+  /**
+   * A chat row's name: its title and when it was last touched.
+   *
+   * ONE string for both, because the visible time and the spoken time have to
+   * be the same characters. `ChatRow.updatedLabel` was computed by
+   * `buildChatList` on every visit to the list and rendered nowhere at all, so
+   * every row was just a title and the list could not be scanned by recency --
+   * the one thing it is sorted by.
+   */
+  readonly chatUpdated: (title: string, when: string) => string;
+  /** The delete control on a chat row. It NAMES the chat: a list of rows each
+   *  offering a button called "Delete" is a list a screen reader user cannot
+   *  delete anything from safely. */
+  readonly deleteChat: (title: string) => string;
+  /** The armed state of that control. Deleting a conversation is the only
+   *  destructive, irreversible thing in the app, so it takes two taps. */
+  readonly actionConfirmDelete: string;
+  readonly deleteChatConfirm: (title: string) => string;
+  /** Said after the row disappears. A row that vanishes silently is
+   *  indistinguishable from a list that failed to draw. */
+  readonly chatDeleted: (title: string) => string;
+  /** The write failed. StoragePort rejects on a real device -- SecurityError
+   *  with site data blocked, QuotaExceededError -- and a delete that quietly
+   *  did nothing leaves the user believing a conversation is gone. */
+  readonly chatDeleteFailed: string;
   /** "You have no chats" -- a new install. */
   readonly chatsEmpty: string;
   /** "None of your chats could be read" -- data loss, and it must not render
@@ -86,6 +171,34 @@ export interface Strings {
   readonly chatsAllUnreadable: (count: number) => string;
   /** An open chat with no messages in it yet. */
   readonly emptyTranscript: string;
+  /**
+   * What the app is, under `emptyTranscript`, in an empty chat.
+   *
+   * Second line rather than first: the invitation is what a returning user
+   * needs and the description is what a new one does, and only one of them can
+   * be read first. It says what the app DOES -- not what it is built on, and
+   * not a claim about where the words go, because with the in-process engine
+   * they go to a model provider and a privacy line here would be false.
+   */
+  readonly emptyAbout: string;
+  /**
+   * The empty chat, when no key is stored and the engine in force needs one.
+   *
+   * The whole of defect #3 is that this sentence did not exist anywhere: the
+   * app could not answer, and the only thing that said so was the provider SDK,
+   * after a message had been sent, in the words "The OPENAI_API_KEY environment
+   * variable is missing or empty". These two strings and the button beside them
+   * are the replacement, and they run BEFORE the failure rather than after it.
+   *
+   * The title says what to do, not what is wrong: "No API key" describes the
+   * app's state, "Add an API key to start" describes the user's next move, and
+   * only one of those is useful to someone holding a phone.
+   */
+  readonly emptyNeedsKeyTitle: string;
+  /** The sentence under it: why, and where. It NAMES Settings, because the
+   *  button says "Open settings" and a user who taps Back has to know what they
+   *  were looking for. */
+  readonly emptyNeedsKeyBody: string;
 
   // ---- relative time (fallback path; see format-intl.ts) -----------------
   readonly justNow: string;
@@ -104,6 +217,27 @@ export interface Strings {
   readonly durationHoursMinutes: (hours: string, minutes: string) => string;
 
   // ---- transcript --------------------------------------------------------
+  /**
+   * Who said it, for a reader who cannot see which side of the screen a row
+   * sits on.
+   *
+   * Rendered INSIDE the user's row as visually-hidden text rather than as an
+   * `aria-label` on it. An aria-label replaces the element's content in the
+   * accessibility tree, and a11y/names.ts rule 3 spells out what that costs on
+   * a row whose content is prose: the reader loses word, sentence and character
+   * navigation and gets one unbrowsable blob. That reasoning was written about
+   * the model's paragraphs and applies word for word to the user's own.
+   */
+  readonly speakerUser: string;
+  /**
+   * "Sent, and not stored."
+   *
+   * Shown only when the turn has FINISHED without the engine reporting an
+   * index -- cancelled, errored, or a write that failed. Not while streaming:
+   * a row that says "not saved" for the whole of a normal answer is crying
+   * wolf during the seconds it matters least.
+   */
+  readonly userNotStored: string;
   /** The turn was cancelled. */
   readonly stopped: string;
   readonly streaming: string;
@@ -111,6 +245,15 @@ export interface Strings {
   readonly draftingTool: (name: string) => string;
   /** Events this turn refused. Plural via CLDR, not via a trailing "s". */
   readonly droppedEvents: (count: number, reasons: readonly string[]) => string;
+  /**
+   * A dropped event's reason, in words.
+   *
+   * The machine tag is kept alongside rather than replaced -- translating
+   * `wrong_msg_id` away makes the one string a support engineer can search for
+   * unsearchable. But a tag alone tells the reader nothing, so both appear: the
+   * sentence explains, the tag identifies.
+   */
+  readonly droppedReason: (reason: string) => string;
 
   // ---- tools -------------------------------------------------------------
   readonly toolStatus: (status: ToolStatus) => string;
@@ -211,6 +354,32 @@ const RECOVERY: Readonly<Record<Recovery, string>> = {
   none: "Dismiss",
 };
 
+const DROPPED_REASON: Readonly<Record<string, string>> = {
+  unparseable_json: "the engine sent something that was not valid JSON",
+  not_an_object: "the engine sent a value where an event was expected",
+  missing_type: "an event arrived with no type",
+  unknown_event: "the engine sent an event this version does not know",
+  missing_msg_id: "an event arrived with no message it belongs to",
+  missing_required_field: "an event was missing a field it needs",
+  empty_text: "an empty piece of text, which is not the same as no answer",
+  before_start: "an event arrived before the turn began",
+  wrong_msg_id: "an event belonged to a different message",
+  after_terminal: "an event arrived after the turn had already ended",
+};
+
+/**
+ * A dropped event's reason, in English words.
+ *
+ * Module-level so both `droppedReason` and `droppedEvents` route through it --
+ * bundle.ts lifts each string function off the table individually, so a
+ * function that reached for a sibling key via `this` would find none. An
+ * unknown tag passes through rather than becoming "unknown reason": a newer
+ * engine can invent one, and the tag is still the thing worth reporting.
+ */
+function enDroppedReason(reason: string): string {
+  return DROPPED_REASON[reason] ?? reason;
+}
+
 /** English. The reference table: bundle.ts compares every other locale's shape
  *  against this object, so a key added here is a key every translation is
  *  measured against. */
@@ -218,17 +387,46 @@ export const en: Strings = {
   appName: "PraisonAI",
   newChat: "New chat",
   bootFailed: (detail) => `PraisonAI could not start: ${detail}`,
+  engineNotReady: (detail) =>
+    `The engine is not answering yet (${detail}). You can still type; sending will retry it.`,
+  stopRefused: "The engine did not accept the stop. It may still be running.",
   crashed: "Something went wrong. Your conversations are saved.",
 
   routeChats: "Chats",
   routeChat: "Chat",
   routeSettings: "Settings",
   routeAbout: "About",
+  // The label, then what happened to it -- not "Invalid value", which names
+  // neither the setting nor the outcome. "was not changed" is the fact the
+  // user needs: the old value is still in force.
+  settingRejected: (label) => `${label} was not changed: that value was refused.`,
+  settingRejectedExample: (label, example) => `${label} was not changed. Enter it like ${example}.`,
+  settingInactive: (label, value) => `Set ${label} to ${value} to use this.`,
+  // "Paste" rather than "Enter": on a phone nobody types an API key, and the
+  // instruction that matches what the user is actually about to do is the one
+  // that reads as written for them.
+  secretPlaceholder: "Paste a key to set or replace it",
+  secretStored: (label) => `${label} saved.`,
+  secretCleared: (label) => `${label} removed.`,
+  actionClearSecret: "Remove",
 
   untitled: "Untitled",
   chatUnreadable: (id) => `Could not be read: ${id}`,
+  chatUpdated: (title, when) => `${title}, ${when}`,
+  deleteChat: (title) => `Delete ${title}`,
+  actionConfirmDelete: "Confirm",
+  // Names the chat and says the consequence. "Are you sure?" says neither.
+  deleteChatConfirm: (title) => `Delete ${title}? Tap Confirm to delete it. This cannot be undone.`,
+  chatDeleted: (title) => `${title} was deleted.`,
+  chatDeleteFailed: "That conversation could not be deleted.",
   chatsEmpty: "No conversations yet.",
   emptyTranscript: "Ask something to begin.",
+  emptyAbout: "PraisonAI answers questions, explains things, and works through tasks with you.",
+  emptyNeedsKeyTitle: "Add an API key to start",
+  // "Paste", to match `secretPlaceholder` and because nobody types a key on a
+  // phone. Active, addressed to the reader, and it does not apologise for a
+  // state the app is simply in on its first launch.
+  emptyNeedsKeyBody: "PraisonAI answers using your own OpenAI account. Paste a key in Settings and this chat is ready.",
   chatsAllUnreadable: (count) =>
     countedPhrase(EN, count, String(count), {
       one: "{n} chat could not be read",
@@ -249,19 +447,34 @@ export const en: Strings = {
   durationMinutesSeconds: (minutes, seconds) => `${minutes}m ${seconds}s`,
   durationHoursMinutes: (hours, minutes) => `${hours}h ${minutes}m`,
 
+  speakerUser: "You said:",
+  // Says what happened AND what it means, because "unsaved" alone leaves the
+  // user to guess whether reopening the chat will find it. It will not.
+  userNotStored: "Not saved — this message is not in the stored conversation",
   stopped: "Stopped",
   streaming: "Responding",
   reasoningLabel: "Reasoning",
   draftingTool: (name) => `Preparing ${name}…`,
+  droppedReason: enDroppedReason,
+
   droppedEvents: (count, reasons) => {
     const phrase = countedPhrase(EN, count, String(count), {
       one: "{n} event could not be read",
       other: "{n} events could not be read",
     });
-    // The reasons are machine tags from the decoder, not prose. They are
-    // appended rather than translated: inventing English for "wrong_msg_id"
-    // would make the one string a support engineer needs unsearchable.
-    return reasons.length === 0 ? phrase : `${phrase} (${reasons.join(", ")})`;
+    // Both, deliberately. The sentence is for the reader; the machine tag is
+    // for whoever they report it to. Translating the tag away would make the
+    // one searchable string in the whole message unsearchable -- and a tag on
+    // its own tells the reader nothing at all.
+    //
+    // The explanation comes from the module-level formatter, NOT from a sibling
+    // key on `this` table -- these functions are lifted off the object by
+    // bundle.ts and have no reliable `this`. A locale that wants localised
+    // reason sentences overrides BOTH `droppedReason` and `droppedEvents`; the
+    // English table keeps them in step by routing both through one source.
+    if (reasons.length === 0) return phrase;
+    const explained = reasons.map((r) => `${enDroppedReason(r)} [${r}]`);
+    return `${phrase}: ${explained.join("; ")}`;
   },
 
   toolStatus: (status) => TOOL_STATUS[status],

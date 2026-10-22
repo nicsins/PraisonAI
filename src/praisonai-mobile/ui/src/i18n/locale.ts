@@ -65,6 +65,19 @@ const RTL_SCRIPTS: ReadonlySet<string> = new Set([
 const RTL_LANGUAGES: ReadonlySet<string> = new Set([
   "ar", "arc", "az-arab", "ckb", "dv", "fa", "he", "ks", "ku-arab", "nqo",
   "pnb", "ps", "sd", "syr", "ug", "ur", "yi",
+  // Added after comparing this table against `Intl.Locale.textInfo` across a
+  // corpus: thirteen languages disagreed, all of them RTL by Intl and LTR
+  // here. Because this table is only consulted when `textInfo` is ABSENT, the
+  // gap was invisible on every host that could have revealed it, and rendered
+  // the whole UI the wrong way round on the older WebViews that reach it.
+  //
+  // Five spoken Arabic varieties, which are what a phone's locale actually
+  // reports in those regions rather than plain "ar":
+  "aeb", "acm", "ajp", "apc", "ary", "arz",
+  // Persian-script and Perso-Arabic languages:
+  "bal", "glk", "haz", "lrc", "mzn", "skr",
+  // Rohingya, whose Hanifi script is RTL:
+  "rhg",
 ]);
 
 /** Split a tag on either separator. A stored preference reaches us as "en_US"
@@ -110,22 +123,54 @@ function directionFromIntl(tag: string): Direction | null {
 }
 
 /** The fallback: an explicit script subtag if there is one, else the language. */
-function directionFromTables(tag: string): Direction {
+/**
+ * The table lookup, exported so a test can call it.
+ *
+ * `direction()` is `directionFromIntl(tag) ?? directionFromTables(tag)`, and
+ * the test host is a Node with full ICU where the first half always answers --
+ * so this half never ran under test. A mutation sweep found FIVE
+ * indistinguishable mutations in it: Arabic, Hebrew, Farsi and Urdu rendering
+ * LTR; `az-Arab` and `ku-Arab` rendering LTR; `ar-Latn` and `ks-Deva`
+ * rendering RTL.
+ *
+ * This is the branch that runs on an older Android WebView without
+ * `Intl.Locale.textInfo` -- exactly the devices most likely to be affected --
+ * and the failure is the whole UI mirrored the wrong way, or not at all.
+ */
+/** The script subtag, if this tag has one: four letters at position 1 exactly. */
+function identifier(parts: readonly string[]): string | undefined {
+  const second = parts[1];
+  return second !== undefined && second.length === 4 ? second : undefined;
+}
+
+export function directionFromTables(tag: string): Direction {
   const parts = subtags(tag).map((part) => part.toLowerCase());
   const language = parts[0] ?? "";
 
-  // A script subtag is four letters. Checked before the language table because
+  // A script subtag is four letters and, per BCP 47, sits IMMEDIATELY after
+  // the language and nowhere else. Checked before the language table because
   // "az-Arab" must beat "az".
-  for (const part of parts.slice(1)) {
-    if (part.length !== 4) continue;
-    const script = part.charAt(0).toUpperCase() + part.slice(1);
-    if (RTL_SCRIPTS.has(script)) return "rtl";
-    return "ltr";
+  //
+  // Position matters, and the previous version scanned every subtag for a
+  // four-letter one. `ar-EG-u-nu-latn` -- an Arabic phone reporting a Unicode
+  // numbering-system extension, which is what a real device sends -- then
+  // matched `latn` inside the extension, and the whole UI was laid out left to
+  // right. Invisible on any host with `Intl.Locale.textInfo`, because
+  // `direction()` answers from ICU first and only falls back here where ICU is
+  // ABSENT -- the older WebView this table exists to serve.
+  //
+  // Reading only position 1 is sufficient on its own: an extension begins with
+  // a single-character subtag, which is never four letters, and no subtag
+  // after position 1 can be a script. A separate "stop at the first singleton"
+  // pass was written first and then removed -- it made the two guards mutually
+  // redundant, so neither could be shown to matter by any test.
+  const script = identifier(parts);
+  if (script !== undefined) {
+    const titled = script.charAt(0).toUpperCase() + script.slice(1);
+    return RTL_SCRIPTS.has(titled) ? "rtl" : "ltr";
   }
 
-  if (RTL_LANGUAGES.has(language)) return "rtl";
-  const withScript = parts.length > 1 ? `${language}-${parts[1] ?? ""}` : language;
-  return RTL_LANGUAGES.has(withScript) ? "rtl" : "ltr";
+  return RTL_LANGUAGES.has(language) ? "rtl" : "ltr";
 }
 
 /**

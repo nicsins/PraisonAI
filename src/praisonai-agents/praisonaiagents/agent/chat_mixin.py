@@ -10,9 +10,11 @@ import os
 import re
 import time
 import json
+import threading
 import logging
 from praisonaiagents._logging import get_logger
 from ..errors import BudgetExceededError, ToolExecutionError
+from .tool_execution import _active_turn_cancel
 
 # Shared lazy display helpers (cached, thread-safe; avoid circular imports)
 from ._lazy_display import _get_console, _get_live, _get_display_functions
@@ -20,11 +22,55 @@ from ._lazy_display import _get_console, _get_live, _get_display_functions
 logger = logging.getLogger(__name__)
 
 
+_turns_lock = threading.Lock()
+
+
+def _enter_turn(agent, cancel):
+    """Mark a ``chat``/``achat`` turn in flight and bind its cancel token to this context."""
+    with _turns_lock:
+        agent._turns_in_flight = getattr(agent, "_turns_in_flight", 0) + 1
+    return _active_turn_cancel.set((agent, cancel))
+
+
+def _exit_turn(agent, ctx_token):
+    """Undo ``_enter_turn``: restore the context's cancel token and drop the in-flight count."""
+    if ctx_token is None:
+        return
+    with _turns_lock:
+        agent._turns_in_flight = max(getattr(agent, "_turns_in_flight", 1) - 1, 0)
+    try:
+        _active_turn_cancel.reset(ctx_token)
+    except (ValueError, LookupError):
+        _active_turn_cancel.set(None)
+
+
+def _reset_loop_guard_for_turn(agent):
+    """Reset per-turn loop-guard limits unless another turn on this agent is still
+    running (the guard is shared; resetting it would restart that turn's limits).
+    Never force-creates the guard."""
+    guard = getattr(agent, "_loop_guard", None)
+    if guard is not None and getattr(agent, "_turns_in_flight", 0) <= 1:
+        guard.reset_turn()
+
+
 
 from typing import List, Optional, Any, Dict, Union, Generator, TYPE_CHECKING
 
 if TYPE_CHECKING:
     pass
+
+
+def _sleep_unless_cancelled(seconds: float, cancel_token: Any = None, step: float = 0.2) -> None:
+    """Sleep for ``seconds``, raising ``InterruptedError`` as soon as ``cancel_token`` is set."""
+    deadline = time.monotonic() + seconds
+    while True:
+        if cancel_token is not None and getattr(cancel_token, "is_set", lambda: False)():
+            reason = getattr(cancel_token, "reason", None) or "cancelled during retry backoff"
+            raise InterruptedError(f"Agent chat cancelled: {reason}")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(step, remaining))
 
 
 class _TurnCancelToken:
@@ -95,6 +141,51 @@ class ChatMixin:
             return _TurnCancelToken(source)
         return _TurnCancelToken(source, turn_id=begin_turn())
 
+    @staticmethod
+    def _notify_tool_call(tool_name, tool_input, tool_result, elapsed_time=None, success=True):
+        """Fire the ``tool_call`` display callback for one tool execution.
+
+        The non-streaming path fires this from the OpenAI client after every
+        tool (``display_tool_call`` -> ``execute_sync_callback('tool_call')``),
+        which is how streaming UIs such as the desktop learn that a tool ran.
+        The streaming path executes tools inline here, so it has to fire the
+        same callback itself with the same kwargs (Issue #4716).
+
+        Best-effort by design: a callback failure is logged and swallowed so
+        it can never break the stream it is reporting on.
+
+        A durable run converts a raising tool into an ``{"error": ...}`` result
+        instead of re-raising (see ``DurableRunContext.wrap_sync``), so the
+        raising-tool ``except`` branch never fires for it. Detect that shape
+        here and report ``success=False`` so streaming UIs do not label a failed
+        tool as successful (Issue #4735 review).
+        """
+        if (
+            success
+            and isinstance(tool_result, dict)
+            and tool_result.get("error") is not None
+        ):
+            success = False
+        try:
+            if tool_result is None:
+                result_str = None
+            else:
+                try:
+                    result_str = json.dumps(tool_result)
+                except (TypeError, ValueError):
+                    result_str = str(tool_result)
+            _get_display_functions()['execute_sync_callback'](
+                'tool_call',
+                message=f"Calling function: {tool_name}",
+                tool_name=tool_name,
+                tool_input=tool_input,
+                tool_output=result_str[:200] if result_str else None,
+                elapsed_time=elapsed_time,
+                success=success,
+            )
+        except Exception as callback_error:
+            logging.debug(f"tool_call callback failed for '{tool_name}': {callback_error}")
+
     def _durable_sync_tool_executor(self, execute_tool_fn):
         """Wrap tool execution only while an opt-in durable run is active."""
         context = self._get_durable_run_context()
@@ -127,6 +218,51 @@ class ChatMixin:
             scope["session_id"] = session_id
             scope["metadata_filter"] = {"session_id": session_id}
         return scope
+
+    @staticmethod
+    def _memory_prefetch_search_queries(query: str) -> List[str]:
+        """Build LIKE-friendly search terms from a natural-language user turn.
+
+        SQLite and other substring backends match the full query string. A recall
+        question such as "What is my project codename?" does not LIKE-match a
+        stored turn that only mentions "ORANGE-PANDA", so we fall back to
+        significant tokens when the verbatim query returns nothing (#5667).
+        """
+        q = (query or "").strip()
+        if not q:
+            return []
+
+        seen: set[str] = set()
+        ordered: List[str] = []
+
+        def _add(term: str) -> None:
+            term = term.strip()
+            if not term:
+                return
+            key = term.casefold()
+            if key not in seen:
+                seen.add(key)
+                ordered.append(term)
+
+        _add(q)
+        stop = frozenset(
+            {
+                "what", "is", "my", "the", "a", "an", "your", "please", "tell",
+                "me", "how", "do", "does", "can", "you", "with", "for", "this",
+                "that", "are", "was", "were", "should", "would", "could", "have",
+                "has", "had", "will", "about", "from", "when", "where", "who",
+                "why", "which", "reply", "only", "exactly", "once", "say",
+            }
+        )
+        words = re.findall(r"[A-Za-z][A-Za-z0-9_-]*", q)
+        significant = [w for w in words if w.casefold() not in stop and len(w) >= 3]
+        if significant:
+            _add(" ".join(significant))
+        for word in significant:
+            if len(word) >= 5 or "-" in word or word[:1].isupper():
+                _add(word)
+        # Cap search calls so a long pasted prompt cannot trigger many scans.
+        return ordered[:5]
 
     @staticmethod
     def _memory_prefetch_query(prompt: Any) -> str:
@@ -225,12 +361,17 @@ class ChatMixin:
             if not limit or not budget:
                 return ""
             scope = self._memory_prefetch_scope()
-            if hasattr(memory, "search_long_term"):
-                results = memory.search_long_term(query, limit=limit, **scope)
-            elif hasattr(memory, "search"):
-                results = memory.search(query, limit=limit, **scope)
-            else:
-                return ""
+            results: List[Any] = []
+            for term in self._memory_prefetch_search_queries(query):
+                if hasattr(memory, "search_long_term"):
+                    batch = memory.search_long_term(term, limit=limit, **scope)
+                elif hasattr(memory, "search"):
+                    batch = memory.search(term, limit=limit, **scope)
+                else:
+                    return ""
+                if batch:
+                    results = list(batch)
+                    break
             return self._format_memory_prefetch(results, limit, budget)
         except Exception as exc:
             logging.debug("Memory prefetch failed; continuing without recalled context: %s", exc)
@@ -253,9 +394,14 @@ class ChatMixin:
             budget = max(0, int(getattr(config, "prefetch_token_budget", 512)))
             if not limit or not budget:
                 return ""
-            results = await self.asearch_memory(
-                query, memory_type="long_term", limit=limit
-            )
+            results: List[Any] = []
+            for term in self._memory_prefetch_search_queries(query):
+                batch = await self.asearch_memory(
+                    term, memory_type="long_term", limit=limit
+                )
+                if batch:
+                    results = list(batch)
+                    break
             return self._format_memory_prefetch(results, limit, budget)
         except Exception as exc:
             logging.debug("Async memory prefetch failed; continuing without recalled context: %s", exc)
@@ -347,11 +493,8 @@ class ChatMixin:
             
             cached_prompt = self._cache_get(self._system_prompt_cache, cache_key)
             if cached_prompt is not None:
-                # Path-scoped glob rules are per-turn (they depend on the files
-                # touched so far) so they are appended after the cache, never
-                # baked into the cached base prompt.
-                return self._append_system_prompt_suffix(
-                    self._append_glob_rules_context(cached_prompt)
+                return self._append_system_prompt_turn_context(
+                    cached_prompt, tools=tools,
                 )
         else:
             cache_key = None  # Don't cache when memory is enabled
@@ -434,6 +577,11 @@ Your Goal: {self.goal}"""
         # Session context is per-turn and should not be cached
         if cache_key:
             self._cache_put(self._system_prompt_cache, cache_key, system_prompt)
+
+        return self._append_system_prompt_turn_context(system_prompt, tools=tools)
+
+    def _append_system_prompt_turn_context(self, system_prompt, tools=None):
+        """Append current-turn context to either a fresh or cached base prompt."""
         
         # Add session context (platform awareness) if available - AFTER caching
         try:
@@ -706,6 +854,93 @@ Your Goal: {self.goal}"""
         
         return None
 
+    def _raise_if_stream_replay_unsafe(self, error: BaseException, tools) -> None:
+        """Re-raise ``error`` if falling back to non-streaming could re-run a tool."""
+        if not (tools or getattr(self, "tools", None)):
+            return
+        from ..llm.error_classifier import is_replay_unsafe_chain
+        if is_replay_unsafe_chain(error):
+            raise error
+
+    def _structured_output_from_message(self, message, schema_model, response_text: str, original_text=None):
+        """Resolve a Pydantic ``output_pydantic`` from an LLM message or JSON text.
+
+        When ``original_text`` is given, ``message.parsed`` is only trusted if the
+        guardrail left the response unchanged; otherwise the guardrail-approved
+        text wins.
+        """
+        if schema_model is None:
+            return response_text
+        parsed = getattr(message, "parsed", None) if message is not None else None
+        if parsed is not None and (original_text is None or response_text == original_text):
+            if isinstance(parsed, schema_model):
+                return parsed
+            if hasattr(schema_model, "model_validate"):
+                try:
+                    return schema_model.model_validate(parsed)
+                except Exception:
+                    pass
+        return self._coerce_structured_output(response_text, schema_model)
+
+    def _coerce_structured_output(self, response_text, schema_model):
+        """Parse a string response into the requested Pydantic model.
+
+        When ``output_pydantic``/``output_json`` is a Pydantic model, callers
+        expect a validated instance rather than a raw string. This tolerates
+        markdown code fences around the JSON payload.
+
+        Returns the parsed model instance on success, or the original
+        ``response_text`` unchanged if parsing is not possible (preserves
+        backward compatibility for non-Pydantic schemas or malformed output).
+        """
+        if not schema_model or not isinstance(response_text, str):
+            return response_text
+        if not hasattr(schema_model, "model_validate_json"):
+            return response_text
+
+        candidate = response_text.strip()
+
+        def _try_validate(payload: str):
+            try:
+                return schema_model.model_validate_json(payload)
+            except Exception:
+                pass
+            if hasattr(schema_model, "model_validate"):
+                try:
+                    return schema_model.model_validate(json.loads(payload))
+                except Exception:
+                    pass
+            return None
+
+        validated = _try_validate(candidate)
+        if validated is not None:
+            return validated
+
+        # Strip a surrounding markdown code fence (```json ... ```) if present
+        fenced = re.search(r"```(?:json)?\s*(.*?)\s*```", candidate, re.DOTALL)
+        if fenced:
+            validated = _try_validate(fenced.group(1).strip())
+            if validated is not None:
+                return validated
+
+        # Last resort: first complete JSON object embedded in prose
+        start = candidate.find("{")
+        if start != -1:
+            try:
+                obj, _ = json.JSONDecoder().raw_decode(candidate, start)
+                validated = _try_validate(json.dumps(obj))
+                if validated is not None:
+                    return validated
+            except ValueError:
+                pass
+
+        logging.warning(
+            f"Agent {self.name}: output_pydantic={getattr(schema_model, '__name__', schema_model)} "
+            f"was requested but the response could not be parsed into the model; "
+            f"returning raw string."
+        )
+        return response_text
+
     def _supports_native_structured_output(self):
         """Check if current model supports native structured output via response_format.
         
@@ -733,6 +968,35 @@ Your Goal: {self.goal}"""
             )
             return False
 
+    def _load_session_history(self):
+        """Persisted session history for this agent, or [] when unavailable.
+
+        Extracted so BOTH branches of _build_messages can use it. The injection
+        used to live only in the manual-message branch, so an agent configured
+        with memory="history" silently dropped its persisted history whenever
+        _openai_client was set -- which is the default path for OpenAI models.
+        """
+        if not self._history_enabled or self._session_store is None:
+            return []
+        try:
+            # Prefer compacted working history (summary + tail) on resume when a
+            # compaction checkpoint exists (Issue #2741); falls back to raw chat
+            # history for backward compatibility.
+            if hasattr(self._session_store, "get_working_history"):
+                session_history = self._session_store.get_working_history(
+                    self._history_session_id,
+                    max_messages=self._history_limit
+                )
+            else:
+                session_history = self._session_store.get_chat_history(
+                    self._history_session_id,
+                    max_messages=self._history_limit
+                )
+            return list(session_history) if session_history else []
+        except Exception as e:
+            logging.debug(f"Failed to load session history: {e}")
+            return []
+
     def _build_messages(self, prompt, temperature=1.0, output_json=None, output_pydantic=None, tools=None, use_native_format=False, restore_durable=True, memory_prefetch_context: str = ""):
         """Build messages list for chat completion.
         
@@ -758,7 +1022,7 @@ Your Goal: {self.goal}"""
                     tools=tools,
                     memory_prefetch_context=memory_prefetch_context,
                 ),
-                chat_history=self.chat_history,
+                chat_history=self._load_session_history() + list(self.chat_history or []),
                 output_json=None if use_native_format else output_json,
                 output_pydantic=None if use_native_format else output_pydantic
             )
@@ -772,25 +1036,7 @@ Your Goal: {self.goal}"""
                 messages.append({"role": "system", "content": system_prompt})
             
             # Inject session history if enabled (from persistent storage)
-            if self._history_enabled and self._session_store is not None:
-                try:
-                    # Prefer compacted working history (summary + tail) on
-                    # resume when a compaction checkpoint exists (Issue #2741);
-                    # falls back to raw chat history for backward compatibility.
-                    if hasattr(self._session_store, "get_working_history"):
-                        session_history = self._session_store.get_working_history(
-                            self._history_session_id,
-                            max_messages=self._history_limit
-                        )
-                    else:
-                        session_history = self._session_store.get_chat_history(
-                            self._history_session_id,
-                            max_messages=self._history_limit
-                        )
-                    if session_history:
-                        messages.extend(session_history)
-                except Exception as e:
-                    logging.debug(f"Failed to load session history: {e}")
+            messages.extend(self._load_session_history())
             
             # Add in-memory chat history (current conversation)
             if self.chat_history:
@@ -849,6 +1095,12 @@ Your Goal: {self.goal}"""
         elif isinstance(tools, list) and len(tools) == 0:
             # Explicit empty list - return immediately to enforce boundary
             return []
+
+        # Plugin tools are copied into the Agent's local tool list at
+        # construction time. Re-check ownership before advertising them so a
+        # later plugin disable/unregister revokes the advertised capability.
+        if getattr(self, "_plugin_tool_owners", None) and isinstance(tools, (list, tuple)):
+            tools = [tool for tool in tools if self._is_plugin_tool_active(tool)]
         
         if not tools:
             return []
@@ -864,9 +1116,18 @@ Your Goal: {self.goal}"""
             return cached_tools
             
         formatted_tools = []
+        # Provider-hosted tool specs have no local callable; the provider
+        # executes them after this formatter forwards the allowlisted dict.
+        try:
+            from ..tools.hosted import is_hosted_tool
+        except ImportError:
+            is_hosted_tool = lambda _tool: False
+
         for tool in tools:
+            if isinstance(tool, dict) and is_hosted_tool(tool):
+                formatted_tools.append(tool)
             # Handle pre-formatted OpenAI tools
-            if isinstance(tool, dict) and tool.get('type') == 'function':
+            elif isinstance(tool, dict) and tool.get('type') == 'function':
                 # Validate nested dictionary structure before accessing
                 if 'function' in tool and isinstance(tool['function'], dict) and 'name' in tool['function']:
                     formatted_tools.append(tool)
@@ -875,7 +1136,9 @@ Your Goal: {self.goal}"""
             # Handle lists of tools
             elif isinstance(tool, list):
                 for subtool in tool:
-                    if isinstance(subtool, dict) and subtool.get('type') == 'function':
+                    if isinstance(subtool, dict) and is_hosted_tool(subtool):
+                        formatted_tools.append(subtool)
+                    elif isinstance(subtool, dict) and subtool.get('type') == 'function':
                         # Validate nested dictionary structure before accessing
                         if 'function' in subtool and isinstance(subtool['function'], dict) and 'name' in subtool['function']:
                             formatted_tools.append(subtool)
@@ -1158,56 +1421,37 @@ Your Goal: {self.goal}"""
         This is a DRY helper used by chat/achat/run/arun/start/astart.
         Attachments are ephemeral - only text is stored in history.
         
+        Routing lives in ``praisonaiagents.agent.attachments``. The contract is
+        that an attachment is **never dropped silently**: a bad path raises
+        :class:`~praisonaiagents.agent.attachments.AttachmentError`, and a file
+        the target model cannot ingest is logged as a warning *and* replaced
+        with a visible marker part (or a locally extracted text form) so both
+        the caller and the model know what happened.
+        
         Args:
             prompt: Text query (ALWAYS stored in chat_history)
-            attachments: Image/file paths for THIS turn only (NEVER stored)
+            attachments: Image/document/audio paths, URLs, or content-part
+                dicts for THIS turn only (NEVER stored)
             
         Returns:
             Either a string (no attachments) or multimodal message list
+        
+        Raises:
+            AttachmentError: for a path that does not exist or cannot be read,
+                or an attachment that is not a path/URL/content-part dict.
         """
         if not attachments:
             return prompt
-        
+
+        from .attachments import build_attachment_parts, resolve_attachment_model_name
+
+        model_name = resolve_attachment_model_name(self)
+
         # Build multimodal content list
         content = [{"type": "text", "text": prompt}]
-        
         for attachment in attachments:
-            # Handle image files
-            if isinstance(attachment, str):
-                import os
-                import base64
-                
-                if os.path.isfile(attachment):
-                    # File path - read and encode
-                    ext = os.path.splitext(attachment)[1].lower()
-                    if ext in ('.jpg', '.jpeg', '.png', '.gif', '.webp'):
-                        try:
-                            with open(attachment, 'rb') as f:
-                                data = base64.b64encode(f.read()).decode('utf-8')
-                            media_type = {
-                                '.jpg': 'image/jpeg',
-                                '.jpeg': 'image/jpeg',
-                                '.png': 'image/png',
-                                '.gif': 'image/gif',
-                                '.webp': 'image/webp',
-                            }.get(ext, 'image/jpeg')
-                            content.append({
-                                "type": "image_url",
-                                "image_url": {"url": f"data:{media_type};base64,{data}"}
-                            })
-                            logging.debug(f"Successfully encoded image attachment: {attachment} ({len(data)} bytes base64)")
-                        except Exception as e:
-                            logging.warning(f"Failed to load attachment {attachment}: {e}")
-                elif attachment.startswith(('http://', 'https://', 'data:')):
-                    # URL or data URI
-                    content.append({
-                        "type": "image_url",
-                        "image_url": {"url": attachment}
-                    })
-            elif isinstance(attachment, dict):
-                # Already structured content
-                content.append(attachment)
-        
+            content.extend(build_attachment_parts(attachment, model_name))
+
         return content
 
     def _extract_llm_response_content(self, response) -> Optional[str]:
@@ -1244,6 +1488,13 @@ Your Goal: {self.goal}"""
                             f"Agent {self.name}: model returned no content "
                             f"(finish_reason={finish_reason!r}, refused={bool(refusal)})"
                         )
+                        # Record a distinct terminal reason so the empty answer is
+                        # actionable end-to-end (RunOutcome / CLI exit / --output
+                        # json) instead of a silent "completed" with empty text.
+                        from .run_outcome import classify_finish_reason
+                        stop_reason = classify_finish_reason(finish_reason, refusal)
+                        if stop_reason is not None:
+                            self._last_stop_reason = stop_reason
                     return ""
         except (AttributeError, IndexError, TypeError) as e:
             logging.warning(
@@ -1370,15 +1621,8 @@ Your Goal: {self.goal}"""
         from ..hooks import HookEvent as _HookEvent
         import logging
         
-        # Map policy strategy to compactor strategy
-        strategy_map = {
-            "truncate": LegacyStrategy.TRUNCATE,
-            "summarise": LegacyStrategy.SUMMARIZE,
-            "drop_oldest_tools": LegacyStrategy.PRUNE,
-            "sliding_window": LegacyStrategy.SLIDING,
-        }
-        
-        compactor.strategy = strategy_map.get(policy.strategy.value, LegacyStrategy.PRUNE)
+        # Map policy strategy to compactor strategy (single source of truth)
+        compactor.strategy = LegacyStrategy.from_policy_value(policy.strategy.value)
         
         # Execute hooks
         try:
@@ -1563,15 +1807,8 @@ Your Goal: {self.goal}"""
         from ..hooks import HookEvent as _HookEvent
         import logging
         
-        # Map policy strategy to compactor strategy
-        strategy_map = {
-            "truncate": LegacyStrategy.TRUNCATE,
-            "summarise": LegacyStrategy.SUMMARIZE,
-            "drop_oldest_tools": LegacyStrategy.PRUNE,
-            "sliding_window": LegacyStrategy.SLIDING,
-        }
-        
-        compactor.strategy = strategy_map.get(policy.strategy.value, LegacyStrategy.PRUNE)
+        # Map policy strategy to compactor strategy (single source of truth)
+        compactor.strategy = LegacyStrategy.from_policy_value(policy.strategy.value)
         
         # Execute hooks
         try:
@@ -1630,6 +1867,47 @@ Your Goal: {self.goal}"""
         if fallback_index >= len(self.fallback_models):
             return None
         return self.fallback_models[fallback_index]
+
+    def _build_fallback_dispatcher(self, model):
+        """Build a throwaway dispatcher bound to a fallback ``model``.
+
+        The async fallback path passes the result to
+        ``_execute_unified_achat_completion(..., _dispatcher=...)`` for a single
+        retry so it NEVER mutates the shared ``self.llm`` /
+        ``self._unified_dispatcher``. Concurrent async turns on the same Agent
+        therefore keep dispatching on the original model with correct cost /
+        observability attribution — closing the ordinary-turn fallback race.
+        Returns ``None`` for custom-LLM agents (the custom client owns its own
+        model), which keeps that path on the shared dispatcher as before.
+        """
+        from ..llm import create_llm_dispatcher
+        if self._using_custom_llm and hasattr(self, 'llm_instance'):
+            return None
+        if not hasattr(self, '_openai_client') or self._openai_client is None:
+            from ..llm import get_openai_client
+            self._openai_client = get_openai_client(api_key=getattr(self, 'api_key', None))
+        return create_llm_dispatcher(openai_client=self._openai_client, model=model)
+
+    def _get_model_fallback_lock(self):
+        """Lazily create the per-instance lock guarding model-fallback swaps.
+
+        Async fallback now runs against a per-call throwaway dispatcher
+        (``_build_fallback_dispatcher``), so it does not mutate shared state and
+        ordinary async turns can never observe the fallback model. The sync
+        fallback path still recurses through the full ``_chat_completion``
+        wrapper (which reads ``self.llm`` for BEFORE_LLM hook attribution and
+        budget), so it temporarily overrides ``self.llm`` /
+        ``self._unified_dispatcher`` for a single retry. This dual (sync/async)
+        lock serialises that mutate/restore window; normal, non-fallback turns
+        never acquire it and stay fully concurrent. Created on demand so no
+        extra state is added for agents without ``fallback_models``.
+        """
+        lock = getattr(self, '_model_fallback_lock', None)
+        if lock is None:
+            from .async_safety import DualLock
+            lock = DualLock()
+            self._model_fallback_lock = lock
+        return lock
 
     def _emit_model_fallback(self, from_model, to_model, reason_category, fallback_index,
                              stream_callback=None):
@@ -1729,6 +2007,35 @@ Your Goal: {self.goal}"""
         except Exception:
             logging.debug("MODEL_FALLBACK stream event failed", exc_info=True)
 
+    def _shrink_after_context_overflow(self, messages, model_name):
+        """Shrink ``messages`` after the provider rejected them as too long.
+
+        Uses the configured ContextManager when present; otherwise falls back
+        to ``ContextCompactor.shrink_to_fit`` so agents without ``context=``
+        still recover. Each call targets at most half the current estimate, so
+        bounded retries shrink progressively even when the estimate was wrong.
+        """
+        from ..context.budgeter import get_model_limit
+        from ..compaction import ContextCompactor
+        compactor = ContextCompactor()
+        target = min(
+            int(get_model_limit(model_name) * 0.7),  # 70% of limit for safety
+            compactor.count_total_tokens(messages) // 2,
+        )
+        if self.context_manager:
+            return self.context_manager.emergency_truncate(messages, target)
+        return compactor.shrink_to_fit(messages, target)
+
+    def _can_restart_after_overflow(self, tools) -> bool:
+        """Whether an overflow may restart the whole turn with shrunk messages.
+
+        The restart replays the turn from its outer messages, so without a
+        ContextManager it is limited to tool-free turns: a tool turn would
+        rerun already-completed tool calls. LiteLLM tool turns recover inside
+        the request loop instead (``LLM._shrink_on_context_overflow``).
+        """
+        return bool(self.context_manager) or not (tools or self.tools)
+
     def _max_retry_depth(self) -> int:
         """Maximum LLM retry depth honoured by the recovery loop.
 
@@ -1746,6 +2053,12 @@ Your Goal: {self.goal}"""
 
     def _chat_completion(self, messages, temperature=None, tools=None, stream=None, reasoning_steps=False, task_name=None, task_description=None, task_id=None, response_format=None, _retry_depth=0, _fallback_index=0, cancel_token=None):
         start_time = time.time()
+
+        # Reset the agent-level finish-reason classification at the start of each
+        # OpenAI-native turn so a provider block/refusal recorded on a previous
+        # run (see ``_extract_llm_response_content``) never leaks into this one.
+        # The LiteLLM path resets its own backend flag independently.
+        self._last_stop_reason = "completed"
 
         # --- Proactive Context Budget Management (default-on) ---
         # Analyzes token budget BEFORE LLM call and applies appropriate strategy
@@ -1843,8 +2156,10 @@ Your Goal: {self.goal}"""
 
         # Smart fallback for streaming: try streaming first, fall back to non-streaming if unsupported
         streaming_response = None
-        if stream is None:
-            # Auto-detect: prefer streaming for better UX, fallback if adapter doesn't support it
+        if stream is None or stream is True:
+            # Auto-detect (stream=None) and explicit stream=True both attempt streaming
+            # first; sync adapters raise "Streaming is not supported", which must not
+            # surface as chat(stream=True) -> None (#5737).
             try:
                 # First attempt: try with streaming enabled for better user experience
                 stream_callback = self.stream_emitter.emit if hasattr(self, 'stream_emitter') else None
@@ -1879,6 +2194,8 @@ Your Goal: {self.goal}"""
                 # Don't retry if it's an LLMError that has exhausted retries
                 if isinstance(e, LLMError):
                     raise  # Re-raise LLMErrors immediately to avoid double retry
+                # Never replay a tool turn after a post-dispatch failure (#3860)
+                self._raise_if_stream_replay_unsafe(e, formatted_tools)
                 # For any other exception, fall back to non-streaming
                 logging.debug(f"{self.name}: Streaming attempt failed, falling back to non-streaming")
                 stream = False  # Set for the main execution below
@@ -1892,20 +2209,44 @@ Your Goal: {self.goal}"""
             if streaming_response is not None:
                 final_response = streaming_response
             else:
-                final_response = self._chat_completion_with_retry(
-                    cancel_token=cancel_token,
-                    messages=messages,
-                    temperature=temperature,
-                    tools=formatted_tools,
-                    stream=stream,
-                    reasoning_steps=reasoning_steps,
-                    task_name=task_name,
-                    task_description=task_description,
-                    task_id=task_id,
-                    response_format=response_format,
-                    stream_callback=stream_callback,
-                    emit_events=True,
-                )
+                try:
+                    final_response = self._chat_completion_with_retry(
+                        cancel_token=cancel_token,
+                        messages=messages,
+                        temperature=temperature,
+                        tools=formatted_tools,
+                        stream=stream,
+                        reasoning_steps=reasoning_steps,
+                        task_name=task_name,
+                        task_description=task_description,
+                        task_id=task_id,
+                        response_format=response_format,
+                        stream_callback=stream_callback,
+                        emit_events=True,
+                    )
+                except ValueError as e:
+                    # Explicit stream=True against a sync adapter that cannot
+                    # stream must not bubble up as None (see issue #5737). Fall
+                    # back to non-streaming so chat() still returns text, the
+                    # same way the stream=None auto-detect path above does.
+                    if stream and "Streaming is not supported" in str(e):
+                        logging.debug(f"{self.name}: Streaming not supported by adapter, falling back to non-streaming")
+                        final_response = self._chat_completion_with_retry(
+                            cancel_token=cancel_token,
+                            messages=messages,
+                            temperature=temperature,
+                            tools=formatted_tools,
+                            stream=False,
+                            reasoning_steps=reasoning_steps,
+                            task_name=task_name,
+                            task_description=task_description,
+                            task_id=task_id,
+                            response_format=response_format,
+                            stream_callback=stream_callback,
+                            emit_events=True,
+                        )
+                    else:
+                        raise
 
             # Emit LLM response trace event with token usage
             _duration_ms = (time.time() - start_time) * 1000
@@ -1995,7 +2336,6 @@ Your Goal: {self.goal}"""
             
             # Use structured error classification for all error types (replaces legacy heuristic checks)
             from ..llm.error_classifier import classify_llm_error
-            from ..llm.retry_utils import jittered_backoff
             
             model_name = self.llm if isinstance(self.llm, str) else "unknown"
             session_id = getattr(self, '_session_id', 'unknown')
@@ -2028,14 +2368,9 @@ Your Goal: {self.goal}"""
             )
             
             # Execute recovery actions based on classification
-            if classification.should_compress_context and self.context_manager:
+            if classification.should_compress_context and self._can_restart_after_overflow(tools):
                 try:
-                    from ..context.budgeter import get_model_limit
-                    model_limit = get_model_limit(model_name)
-                    target = int(model_limit * 0.7)  # Target 70% of limit for safety
-                    
-                    # Apply emergency truncation
-                    truncated_messages = self.context_manager.emergency_truncate(messages, target)
+                    truncated_messages = self._shrink_after_context_overflow(messages, model_name)
                     
                     logging.info(f"[{self.name}] {classification.user_message}")
                     
@@ -2080,24 +2415,31 @@ Your Goal: {self.goal}"""
 
                     # Apply backoff if suggested
                     if classification.backoff_seconds and classification.backoff_seconds > 0:
-                        time.sleep(classification.backoff_seconds)
-                    
-                    # Temporarily override the model and clear dispatcher cache for this call
-                    original_llm = self.llm
-                    original_dispatcher = getattr(self, '_unified_dispatcher', None)
-                    try:
-                        self.llm = next_model
-                        self._unified_dispatcher = None  # Force recreation with new model
-                        return self._chat_completion(
-                            messages, temperature, tools, stream,
-                            reasoning_steps, task_name, task_description, task_id, response_format,
-                            _retry_depth=_retry_depth + 1,
-                            _fallback_index=_fallback_index + 1,
-                            cancel_token=cancel_token
+                        _sleep_unless_cancelled(
+                            classification.backoff_seconds,
+                            cancel_token if cancel_token is not None else getattr(self, "interrupt_controller", None),
                         )
-                    finally:
-                        self.llm = original_llm
-                        self._unified_dispatcher = original_dispatcher  # Restore original dispatcher
+                    
+                    # Temporarily override the model and clear dispatcher cache
+                    # for this call. Serialise the mutate/restore window so a
+                    # concurrent turn on a shared Agent can't observe the wrong
+                    # model; only fallback turns contend on this lock.
+                    with self._get_model_fallback_lock().sync():
+                        original_llm = self.llm
+                        original_dispatcher = getattr(self, '_unified_dispatcher', None)
+                        try:
+                            self.llm = next_model
+                            self._unified_dispatcher = None  # Force recreation with new model
+                            return self._chat_completion(
+                                messages, temperature, tools, stream,
+                                reasoning_steps, task_name, task_description, task_id, response_format,
+                                _retry_depth=_retry_depth + 1,
+                                _fallback_index=_fallback_index + 1,
+                                cancel_token=cancel_token
+                            )
+                        finally:
+                            self.llm = original_llm
+                            self._unified_dispatcher = original_dispatcher  # Restore original dispatcher
                 else:
                     logging.warning(f"[{self.name}] {classification.user_message} (no more fallback models available)")
                     # Continue to error handling without retry
@@ -2105,7 +2447,10 @@ Your Goal: {self.goal}"""
             elif classification.is_retryable and classification.backoff_seconds > 0:
                 if _retry_depth < self._max_retry_depth():  # Bounded by configured RetryBackoffConfig.max_retries
                     logging.info(f"[{self.name}] {classification.user_message} (waiting {classification.backoff_seconds:.1f}s)")
-                    time.sleep(classification.backoff_seconds)
+                    _sleep_unless_cancelled(
+                        classification.backoff_seconds,
+                        cancel_token if cancel_token is not None else getattr(self, "interrupt_controller", None),
+                    )
                     return self._chat_completion(
                         messages, temperature, tools, stream, 
                         reasoning_steps, task_name, task_description, task_id, response_format, 
@@ -2202,14 +2547,9 @@ Your Goal: {self.goal}"""
         )
         
         # Execute recovery actions based on classification (async-compatible)
-        if classification.should_compress_context and self.context_manager:
+        if classification.should_compress_context and self._can_restart_after_overflow(tools):
             try:
-                from ..context.budgeter import get_model_limit
-                model_limit = get_model_limit(model_name)
-                target = int(model_limit * 0.7)  # Target 70% of limit for safety
-                
-                # Apply emergency truncation
-                truncated_messages = self.context_manager.emergency_truncate(messages, target)
+                truncated_messages = self._shrink_after_context_overflow(messages, model_name)
                 
                 logging.info(f"[{self.name}] {classification.user_message}")
                 
@@ -2260,16 +2600,21 @@ Your Goal: {self.goal}"""
                 if classification.backoff_seconds and classification.backoff_seconds > 0:
                     await asyncio.sleep(classification.backoff_seconds)
                 
-                # Temporarily override the model and clear dispatcher cache for this call
-                original_llm = self.llm
-                original_dispatcher = getattr(self, '_unified_dispatcher', None)
+                # Run this single retry against a throwaway dispatcher bound to
+                # the fallback model, passed per-call. This never mutates the
+                # shared self.llm / self._unified_dispatcher, so a concurrent
+                # async turn on this shared Agent keeps dispatching on the
+                # original model (correct cost / observability attribution) even
+                # while this turn is suspended on the await — no lock needed on
+                # the async path. Custom-LLM agents get None here and fall back
+                # to the shared dispatcher, matching prior behaviour.
+                _fallback_dispatcher = self._build_fallback_dispatcher(next_model)
                 try:
-                    self.llm = next_model
-                    self._unified_dispatcher = None  # Force recreation with new model
                     return await self._execute_unified_achat_completion(
                         messages, temperature, tools, stream,
                         reasoning_steps, task_name, task_description, task_id, response_format,
-                        stream_callback, emit_events
+                        stream_callback, emit_events,
+                        _dispatcher=_fallback_dispatcher,
                     )
                 except Exception as retry_error:
                     return await self._handle_async_llm_error(
@@ -2277,9 +2622,6 @@ Your Goal: {self.goal}"""
                         reasoning_steps, task_name, task_description, task_id, response_format,
                         stream_callback, emit_events, _retry_depth + 1, _fallback_index + 1
                     )
-                finally:
-                    self.llm = original_llm
-                    self._unified_dispatcher = original_dispatcher  # Restore original dispatcher
             else:
                 logging.warning(f"[{self.name}] {classification.user_message} (no more fallback models available)")
                 # Continue to error handling without retry
@@ -2376,8 +2718,9 @@ Your Goal: {self.goal}"""
             self._unified_dispatcher = dispatcher
         
         # Smart fallback for streaming: try streaming first, fall back to non-streaming if unsupported
-        if stream is None:
-            # Auto-detect: prefer streaming for better UX, fallback if adapter doesn't support it
+        if stream is None or stream is True:
+            # Auto-detect (stream=None) and explicit stream=True both attempt streaming
+            # first; sync adapters raise "Streaming is not supported", which must fall back.
             try:
                 # First attempt: try with streaming enabled for better user experience
                 if stream_callback is None and hasattr(self, 'stream_emitter'):
@@ -2400,6 +2743,7 @@ Your Goal: {self.goal}"""
                     emit_events=emit_events,
                     verbose=self.verbose,
                     max_iterations=self._resolve_max_steps(),
+                    output_continuation=getattr(getattr(self, "execution", None), "output_continuation", True),
                     reasoning_steps=reasoning_steps,
                     task_name=task_name,
                     task_description=task_description,
@@ -2418,7 +2762,9 @@ Your Goal: {self.goal}"""
                     stream = False  # Set for the main execution below
                 else:
                     raise  # Re-raise if it's a different ValueError
-            except Exception:
+            except Exception as e:
+                # Never replay a tool turn after a post-dispatch failure (#3860)
+                self._raise_if_stream_replay_unsafe(e, tools)
                 # For any other exception, fall back to non-streaming
                 logging.debug(f"Agent: Streaming attempt failed, falling back to non-streaming")
                 stream = False  # Set for the main execution below
@@ -2446,6 +2792,7 @@ Your Goal: {self.goal}"""
                 emit_events=emit_events,
                 verbose=self.verbose,
                 max_iterations=self._resolve_max_steps(),
+                output_continuation=getattr(getattr(self, "execution", None), "output_continuation", True),
                 reasoning_steps=reasoning_steps,
                 task_name=task_name,
                 task_description=task_description,
@@ -2487,29 +2834,43 @@ Your Goal: {self.goal}"""
         response_format=None,
         stream_callback=None,
         emit_events=True,
+        _dispatcher=None,
     ):
         """
         Execute unified async chat completion using composition instead of runtime class mutation.
         
         This method provides a unified async dispatch for all LLM providers using
         composition for safety and maintainability.
+
+        ``_dispatcher`` lets the model-fallback path run a single retry against a
+        caller-supplied throwaway dispatcher WITHOUT mutating the shared
+        ``self.llm`` / ``self._unified_dispatcher``, so concurrent async turns on
+        the same Agent never observe another turn's fallback model.
         """
         from ..llm import create_llm_dispatcher
         
-        # Get or create unified dispatcher
-        if not hasattr(self, '_unified_dispatcher') or self._unified_dispatcher is None:
-            # Provider selection based on existing agent configuration
-            if self._using_custom_llm and hasattr(self, 'llm_instance'):
-                dispatcher = create_llm_dispatcher(llm_instance=self.llm_instance)
+        # Resolve the dispatcher for THIS call. A caller-supplied dispatcher
+        # (async model fallback) is used as-is and never cached onto the
+        # instance, so the shared cached dispatcher is left intact for
+        # concurrent turns.
+        dispatcher = _dispatcher
+        if dispatcher is None:
+            # Get or create the shared cached dispatcher
+            if not hasattr(self, '_unified_dispatcher') or self._unified_dispatcher is None:
+                # Provider selection based on existing agent configuration
+                if self._using_custom_llm and hasattr(self, 'llm_instance'):
+                    dispatcher = create_llm_dispatcher(llm_instance=self.llm_instance)
+                else:
+                    # Initialize OpenAI client if not present
+                    if not hasattr(self, '_openai_client') or self._openai_client is None:
+                        from ..llm import get_openai_client
+                        self._openai_client = get_openai_client(api_key=getattr(self, 'api_key', None))
+                    dispatcher = create_llm_dispatcher(openai_client=self._openai_client, model=self.llm)
+
+                # Cache the dispatcher
+                self._unified_dispatcher = dispatcher
             else:
-                # Initialize OpenAI client if not present
-                if not hasattr(self, '_openai_client') or self._openai_client is None:
-                    from ..llm import get_openai_client
-                    self._openai_client = get_openai_client(api_key=getattr(self, 'api_key', None))
-                dispatcher = create_llm_dispatcher(openai_client=self._openai_client, model=self.llm)
-            
-            # Cache the dispatcher
-            self._unified_dispatcher = dispatcher
+                dispatcher = self._unified_dispatcher
 
         # Pre-call budget guard (parity with sync _chat_completion). Bots and
         # other async callers route through here, not _chat_completion.
@@ -2565,7 +2926,7 @@ Your Goal: {self.goal}"""
         try:
             if stream_callback is None and hasattr(self, 'stream_emitter'):
                 stream_callback = getattr(self.stream_emitter, 'emit', None)
-            final_response = await self._unified_dispatcher.achat_completion(
+            final_response = await dispatcher.achat_completion(
                 messages=messages,
                 tools=tools,
                 tool_choice=getattr(self, 'tool_choice', None),
@@ -2582,6 +2943,7 @@ Your Goal: {self.goal}"""
                 emit_events=emit_events,
                 verbose=self.verbose,
                 max_iterations=self._resolve_max_steps(),
+                output_continuation=getattr(getattr(self, "execution", None), "output_continuation", True),
                 reasoning_steps=reasoning_steps,
                 task_name=task_name,
                 task_description=task_description,
@@ -3065,12 +3427,20 @@ Your Goal: {self.goal}"""
         _trace_emitter.agent_start(self.name, {"role": self.role, "goal": self.goal})
         durable_context = None
         durable_token = None
+        previous_run_state = self._get_db_run_state()
+        previous_run_id = self._current_run_id
+        db_started = time.perf_counter()
+        db_output, db_status = None, "error"
+        _cancel = None
+        _cancel_ctx = None
         try:
             # C2 - cooperative cancellation: abort early if a pre-set token is given
             cancel_source = cancel_token if cancel_token is not None else getattr(self, "interrupt_controller", None)
             _cancel = self._turn_cancel_token(
                 cancel_source, explicit=cancel_token is not None
             )
+            self._active_turn_token = _cancel
+            _cancel_ctx = _enter_turn(self, _cancel)
             if _cancel is not None and getattr(_cancel, "is_set", lambda: False)():
                 reason = getattr(_cancel, "reason", None) or "cancelled before LLM call"
                 raise InterruptedError(f"Agent chat cancelled: {reason}")
@@ -3081,7 +3451,16 @@ Your Goal: {self.goal}"""
                 durable_context, durable_token = begin_durable_run(
                     self, prompt if isinstance(prompt, str) else str(prompt)
                 )
+            if self._db is not None:
+                self._init_db_session()
+                self._start_run(prompt if isinstance(prompt, str) else str(prompt))
             result = self._chat_impl(prompt, temperature, tools, output_json, output_pydantic, reasoning_steps, stream, task_name, task_description, task_id, config, force_retrieval, skip_retrieval, attachments, _trace_emitter, tool_choice, seed=seed, cancel_token=_cancel)
+            db_output = str(result) if result is not None else None
+            # A guardrail-blocked turn returns a non-None refusal string; it must
+            # be recorded as "error", not "completed" (the answer was rejected).
+            db_status = "cancelled" if _cancel is not None and _cancel.was_cancelled() else (
+                "error" if result is None else "completed"
+            )
             if durable_context is not None:
                 outcome = (
                     "cancelled"
@@ -3097,11 +3476,17 @@ Your Goal: {self.goal}"""
                 self.execution.resume_run_id = None
             raise
         except InterruptedError:
+            db_status = "cancelled"
             if durable_context is not None:
                 durable_context.finalize("cancelled")
                 self.execution.resume_run_id = None
             raise
         finally:
+            try:
+                if self._current_run_id is not None and self._current_run_id != previous_run_id:
+                    self._end_run(db_output, db_status, {"duration_ms": (time.perf_counter() - db_started) * 1000})
+            finally:
+                self._restore_db_run_state(previous_run_state)
             if durable_context is not None:
                 from .durable import end_durable_run
 
@@ -3110,6 +3495,9 @@ Your Goal: {self.goal}"""
             try:
                 _trace_emitter.agent_end(self.name)
             finally:
+                if getattr(self, "_active_turn_token", None) is _cancel:
+                    self._active_turn_token = None
+                _exit_turn(self, _cancel_ctx)
                 if _cancel is not None:
                     _cancel.close()
 
@@ -3118,6 +3506,10 @@ Your Goal: {self.goal}"""
         # Reset the per-turn tool buffer so the self-improve review policy only
         # sees tools used in this turn (not during a nested skill-review turn).
         self._reset_turn_tools()
+        # Per-turn loop-guard limits (time/count/no-progress) must not accumulate
+        # across turns of a long-lived agent.
+        _reset_loop_guard_for_turn(self)
+        self._last_stop_reason = "completed"
         # Apply rate limiter if configured (before any LLM call)
         if self._rate_limiter is not None:
             self._rate_limiter.acquire()
@@ -3146,10 +3538,10 @@ Your Goal: {self.goal}"""
         # Initialize session store for JSON-based persistence (lazy)
         # This enables automatic session persistence when session_id is provided
         self._init_session_store()
-        
-        # Start a new run for this chat turn
+
+        # The DB run is now started/ended by the public chat() boundary, but the
+        # prompt string is still needed below for hook input and memory.
         prompt_str = prompt if isinstance(prompt, str) else str(prompt)
-        self._start_run(prompt_str)
 
         # Trigger BEFORE_AGENT hook (only build the input if a hook is actually registered)
         from ..hooks import HookEvent, BeforeAgentInput
@@ -3174,6 +3566,10 @@ Your Goal: {self.goal}"""
                 if res.output and res.output.modified_input and "prompt" in res.output.modified_input:
                     prompt = res.output.modified_input["prompt"]
                     llm_prompt = self._build_multimodal_prompt(prompt, attachments) if attachments else prompt
+
+        # Track execution via telemetry
+        if hasattr(self, '_telemetry') and self._telemetry:
+            self._telemetry.track_agent_execution(self.name, success=True)
 
         # Reset the final display flag for each new conversation
         self._final_display_shown = False
@@ -3238,6 +3634,36 @@ Your Goal: {self.goal}"""
                     
                     # Append formatted knowledge to the prompt
                     prompt = f"{prompt}\n\n{formatted_context}"
+
+                    # Sync llm_prompt with the retrieved context so the RAG block
+                    # actually reaches the model. llm_prompt (not prompt) is what
+                    # gets sent to the LLM in both the custom-LLM and OpenAI paths
+                    # below; without this the retrieved knowledge is appended to
+                    # `prompt` but never delivered, so the model answers from
+                    # parametric memory only. Append (rather than reassign) to
+                    # preserve any response-template instruction already baked into
+                    # llm_prompt.
+                    if isinstance(llm_prompt, str):
+                        llm_prompt = f"{llm_prompt}\n\n{formatted_context}"
+                    elif isinstance(llm_prompt, list):
+                        # Multimodal prompt: append the retrieved context to the
+                        # last text part so attachment-bearing turns still receive
+                        # the RAG block. Copy dicts before mutating to avoid
+                        # aliasing the caller's attachment structures; if no text
+                        # part exists, add one.
+                        appended = False
+                        for i in range(len(llm_prompt) - 1, -1, -1):
+                            item = llm_prompt[i]
+                            if isinstance(item, dict) and item.get("type") == "text":
+                                updated = dict(item)
+                                updated["text"] = f"{updated.get('text', '')}\n\n{formatted_context}"
+                                llm_prompt[i] = updated
+                                appended = True
+                                break
+                        if not appended:
+                            llm_prompt = list(llm_prompt) + [
+                                {"type": "text", "text": formatted_context}
+                            ]
 
         if self._using_custom_llm:
             # Track messages THIS turn appends so a failure rolls back only our
@@ -3368,6 +3794,7 @@ Your Goal: {self.goal}"""
                         ),
                         parallel_tool_calls=getattr(getattr(self, "execution", None), "parallel_tool_calls", False),
                         max_iterations=self._resolve_max_steps(),
+                        output_continuation=getattr(getattr(self, "execution", None), "output_continuation", True),
                         max_tool_calls_per_turn=self._resolve_max_tool_calls(),
                         reasoning_steps=reasoning_steps,
                         stream=stream
@@ -3411,7 +3838,16 @@ Your Goal: {self.goal}"""
 
                     # Apply guardrail validation for custom LLM response
                     try:
-                        validated_response = self._apply_guardrail_with_retry(response_text, prompt, temperature, tools, task_name, task_description, task_id, cancel_token=cancel_token)
+                        validated_response = self._apply_guardrail_with_retry(response_text, prompt, temperature, tools, task_name, task_description, task_id, cancel_token=cancel_token, messages=processed_history)
+                        # Coerce into the requested Pydantic model so callers
+                        # get a validated instance, not a raw JSON string.
+                        # Only output_pydantic changes the return type; output_json
+                        # must stay a string for backward-compatible downstream
+                        # JSON parsing (task parsing, workflow results).
+                        if output_pydantic:
+                            validated_response = self._coerce_structured_output(
+                                validated_response, output_pydantic
+                            )
                         # Execute callback and display after validation
                         self._execute_callback_and_display(prompt, validated_response, time.time() - start_time, task_name, task_description, task_id)
                         return self._trigger_after_agent_hook(prompt, validated_response, start_time)
@@ -3419,10 +3855,11 @@ Your Goal: {self.goal}"""
                         logging.error(f"Agent {self.name}: Guardrail validation failed for custom LLM: {e}")
                         # Rollback chat history on guardrail failure
                         self._rollback_chat_history_to(chat_history_length)
-                        return None
+                        return self._guardrail_blocked_message(e)
                 except ToolExecutionError:
                     raise
                 except Exception as e:
+                    self._last_stop_reason = "error"
                     # Rollback chat history if LLM call fails
                     self._rollback_chat_history_to(chat_history_length)
                     _get_display_functions()['display_error'](f"Error in LLM chat: {e}")
@@ -3430,6 +3867,7 @@ Your Goal: {self.goal}"""
             except ToolExecutionError:
                 raise
             except Exception as e:
+                self._last_stop_reason = "error"
                 _get_display_functions()['display_error'](f"Error in LLM chat: {e}")
                 return None
             finally:
@@ -3454,43 +3892,54 @@ Your Goal: {self.goal}"""
                 use_native_format=use_native_format,
                 memory_prefetch_context=memory_prefetch_context,
             )
+            if attachments:
+                # Model content includes ephemeral files; history and after-turn
+                # memory must receive only the user's text, including hook edits.
+                original_prompt = prompt
             
+
+            # Track messages THIS turn appends so a failure rolls back only our
+            # own messages, never a concurrent turn's (see memory_mixin). The
+            # default (OpenAI) path used to skip this, so its positional rollback
+            # ``del chat_history[n:]`` erased a concurrent turn's interleaved
+            # messages and corrupted the shared transcript.
+            _turn_token = self._begin_turn_tracking()
 
             # Store chat history length for potential rollback
             chat_history_length = len(self.chat_history)
-            
-            # Normalize original_prompt for consistent chat history storage
-            normalized_content = original_prompt
-            if isinstance(original_prompt, list):
-                # Extract text from multimodal prompts
-                normalized_content = next((item["text"] for item in original_prompt if item.get("type") == "text"), "")
-            
-            # Prevent duplicate messages
-            if not (self.chat_history and 
-                    self.chat_history[-1].get("role") == "user" and 
-                    self.chat_history[-1].get("content") == normalized_content):
-                # Add user message to chat history BEFORE LLM call so handoffs can access it
-                self._append_to_chat_history({"role": "user", "content": normalized_content})
-                # Persist user message to DB (OpenAI path)
-                self._persist_message("user", normalized_content)
 
-            reflection_count = 0
-            start_time = time.time()
-            
-            # Apply context management before LLM call (auto-compaction)
-            # Zero overhead when context=False
-            system_prompt_content = messages[0].get("content", "") if messages and messages[0].get("role") == "system" else ""
-            processed_messages, context_result = self._apply_context_management(
-                messages=messages,
-                system_prompt=system_prompt_content,
-                tools=tools,
-            )
-            # Use processed messages for the LLM call
-            messages = processed_messages
-            
-            
-            # Wrap entire while loop in try-except for rollback on any failure
+            # Wrap entire turn in try/finally so per-turn tracking is always
+            # ended (the finally reads the ownership list during rollback).
             try:
+                # Normalize original_prompt for consistent chat history storage
+                normalized_content = original_prompt
+                if isinstance(original_prompt, list):
+                    # Extract text from multimodal prompts
+                    normalized_content = next((item["text"] for item in original_prompt if item.get("type") == "text"), "")
+
+                # Add user message to chat history BEFORE LLM call so handoffs can
+                # access it. Use atomic check-then-act to prevent TOCTOU races: an
+                # unatomic read of chat_history[-1] followed by a separate append
+                # lets a concurrent turn's user message be mistaken for this turn's
+                # own duplicate, silently dropping this user turn from the record.
+                if self._add_to_chat_history_if_not_duplicate("user", normalized_content):
+                    # Persist user message to DB (OpenAI path)
+                    self._persist_message("user", normalized_content)
+
+                reflection_count = 0
+                start_time = time.time()
+
+                # Apply context management before LLM call (auto-compaction)
+                # Zero overhead when context=False
+                system_prompt_content = messages[0].get("content", "") if messages and messages[0].get("role") == "system" else ""
+                processed_messages, context_result = self._apply_context_management(
+                    messages=messages,
+                    system_prompt=system_prompt_content,
+                    tools=tools,
+                )
+                # Use processed messages for the LLM call
+                messages = processed_messages
+
                 while True:
                     try:
                         if self.verbose:
@@ -3523,8 +3972,18 @@ Your Goal: {self.goal}"""
                             return None
 
                         # Handle None content (can happen with tool calls or empty responses)
-                        content = response.choices[0].message.content
+                        message = response.choices[0].message
+                        content = message.content
                         response_text = content.strip() if content else ""
+                        if output_pydantic and not response_text:
+                            parsed_only = getattr(message, "parsed", None)
+                            if parsed_only is not None:
+                                if hasattr(parsed_only, "model_dump_json"):
+                                    response_text = parsed_only.model_dump_json()
+                                elif isinstance(parsed_only, (dict, list)):
+                                    response_text = json.dumps(parsed_only)
+                                else:
+                                    response_text = str(parsed_only)
 
                         # Handle output_json or output_pydantic if specified
                         if output_json or output_pydantic:
@@ -3535,7 +3994,14 @@ Your Goal: {self.goal}"""
                             self._persist_message("assistant", response_text)
                             # Apply guardrail validation even for JSON output
                             try:
-                                validated_response = self._apply_guardrail_with_retry(response_text, original_prompt, temperature, tools, task_name, task_description, task_id, cancel_token=cancel_token)
+                                validated_response = self._apply_guardrail_with_retry(response_text, original_prompt, temperature, tools, task_name, task_description, task_id, cancel_token=cancel_token, messages=messages)
+                                # Coerce into the requested Pydantic model so callers
+                                # get a validated instance, not a raw JSON string.
+                                # output_json intentionally stays a string (backward compat).
+                                if output_pydantic:
+                                    validated_response = self._structured_output_from_message(
+                                        message, output_pydantic, validated_response, response_text
+                                    )
                                 # Execute callback after validation
                                 self._execute_callback_and_display(original_prompt, validated_response, time.time() - start_time, task_name, task_description, task_id)
                                 return self._trigger_after_agent_hook(original_prompt, validated_response, start_time)
@@ -3543,7 +4009,7 @@ Your Goal: {self.goal}"""
                                 logging.error(f"Agent {self.name}: Guardrail validation failed for JSON output: {e}")
                                 # Rollback chat history on guardrail failure
                                 self._rollback_chat_history_to(chat_history_length)
-                                return None
+                                return self._guardrail_blocked_message(e)
 
                         if not self.self_reflect:
                             # User message already added before LLM call via _build_messages
@@ -3556,18 +4022,21 @@ Your Goal: {self.goal}"""
                             if reasoning_steps and hasattr(response.choices[0].message, 'reasoning_content') and response.choices[0].message.reasoning_content:
                                 # Apply guardrail to reasoning content
                                 try:
-                                    validated_reasoning = self._apply_guardrail_with_retry(response.choices[0].message.reasoning_content, original_prompt, temperature, tools, task_name, task_description, task_id, cancel_token=cancel_token)
+                                    validated_reasoning = self._apply_guardrail_with_retry(response.choices[0].message.reasoning_content, original_prompt, temperature, tools, task_name, task_description, task_id, cancel_token=cancel_token, messages=messages)
                                     # Execute callback after validation
                                     self._execute_callback_and_display(original_prompt, validated_reasoning, time.time() - start_time, task_name, task_description, task_id)
                                     return self._trigger_after_agent_hook(original_prompt, validated_reasoning, start_time)
                                 except Exception as e:
                                     logging.error(f"Agent {self.name}: Guardrail validation failed for reasoning content: {e}")
-                                    # Rollback chat history on guardrail failure
+                                    # Rollback chat history on guardrail failure.
+                                    # The public chat()/achat() finalizer records the
+                                    # blocked turn as "error" (see _guardrail_blocked_message),
+                                    # so the run keeps its output and duration_ms.
                                     self._rollback_chat_history_to(chat_history_length)
-                                    return None
+                                    return self._guardrail_blocked_message(e)
                             # Apply guardrail to regular response
                             try:
-                                validated_response = self._apply_guardrail_with_retry(response_text, original_prompt, temperature, tools, task_name, task_description, task_id, cancel_token=cancel_token)
+                                validated_response = self._apply_guardrail_with_retry(response_text, original_prompt, temperature, tools, task_name, task_description, task_id, cancel_token=cancel_token, messages=messages)
                                 # Execute callback after validation
                                 self._execute_callback_and_display(original_prompt, validated_response, time.time() - start_time, task_name, task_description, task_id)
                                 return self._trigger_after_agent_hook(original_prompt, validated_response, start_time)
@@ -3575,7 +4044,7 @@ Your Goal: {self.goal}"""
                                 logging.error(f"Agent {self.name}: Guardrail validation failed: {e}")
                                 # Rollback chat history on guardrail failure
                                 self._rollback_chat_history_to(chat_history_length)
-                                return None
+                                return self._guardrail_blocked_message(e)
 
                         reflection_prompt = f"""
 Reflect on your previous response: '{response_text}'.
@@ -3633,17 +4102,15 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                 self._append_to_chat_history({"role": "assistant", "content": response_text})
                                 # Apply guardrail validation after satisfactory reflection
                                 try:
-                                    validated_response = self._apply_guardrail_with_retry(response_text, original_prompt, temperature, tools, task_name, task_description, task_id, cancel_token=cancel_token)
+                                    validated_response = self._apply_guardrail_with_retry(response_text, original_prompt, temperature, tools, task_name, task_description, task_id, cancel_token=cancel_token, messages=messages)
                                     # Execute callback after validation
                                     self._execute_callback_and_display(original_prompt, validated_response, time.time() - start_time, task_name, task_description, task_id)
-                                    self._end_run(validated_response, "completed", {"duration_ms": (time.time() - start_time) * 1000})
                                     return self._trigger_after_agent_hook(original_prompt, validated_response, start_time)
                                 except Exception as e:
                                     logging.error(f"Agent {self.name}: Guardrail validation failed after reflection: {e}")
                                     # Rollback chat history on guardrail failure
                                     self._rollback_chat_history_to(chat_history_length)
-                                    self._end_run(None, "error", {"error": str(e)})
-                                    return None
+                                    return self._guardrail_blocked_message(e)
 
                             # Check if we've hit max reflections
                             if reflection_count >= self.max_reflect - 1:
@@ -3653,7 +4120,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                 self._append_to_chat_history({"role": "assistant", "content": response_text})
                                 # Apply guardrail validation after max reflections
                                 try:
-                                    validated_response = self._apply_guardrail_with_retry(response_text, original_prompt, temperature, tools, task_name, task_description, task_id, cancel_token=cancel_token)
+                                    validated_response = self._apply_guardrail_with_retry(response_text, original_prompt, temperature, tools, task_name, task_description, task_id, cancel_token=cancel_token, messages=messages)
                                     # Execute callback after validation
                                     self._execute_callback_and_display(original_prompt, validated_response, time.time() - start_time, task_name, task_description, task_id)
                                     return self._trigger_after_agent_hook(original_prompt, validated_response, start_time)
@@ -3661,7 +4128,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                     logging.error(f"Agent {self.name}: Guardrail validation failed after max reflections: {e}")
                                     # Rollback chat history on guardrail failure
                                     self._rollback_chat_history_to(chat_history_length)
-                                    return None
+                                    return self._guardrail_blocked_message(e)
                             
                             # If not satisfactory and not at max reflections, continue with regeneration
                             logging.debug(f"{self.name} reflection count {reflection_count + 1}, continuing reflection process")
@@ -3689,7 +4156,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                         _get_display_functions()['display_self_reflection']("Maximum reflection count reached after repeated parse errors, returning current response", console=self.console)
                                     self._append_to_chat_history({"role": "assistant", "content": response_text})
                                     try:
-                                        validated_response = self._apply_guardrail_with_retry(response_text, original_prompt, temperature, tools, task_name, task_description, task_id, cancel_token=cancel_token)
+                                        validated_response = self._apply_guardrail_with_retry(response_text, original_prompt, temperature, tools, task_name, task_description, task_id, cancel_token=cancel_token, messages=messages)
                                         self._execute_callback_and_display(original_prompt, validated_response, time.time() - start_time, task_name, task_description, task_id)
                                         return self._trigger_after_agent_hook(original_prompt, validated_response, start_time)
                                     except Exception as guard_e:
@@ -3703,11 +4170,16 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
             except ToolExecutionError:
                 raise
             except Exception as e:
+                self._last_stop_reason = "error"
                 # Catch any exceptions that escape the while loop
                 _get_display_functions()['display_error'](f"Unexpected error in chat: {e}", console=self.console)
                 # Rollback chat history
                 self._rollback_chat_history_to(chat_history_length)
                 return None
+            finally:
+                # End per-turn tracking after any rollback has run (rollback
+                # reads the ownership list, so this must come last).
+                self._end_turn_tracking(_turn_token)
 
     def clean_json_output(self, output: str) -> str:
         """Clean JSON output while preserving the legacy agent method."""
@@ -3795,10 +4267,16 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
         _trace_emitter.agent_start(self.name, {"role": self.role, "goal": self.goal})
         durable_context = None
         durable_token = None
+        previous_run_state = self._get_db_run_state()
+        previous_run_id = self._current_run_id
+        db_started = time.perf_counter()
+        db_output, db_status = None, "error"
         cancel_source = cancel_token if cancel_token is not None else getattr(self, "interrupt_controller", None)
         _cancel = self._turn_cancel_token(
             cancel_source, explicit=cancel_token is not None
         )
+        self._active_turn_token = _cancel
+        _cancel_ctx = _enter_turn(self, _cancel)
         try:
             if getattr(getattr(self, "execution", None), "durable", False):
                 from .durable import abegin_durable_run
@@ -3806,6 +4284,9 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                 durable_context, durable_token = await abegin_durable_run(
                     self, prompt if isinstance(prompt, str) else str(prompt)
                 )
+            if self._db is not None:
+                await self._ainit_db_session()
+                await self._astart_run(prompt if isinstance(prompt, str) else str(prompt))
             result = await self._achat_impl(
                 prompt=prompt, temperature=temperature, tools=tools,
                 output_json=output_json, output_pydantic=output_pydantic,
@@ -3814,6 +4295,12 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                 config=config, force_retrieval=force_retrieval, skip_retrieval=skip_retrieval,
                 attachments=attachments, _trace_emitter=_trace_emitter, tool_choice=tool_choice,
                 seed=seed, cancel_token=_cancel
+            )
+            db_output = str(result) if result is not None else None
+            # A guardrail-blocked turn returns a non-None refusal string; record
+            # it as "error", not "completed" (see sync chat()).
+            db_status = "cancelled" if _cancel is not None and _cancel.was_cancelled() else (
+                "error" if result is None else "completed"
             )
             if durable_context is not None:
                 outcome = (
@@ -3830,21 +4317,32 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                 self.execution.resume_run_id = None
             raise
         except (InterruptedError, asyncio.CancelledError):
+            db_status = "cancelled"
             if durable_context is not None:
                 await durable_context.afinalize("cancelled")
                 self.execution.resume_run_id = None
             raise
         finally:
-            if durable_context is not None:
-                from .durable import end_durable_run
-
-                end_durable_run(durable_token)
-                await durable_context.aclose()
             try:
-                _trace_emitter.agent_end(self.name)
+                if self._current_run_id is not None and self._current_run_id != previous_run_id:
+                    await self._aend_run(db_output, db_status, {"duration_ms": (time.perf_counter() - db_started) * 1000})
             finally:
-                if _cancel is not None:
-                    _cancel.close()
+                self._restore_db_run_state(previous_run_state)
+                try:
+                    if durable_context is not None:
+                        from .durable import end_durable_run
+
+                        end_durable_run(durable_token)
+                        await durable_context.aclose()
+                finally:
+                    try:
+                        _trace_emitter.agent_end(self.name)
+                    finally:
+                        if getattr(self, "_active_turn_token", None) is _cancel:
+                            self._active_turn_token = None
+                        _exit_turn(self, _cancel_ctx)
+                        if _cancel is not None:
+                            _cancel.close()
 
     async def _achat_impl(self, prompt, temperature, tools, output_json, output_pydantic, reasoning_steps, stream, task_name, task_description, task_id, config, force_retrieval, skip_retrieval, attachments, _trace_emitter, tool_choice=None, seed=None, cancel_token=None):
         """Internal async chat implementation (extracted for trace wrapping)."""
@@ -3854,6 +4352,10 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
         # Reset the per-turn tool buffer so the self-improve review policy only
         # sees tools used in this turn (not during a nested skill-review turn).
         self._reset_turn_tools()
+        # Per-turn loop-guard limits (time/count/no-progress) must not accumulate
+        # across turns of a long-lived agent.
+        _reset_loop_guard_for_turn(self)
+        self._last_stop_reason = "completed"
         # Apply rate limiter if configured (before any LLM call) - async parity
         # with the sync path in _chat_impl; without this, async bursts (astart,
         # async_execution=True) would fire with zero throttling.
@@ -3934,18 +4436,18 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                 self._ensure_knowledge_processed()
             
             if not skip_retrieval and self.knowledge:
-                # Knowledge.search is synchronous (Mem0 embedding + vector-store
-                # I/O). Offload to a thread so it never blocks the event loop for
-                # other coroutines sharing the loop.
-                search_results = await asyncio.to_thread(
-                    self.knowledge.search, prompt, agent_id=self.agent_id
+                # Use the unified, already-correct normalization helper (handles
+                # the SearchResult dataclass, dict, and list shapes). It is
+                # synchronous (Mem0 embedding + vector-store I/O), so offload it
+                # to a thread to avoid blocking the event loop for coroutines
+                # sharing the loop.
+                knowledge_context, _ = await asyncio.to_thread(
+                    self._get_knowledge_context,
+                    prompt if isinstance(prompt, str) else str(prompt),
+                    True
                 )
-                if search_results:
-                    if isinstance(search_results, dict) and 'results' in search_results:
-                        knowledge_content = "\n".join([result['memory'] for result in search_results['results']])
-                    else:
-                        knowledge_content = "\n".join(search_results)
-                    prompt = f"{prompt}\n\nKnowledge: {knowledge_content}"
+                if knowledge_context:
+                    prompt = f"{prompt}\n\nKnowledge: {knowledge_context}"
 
             if self._using_custom_llm:
                 # Store chat history length for potential rollback
@@ -3965,7 +4467,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                 # Add user message to chat history BEFORE LLM call so handoffs can access it.
                 # Use atomic check-then-act to prevent TOCTOU race conditions (matches sync chat()).
                 if self._add_to_chat_history_if_not_duplicate("user", normalized_content):
-                    self._persist_message("user", normalized_content)
+                    await self._apersist_message("user", normalized_content)
 
                 # --- Proactive Context Budget Management (async custom LLM path) ---
                 try:
@@ -4025,6 +4527,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                         ),
                         'parallel_tool_calls': getattr(getattr(self, "execution", None), "parallel_tool_calls", False),
                         'max_iterations': self._resolve_max_steps(),
+                        'output_continuation': getattr(getattr(self, "execution", None), "output_continuation", True),
                         'max_tool_calls_per_turn': self._resolve_max_tool_calls(),
                         'reasoning_steps': reasoning_steps,
                         'stream': stream
@@ -4063,7 +4566,12 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                     
                     # Apply guardrail validation for custom LLM response
                     try:
-                        validated_response = await self._aapply_guardrail_with_retry(response_text, prompt, temperature, tools, task_name, task_description, task_id)
+                        validated_response = await self._aapply_guardrail_with_retry(response_text, prompt, temperature, tools, task_name, task_description, task_id, messages=effective_history)
+                        # Coerce into the requested Pydantic model so callers
+                        # get a validated instance, not a raw JSON string.
+                        # output_json intentionally stays a string (backward compat).
+                        if output_pydantic:
+                            validated_response = self._coerce_structured_output(validated_response, output_pydantic)
                         # Execute callback after validation
                         self._execute_callback_and_display(normalized_content, validated_response, time.time() - start_time, task_name, task_description, task_id)
                         return await self._atrigger_after_agent_hook(prompt, validated_response, start_time)
@@ -4071,10 +4579,11 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                         logging.error(f"Agent {self.name}: Guardrail validation failed for custom LLM: {e}")
                         # Rollback chat history on guardrail failure
                         self._rollback_chat_history_to(chat_history_length)
-                        return None
+                        return self._guardrail_blocked_message(e)
                 except ToolExecutionError:
                     raise
                 except Exception as e:
+                    self._last_stop_reason = "error"
                     # Rollback chat history if LLM call fails
                     self._rollback_chat_history_to(chat_history_length)
                     _get_display_functions()['display_error'](f"Error in LLM chat: {e}")
@@ -4097,6 +4606,15 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
             if durable_context is not None:
                 messages = await durable_context.arestore_messages(messages)
             
+            # Track messages THIS turn appends so a failure rolls back only our
+            # own messages, never a concurrent turn's (see memory_mixin). The
+            # default (OpenAI) path used to skip this, so its positional rollback
+            # ``del chat_history[n:]`` erased a concurrent turn's interleaved
+            # messages. Each achat() turn runs in its own task/context and
+            # _clear_turn_tracking() ran at the top of this turn, so this list is
+            # cleaned up when the next turn on this task starts.
+            self._begin_turn_tracking()
+
             # Store chat history length for potential rollback
             chat_history_length = len(self.chat_history)
             
@@ -4106,12 +4624,12 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                 # Extract text from multimodal prompts
                 normalized_content = next((item["text"] for item in original_prompt if item.get("type") == "text"), "")
             
-            # Prevent duplicate messages
-            if not (self.chat_history and 
-                    self.chat_history[-1].get("role") == "user" and 
-                    self.chat_history[-1].get("content") == normalized_content):
-                # Add user message to chat history BEFORE LLM call so handoffs can access it
-                self._append_to_chat_history({"role": "user", "content": normalized_content})
+            # Add user message to chat history BEFORE LLM call so handoffs can
+            # access it. Use atomic check-then-act to prevent TOCTOU races: an
+            # unatomic read of chat_history[-1] followed by a separate append
+            # lets a concurrent turn's user message be mistaken for this turn's
+            # own duplicate, silently dropping this user turn from the record.
+            self._add_to_chat_history_if_not_duplicate("user", normalized_content)
 
             # --- Proactive Context Budget Management (async standard OpenAI path) ---
             try:
@@ -4199,7 +4717,12 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                             await self._apersist_message("assistant", response_text)
                             # Apply guardrail validation even for JSON output
                             try:
-                                validated_response = await self._aapply_guardrail_with_retry(response_text, original_prompt, temperature, tools, task_name, task_description, task_id)
+                                validated_response = await self._aapply_guardrail_with_retry(response_text, original_prompt, temperature, tools, task_name, task_description, task_id, messages=messages)
+                                # Coerce into the requested Pydantic model so callers
+                                # get a validated instance, not a raw JSON string.
+                                # output_json intentionally stays a string (backward compat).
+                                if output_pydantic:
+                                    validated_response = self._coerce_structured_output(validated_response, output_pydantic)
                                 # Execute callback after validation
                                 self._execute_callback_and_display(original_prompt, validated_response, time.time() - start_time, task_name, task_description, task_id)
                                 return await self._atrigger_after_agent_hook(original_prompt, validated_response, start_time)
@@ -4207,7 +4730,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                 logging.error(f"Agent {self.name}: Guardrail validation failed for JSON output: {e}")
                                 # Rollback chat history on guardrail failure
                                 self._rollback_chat_history_to(chat_history_length)
-                                return None
+                                return self._guardrail_blocked_message(e)
 
                         # For regular responses (no self-reflection)
                         if not self.self_reflect:
@@ -4222,7 +4745,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                             if reasoning_steps and hasattr(response, 'choices') and response.choices and hasattr(response.choices[0].message, 'reasoning_content') and response.choices[0].message.reasoning_content:
                                 # Apply guardrail to reasoning content
                                 try:
-                                    validated_reasoning = await self._aapply_guardrail_with_retry(response.choices[0].message.reasoning_content, original_prompt, temperature, tools, task_name, task_description, task_id)
+                                    validated_reasoning = await self._aapply_guardrail_with_retry(response.choices[0].message.reasoning_content, original_prompt, temperature, tools, task_name, task_description, task_id, messages=messages)
                                     # Execute callback after validation
                                     self._execute_callback_and_display(original_prompt, validated_reasoning, time.time() - start_time, task_name, task_description, task_id)
                                     return await self._atrigger_after_agent_hook(original_prompt, validated_reasoning, start_time)
@@ -4230,11 +4753,11 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                     logging.error(f"Agent {self.name}: Guardrail validation failed for reasoning content: {e}")
                                     # Rollback chat history on guardrail failure
                                     self._rollback_chat_history_to(chat_history_length)
-                                    return None
+                                    return self._guardrail_blocked_message(e)
                             else:
                                 # Apply guardrail to regular response content
                                 try:
-                                    validated_response = await self._aapply_guardrail_with_retry(response_text, original_prompt, temperature, tools, task_name, task_description, task_id)
+                                    validated_response = await self._aapply_guardrail_with_retry(response_text, original_prompt, temperature, tools, task_name, task_description, task_id, messages=messages)
                                     # Execute callback after validation
                                     self._execute_callback_and_display(original_prompt, validated_response, time.time() - start_time, task_name, task_description, task_id)
                                     return await self._atrigger_after_agent_hook(original_prompt, validated_response, start_time)
@@ -4242,7 +4765,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                     logging.error(f"Agent {self.name}: Guardrail validation failed: {e}")
                                     # Rollback chat history on guardrail failure
                                     self._rollback_chat_history_to(chat_history_length)
-                                    return None
+                                    return self._guardrail_blocked_message(e)
                         
                         # If self-reflection is enabled, implement reflection logic
                         if self.self_reflect:
@@ -4274,7 +4797,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                         # Persist assistant message to DB (offloaded to a worker thread)
                                         await self._apersist_message("assistant", response_text)
                                         try:
-                                            validated_response = await self._aapply_guardrail_with_retry(response_text, original_prompt, temperature, tools, task_name, task_description, task_id)
+                                            validated_response = await self._aapply_guardrail_with_retry(response_text, original_prompt, temperature, tools, task_name, task_description, task_id, messages=messages)
                                             # Execute callback after validation
                                             self._execute_callback_and_display(original_prompt, validated_response, time.time() - start_time, task_name, task_description, task_id)
                                             return await self._atrigger_after_agent_hook(original_prompt, validated_response, start_time)
@@ -4282,7 +4805,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                             logging.error(f"Agent {self.name}: Guardrail validation failed: {e}")
                                             # Rollback chat history on guardrail failure
                                             self._rollback_chat_history_to(chat_history_length)
-                                            return None
+                                            return self._guardrail_blocked_message(e)
                                     
                                     _areflection_kwargs = {}
                                     if temperature is not None:
@@ -4308,7 +4831,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                         # Persist assistant message to DB (offloaded to a worker thread)
                                         await self._apersist_message("assistant", response_text)
                                         try:
-                                            validated_response = await self._aapply_guardrail_with_retry(response_text, original_prompt, temperature, tools, task_name, task_description, task_id)
+                                            validated_response = await self._aapply_guardrail_with_retry(response_text, original_prompt, temperature, tools, task_name, task_description, task_id, messages=messages)
                                             # Execute callback after validation
                                             self._execute_callback_and_display(original_prompt, validated_response, time.time() - start_time, task_name, task_description, task_id)
                                             return await self._atrigger_after_agent_hook(original_prompt, validated_response, start_time)
@@ -4316,7 +4839,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                             logging.error(f"Agent {self.name}: Guardrail validation failed after reflection: {e}")
                                             # Rollback chat history on guardrail failure
                                             self._rollback_chat_history_to(chat_history_length)
-                                            return None
+                                            return self._guardrail_blocked_message(e)
                                     
                                     # Check if we've hit max reflections
                                     if reflection_count >= self.max_reflect - 1:
@@ -4327,7 +4850,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                         # Persist assistant message to DB (offloaded to a worker thread)
                                         await self._apersist_message("assistant", response_text)
                                         try:
-                                            validated_response = await self._aapply_guardrail_with_retry(response_text, original_prompt, temperature, tools, task_name, task_description, task_id)
+                                            validated_response = await self._aapply_guardrail_with_retry(response_text, original_prompt, temperature, tools, task_name, task_description, task_id, messages=messages)
                                             # Execute callback after validation
                                             self._execute_callback_and_display(original_prompt, validated_response, time.time() - start_time, task_name, task_description, task_id)
                                             return await self._atrigger_after_agent_hook(original_prompt, validated_response, start_time)
@@ -4335,7 +4858,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                             logging.error(f"Agent {self.name}: Guardrail validation failed after max reflections: {e}")
                                             # Rollback chat history on guardrail failure
                                             self._rollback_chat_history_to(chat_history_length)
-                                            return None
+                                            return self._guardrail_blocked_message(e)
                                     
                                     # Regenerate response based on reflection
                                     regenerate_messages = reflection_messages + [
@@ -4377,7 +4900,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                         # Persist assistant message to DB (offloaded to a worker thread)
                                         await self._apersist_message("assistant", response_text)
                                         try:
-                                            validated_response = await self._aapply_guardrail_with_retry(response_text, original_prompt, temperature, tools, task_name, task_description, task_id)
+                                            validated_response = await self._aapply_guardrail_with_retry(response_text, original_prompt, temperature, tools, task_name, task_description, task_id, messages=messages)
                                             # Execute callback after validation
                                             self._execute_callback_and_display(original_prompt, validated_response, time.time() - start_time, task_name, task_description, task_id)
                                             return await self._atrigger_after_agent_hook(original_prompt, validated_response, start_time)
@@ -4385,7 +4908,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                             logging.error(f"Agent {self.name}: Guardrail validation failed after reflection error: {guard_e}")
                                             # Rollback chat history on guardrail failure
                                             self._rollback_chat_history_to(chat_history_length)
-                                            return None
+                                            return self._guardrail_blocked_message(guard_e)
                                     continue
                         
                         # This should never be reached due to the returns above
@@ -4435,6 +4958,11 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                             if get_logger().getEffectiveLevel() == logging.DEBUG:
                                 total_time = time.time() - start_time
                                 logging.debug(f"Agent.achat completed in {total_time:.2f} seconds")
+                            # Coerce into the requested Pydantic model so callers
+                            # get a validated instance, not a raw JSON string.
+                            # output_json intentionally stays a string (backward compat).
+                            if output_pydantic:
+                                response_text = self._coerce_structured_output(response_text, output_pydantic)
                             # Execute callback after JSON/Pydantic completion
                             self._execute_callback_and_display(original_prompt, response_text, time.time() - start_time, task_name, task_description, task_id)
                             return await self._atrigger_after_agent_hook(original_prompt, response_text, start_time)
@@ -4541,7 +5069,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                         
                         # Apply guardrail validation for OpenAI client response
                         try:
-                            validated_response = await self._aapply_guardrail_with_retry(response_text, original_prompt, temperature, tools, task_name, task_description, task_id)
+                            validated_response = await self._aapply_guardrail_with_retry(response_text, original_prompt, temperature, tools, task_name, task_description, task_id, messages=messages)
                             # Execute callback after validation
                             self._execute_callback_and_display(original_prompt, validated_response, time.time() - start_time, task_name, task_description, task_id)
                             return await self._atrigger_after_agent_hook(original_prompt, validated_response, start_time)
@@ -4549,23 +5077,42 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                             logging.error(f"Agent {self.name}: Guardrail validation failed for OpenAI client: {e}")
                             # Rollback chat history on guardrail failure
                             self._rollback_chat_history_to(chat_history_length)
-                            return None
+                            return self._guardrail_blocked_message(e)
                 except ToolExecutionError:
                     raise
                 except Exception as e:
+                    self._last_stop_reason = "error"
                     _get_display_functions()['display_error'](f"Error in chat completion: {e}")
                     if get_logger().getEffectiveLevel() == logging.DEBUG:
                         total_time = time.time() - start_time
                         logging.debug(f"Agent.achat failed in {total_time:.2f} seconds: {str(e)}")
+                    # Rollback chat history so a failed async turn does not leave
+                    # a dangling, unanswered user message (mirrors the sync path
+                    # and achat()'s own guardrail handler).
+                    self._rollback_chat_history_to(chat_history_length)
                     return None
         except ToolExecutionError:
             raise
         except Exception as e:
+            self._last_stop_reason = "error"
             _get_display_functions()['display_error'](f"Error in achat: {e}")
             if get_logger().getEffectiveLevel() == logging.DEBUG:
                 total_time = time.time() - start_time
                 logging.debug(f"Agent.achat failed in {total_time:.2f} seconds: {str(e)}")
+            # Rollback chat history so a failed async turn does not leave a
+            # dangling, unanswered user message (mirrors the sync path).
+            self._rollback_chat_history_to(chat_history_length)
             return None
+        finally:
+            # Unregister this turn's ownership list from the process-wide
+            # live-turn registry once the turn finishes (success or failure).
+            # The sync path does this in _end_turn_tracking's finally; the async
+            # path previously relied only on the *next* turn's
+            # _clear_turn_tracking(), so a terminal achat/arun/astart left its
+            # completed ownership globally registered and a later ephemeral()
+            # cleanup treated its committed messages as still live. Rollback in
+            # the except blocks above already read ownership before this runs.
+            self._clear_turn_tracking()
 
     async def _achat_completion(self, response, tools, reasoning_steps=False):
         """Async version of _chat_completion method"""
@@ -4578,13 +5125,43 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
             for tool_call in message.tool_calls:
                 try:
                     function_name = tool_call.function.name
-                    # Parse JSON arguments safely 
+                    # Parse JSON arguments safely. A parse failure is NOT {}: a
+                    # truncated/malformed argument string must not silently run
+                    # the tool with defaults and be reported as success. Surface
+                    # a retryable tool-error to the model instead (mirrors
+                    # llm.py's _tool_arguments_parse_failed handling).
+                    from .tool_execution import (
+                        _TOOL_ARGUMENTS_PARSE_FAILED,
+                        tool_arguments_parse_failed,
+                        tool_parse_error_message,
+                    )
                     try:
-                        arguments = json.loads(tool_call.function.arguments)
-                    except json.JSONDecodeError as json_error:
+                        arguments = json.loads(tool_call.function.arguments) if tool_call.function.arguments else {}
+                    except (json.JSONDecodeError, TypeError) as json_error:
+                        # TypeError: a custom client can hand back a non-text
+                        # argument value, which json.loads rejects. Treat it the
+                        # same as malformed JSON (mirrors llm.py's parser).
                         logging.error(f"Failed to parse tool arguments as JSON: {json_error}")
-                        arguments = {}
-                    
+                        arguments = _TOOL_ARGUMENTS_PARSE_FAILED
+                    if tool_arguments_parse_failed(arguments):
+                        # Report the failure to streaming observers before skipping
+                        # execution, so a malformed call is never silently dropped
+                        # (mirrors the sync streaming path).
+                        self._notify_tool_call(
+                            function_name,
+                            {},
+                            None,
+                            elapsed_time=0.0,
+                            success=False,
+                        )
+                        results.append(
+                            tool_parse_error_message(
+                                function_name,
+                                getattr(tool_call, "id", None),
+                            )["content"]
+                        )
+                        continue
+
                     # Find the matching tool by comparing every supported identifier:
                     # __name__ (plain callables), .name (BaseTool instances like
                     # BrowserBaseTool, or aliased FunctionTools), or the class name.
@@ -4722,6 +5299,42 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
             from .tools_placement import ensure_tools_placed
             ensure_tools_placed(self)
 
+        # Input-side guardrail runs BEFORE begin_durable_run so a rejected prompt
+        # never opens (and therefore never finalizes) a durable run -- exact
+        # parity with chat()/achat(), which validate input before begin_durable_run
+        # and return early. Doing it here (not in _start_stream_impl) keeps a
+        # blocked stream from being recorded as a "succeeded" durable run.
+        if hasattr(self, '_validate_input_with_guardrail'):
+            _in_ok, _in_prompt, _in_err = self._validate_input_with_guardrail(prompt)
+            if not _in_ok:
+                logging.warning(f"Agent {getattr(self, 'name', '')}: input blocked by guardrail: {_in_err}")
+                yield f"[Input blocked by guardrail: {_in_err}]"
+                return
+            prompt = _in_prompt
+
+        # Same pre-turn checks as chat()/achat(): a streamed turn must not
+        # bypass a configured rate limit or a blocking BEFORE_AGENT hook.
+        if getattr(self, '_rate_limiter', None) is not None:
+            self._rate_limiter.acquire()
+        from ..hooks import HookEvent, BeforeAgentInput
+        if self._hook_runner.registry.has_hooks(HookEvent.BEFORE_AGENT):
+            hook_results = self._hook_runner.execute_sync(HookEvent.BEFORE_AGENT, BeforeAgentInput(
+                session_id=getattr(self, '_session_id', 'default'),
+                cwd=os.getcwd(),
+                event_name=HookEvent.BEFORE_AGENT,
+                timestamp=str(time.time()),
+                agent_name=self.name,
+                prompt=prompt if isinstance(prompt, str) else str(prompt),
+                conversation_history=self.chat_history,
+                tools_available=[t.__name__ if hasattr(t, '__name__') else str(t) for t in self.tools]
+            ))
+            if self._hook_runner.is_blocked(hook_results):
+                logging.warning(f"Agent {self.name} execution blocked by BEFORE_AGENT hook")
+                return
+            for res in hook_results:
+                if res.output and res.output.modified_input and "prompt" in res.output.modified_input:
+                    prompt = res.output.modified_input["prompt"]
+
         durable_context = None
         durable_token = None
         try:
@@ -4763,6 +5376,10 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                 "applied to streamed responses (iter_stream / stream=True). "
                 "Use chat() for guardrail-validated output."
             )
+        # Input-side guardrail validation is performed by _start_stream (before
+        # begin_durable_run), so the prompt reaching this generator is already
+        # validated/transformed. Kept out of this impl so a blocked prompt never
+        # opens a durable run that would then finalize as "succeeded".
         try:
             # Reset the final display flag for each new conversation
             self._final_display_shown = False
@@ -4770,8 +5387,22 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
             # Temporarily disable verbose mode to prevent console output conflicts during streaming
             original_verbose = self.verbose
             self.verbose = False
+            # Initialize persistence so streamed turns reach the session store
+            # incrementally (Issue #5407). chat()/achat() do this already; the
+            # streaming path previously skipped it, so an interrupted stream
+            # persisted nothing at all.
+            self._init_db_session()
+            self._init_session_store()
             memory_prefetch_context = self._prefetch_memory(prompt)
-            
+
+            # Ephemeral attachments (images / data URIs) are folded into a
+            # multimodal prompt so streaming turns reach vision models too,
+            # matching chat()/achat(). The text prompt is kept intact through
+            # knowledge retrieval below and the multimodal content is built
+            # afterwards, so knowledge augmentation never flattens the image.
+            # Only the text is stored in history.
+            attachments = kwargs.get('attachments')
+
             # For custom LLM path, use the new get_response_stream generator
             if self._using_custom_llm:
                 # Handle knowledge search
@@ -4780,13 +5411,15 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                     self._ensure_knowledge_processed()
                 
                 if self.knowledge:
-                    search_results = self.knowledge.search(prompt, agent_id=self.agent_id)
-                    if search_results:
-                        if isinstance(search_results, dict) and 'results' in search_results:
-                            knowledge_content = "\n".join([result['memory'] for result in search_results['results']])
-                        else:
-                            knowledge_content = "\n".join(search_results)
-                        actual_prompt = f"{prompt}\n\nKnowledge: {knowledge_content}"
+                    knowledge_context, _ = self._get_knowledge_context(
+                        prompt if isinstance(prompt, str) else str(prompt),
+                        use_rag=True
+                    )
+                    if knowledge_context:
+                        actual_prompt = f"{prompt}\n\nKnowledge: {knowledge_context}"
+
+                if attachments:
+                    actual_prompt = self._build_multimodal_prompt(actual_prompt, attachments)
                 
                 # Handle tools properly
                 tools = kwargs.get('tools', self.tools)
@@ -4823,22 +5456,67 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                         self.chat_history[-1].get("role") == "user" and 
                         self.chat_history[-1].get("content") == normalized_content):
                     self._append_to_chat_history({"role": "user", "content": normalized_content})
+                    # Persist the user turn so a recovered partial assistant turn
+                    # is paired with its prompt on resume (Issue #5407).
+                    self._persist_message("user", normalized_content)
                 
                 try:
                     # Use the new streaming generator from LLM class
                     response_content = ""
-                    stream_history = self.chat_history
+                    # Compact before sending, exactly as the OpenAI-client
+                    # branch below does. #4729 added compaction to that branch
+                    # only, so a configured ContextManager -- auto-enabled
+                    # whenever tools are present -- was still skipped for every
+                    # agent routed through the custom-LLM path. The trigger is
+                    # the routing flag, not the vendor: llm="openai/gpt-4o-mini"
+                    # takes this branch too. Zero overhead when context=False.
+                    stream_system_prompt = self._build_system_prompt(
+                        tool_param,
+                        memory_prefetch_context=memory_prefetch_context,
+                    )
+                    if self.context_manager:
+                        stream_history, _ = self._apply_context_management(
+                            messages=self.chat_history,
+                            system_prompt=stream_system_prompt or "",
+                            tools=tool_param,
+                        )
+                        stream_history = list(stream_history)
+                    else:
+                        stream_history = self.chat_history
                     durable_context = self._get_durable_run_context()
                     if durable_context is not None:
                         stream_history = durable_context.restore_messages(
                             list(stream_history)
                         )
+                    stream_sampling_kwargs = {}
+                    if kwargs.get('max_tokens') is not None:
+                        stream_sampling_kwargs['max_tokens'] = kwargs['max_tokens']
+                    if kwargs.get('top_p') is not None:
+                        stream_sampling_kwargs['top_p'] = kwargs['top_p']
+                    # reasoning_effort travelled the same route as max_tokens
+                    # and top_p -- collected by the caller, forwarded into
+                    # start(), and then dropped, because this enumeration never
+                    # listed it. llm.py already consumes it from here.
+                    _stream_effort = kwargs.get(
+                        'reasoning_effort', getattr(self, 'reasoning_effort', None))
+                    if _stream_effort is not None:
+                        stream_sampling_kwargs['reasoning_effort'] = _stream_effort
+                    # Forward the cancellation token so a Stop/interrupt during
+                    # the streamed tool phase short-circuits pending tool calls
+                    # (Issue #5073). Resolve the explicit token first, then fall
+                    # back to the agent's interrupt controller, mirroring chat().
+                    _stream_cancel_source = kwargs.get('cancel_token')
+                    if _stream_cancel_source is None:
+                        _stream_cancel_source = getattr(self, "interrupt_controller", None)
+                    _stream_cancel_token = self._turn_cancel_token(
+                        _stream_cancel_source,
+                        explicit=kwargs.get('cancel_token') is not None,
+                    )
+                    if _stream_cancel_token is not None:
+                        stream_sampling_kwargs['cancel_token'] = _stream_cancel_token
                     for chunk in self.llm_instance.get_response_stream(
                         prompt=actual_prompt,
-                        system_prompt=self._build_system_prompt(
-                            tool_param,
-                            memory_prefetch_context=memory_prefetch_context,
-                        ),
+                        system_prompt=stream_system_prompt,
                         chat_history=stream_history,
                         temperature=kwargs.get('temperature', 1.0),
                         tools=tool_param,
@@ -4856,15 +5534,27 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                             self.execute_tool
                         ),
                         parallel_tool_calls=getattr(getattr(self, "execution", None), "parallel_tool_calls", False),
-                        max_tool_calls_per_turn=self._resolve_max_tool_calls()
+                        max_tool_calls_per_turn=self._resolve_max_tool_calls(),
+                        **stream_sampling_kwargs
                     ):
                         response_content += chunk
+                        # Flush the growing partial turn so an interrupt mid
+                        # stream retains it in the store (Issue #5407, debounced).
+                        self._persist_assistant_delta(response_content)
                         yield chunk
-                    
+
                     # Add complete response to chat history
                     if response_content:
                         self._append_to_chat_history({"role": "assistant", "content": response_content})
-                        
+                    # Finalize the streamed turn (promotes the partial record or
+                    # falls back to a single terminal write).
+                    self._finalize_assistant_turn(response_content)
+
+                except GeneratorExit:
+                    # Consumer stopped iterating (e.g. Ctrl-C). Keep whatever
+                    # was produced so --continue can recover it (Issue #5407).
+                    self._persist_assistant_delta(response_content, force=True)
+                    raise
                 except ToolExecutionError:
                     self._rollback_chat_history_to(chat_history_length)
                     raise
@@ -4882,13 +5572,15 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                     self._ensure_knowledge_processed()
                 
                 if self.knowledge:
-                    search_results = self.knowledge.search(prompt, agent_id=self.agent_id)
-                    if search_results:
-                        if isinstance(search_results, dict) and 'results' in search_results:
-                            knowledge_content = "\n".join([result['memory'] for result in search_results['results']])
-                        else:
-                            knowledge_content = "\n".join(search_results)
-                        actual_prompt = f"{prompt}\n\nKnowledge: {knowledge_content}"
+                    knowledge_context, _ = self._get_knowledge_context(
+                        prompt if isinstance(prompt, str) else str(prompt),
+                        use_rag=True
+                    )
+                    if knowledge_context:
+                        actual_prompt = f"{prompt}\n\nKnowledge: {knowledge_context}"
+
+                if attachments:
+                    actual_prompt = self._build_multimodal_prompt(actual_prompt, attachments)
                 
                 # Handle tools properly
                 tools = kwargs.get('tools', self.tools)
@@ -4901,6 +5593,27 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                 messages, original_prompt = self._build_messages(actual_prompt, kwargs.get('temperature', 1.0), 
                                                                kwargs.get('output_json'), kwargs.get('output_pydantic'),
                                                                memory_prefetch_context=memory_prefetch_context)
+                
+                # Apply context management so the streaming path compacts long
+                # histories the same way the non-streaming path does (Issue #4714).
+                # The system prompt is embedded as messages[0]; split it out so the
+                # token ledger accounts for it, then reattach after optimization.
+                if self.context_manager and messages:
+                    if messages[0].get("role") == "system":
+                        stream_system_prompt = messages[0].get("content", "")
+                        optimized_history, _ = self._apply_context_management(
+                            messages=messages[1:],
+                            system_prompt=stream_system_prompt,
+                            tools=tool_param,
+                        )
+                        messages = [messages[0]] + list(optimized_history)
+                    else:
+                        optimized_history, _ = self._apply_context_management(
+                            messages=messages,
+                            system_prompt="",
+                            tools=tool_param,
+                        )
+                        messages = list(optimized_history)
                 
                 # Store chat history length for potential rollback
                 chat_history_length = len(self.chat_history)
@@ -4915,6 +5628,9 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                         self.chat_history[-1].get("role") == "user" and 
                         self.chat_history[-1].get("content") == normalized_content):
                     self._append_to_chat_history({"role": "user", "content": normalized_content})
+                    # Persist the user turn so a recovered partial assistant turn
+                    # is paired with its prompt on resume (Issue #5407).
+                    self._persist_message("user", normalized_content)
                 
                 try:
                     # Check if OpenAI client is available
@@ -4931,6 +5647,37 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                         "temperature": kwargs.get('temperature', 1.0),
                         "stream": True
                     }
+                    if kwargs.get('max_tokens') is not None:
+                        completion_args["max_tokens"] = kwargs['max_tokens']
+                    if kwargs.get('top_p') is not None:
+                        completion_args["top_p"] = kwargs['top_p']
+                    # Native reasoning control. resolve_reasoning_params returns
+                    # {} for "off", for an unset level, and for a model with no
+                    # reasoning knob, so the default stays a no-op; a reasoning
+                    # model gets reasoning_effort and Anthropic/Gemini get their
+                    # thinking budget. completion_args is copied into
+                    # followup_args below, so tool follow-ups inherit it.
+                    _effort = kwargs.get(
+                        'reasoning_effort', getattr(self, 'reasoning_effort', None))
+                    if _effort is not None:
+                        try:
+                            from ..thinking.effort import resolve_reasoning_params
+                            _reasoning = resolve_reasoning_params(_effort, self.llm)
+                            for _key, _value in _reasoning.items():
+                                # ``reasoning_effort`` is a native OpenAI SDK
+                                # keyword; anything else (e.g. an extended-thinking
+                                # ``thinking`` budget for an Anthropic/Gemini-named
+                                # model reached over an OpenAI-compatible endpoint)
+                                # is a provider-specific body field the OpenAI SDK
+                                # rejects as a top-level kwarg, so route it through
+                                # ``extra_body`` instead of raising TypeError.
+                                if _key == "reasoning_effort":
+                                    completion_args[_key] = _value
+                                else:
+                                    completion_args.setdefault(
+                                        "extra_body", {})[_key] = _value
+                        except ImportError:
+                            pass
                     if formatted_tools:
                         completion_args["tools"] = formatted_tools
                     
@@ -4959,6 +5706,13 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                     tool_calls_data = []
                     first_token_emitted = False
                     last_content_time = None
+                    # Track the text of the phase currently streaming so a
+                    # GeneratorExit (consumer Ctrl-C) recovers *that* phase's
+                    # answer. Before tools this is response_text; after tools it
+                    # becomes the post-tool follow-up answer. Without this the
+                    # interrupt handler would force a stale (usually empty)
+                    # pre-tool response_text over the real answer (Issue #5407).
+                    active_stream = {"text": "", "after_tools": False}
                     
                     for chunk in completion:
                         delta = chunk.choices[0].delta
@@ -4985,6 +5739,11 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                     content=chunk_content
                                 ))
                             
+                            # Flush the growing partial turn so an interrupt
+                            # mid stream retains it in the store (Issue #5407,
+                            # debounced).
+                            active_stream["text"] = response_text
+                            self._persist_assistant_delta(response_text)
                             yield chunk_content
                         
                         # Handle tool calls (accumulate but don't yield as chunks)
@@ -5020,6 +5779,16 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                         # append exactly the assistant tool-call and tool-result
                         # messages onto the original request context below.
                         tool_turn_start = len(self.chat_history)
+                        # Drop any partial record for this turn before writing
+                        # the authoritative tool-call assistant turn below so the
+                        # store never keeps a stale partial (Issue #5407).
+                        self._discard_partial_assistant_turn()
+                        # From here the post-tool answer is the recoverable
+                        # phase; reset the interrupt tracker so a Ctrl-C during
+                        # the follow-up persists that answer, not the pre-tool
+                        # text we just discarded (Issue #5407).
+                        active_stream["after_tools"] = True
+                        active_stream["text"] = ""
                         # Add assistant message with tool calls to chat history
                         assistant_message = {"role": "assistant", "content": response_text}
                         if tool_calls_data:
@@ -5047,13 +5816,43 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                         for tool_call in tool_calls_data:
                             if tool_call['id'] and tool_call['function']['name']:
                                 try:
-                                    # Parse JSON arguments safely 
+                                    # Parse JSON arguments safely. A parse failure
+                                    # is NOT {}: a truncated/malformed argument
+                                    # string must not silently run the tool with
+                                    # defaults and report success. Surface a
+                                    # retryable tool-error to the model instead.
+                                    from .tool_execution import (
+                                        _TOOL_ARGUMENTS_PARSE_FAILED,
+                                        tool_arguments_parse_failed,
+                                        tool_parse_error_message,
+                                    )
                                     try:
                                         parsed_args = json.loads(tool_call['function']['arguments']) if tool_call['function']['arguments'] else {}
-                                    except json.JSONDecodeError as json_error:
+                                    except (json.JSONDecodeError, TypeError) as json_error:
+                                        # TypeError: a non-text argument value also
+                                        # cannot be parsed; treat it as malformed.
                                         logging.error(f"Failed to parse tool arguments as JSON: {json_error}")
-                                        parsed_args = {}
-                                    
+                                        parsed_args = _TOOL_ARGUMENTS_PARSE_FAILED
+                                    if tool_arguments_parse_failed(parsed_args):
+                                        self._notify_tool_call(
+                                            tool_call['function']['name'],
+                                            {},
+                                            None,
+                                            elapsed_time=0.0,
+                                            success=False,
+                                        )
+                                        _err_msg = tool_parse_error_message(
+                                            tool_call['function']['name'],
+                                            tool_call['id'],
+                                        )
+                                        self._append_to_chat_history(_err_msg)
+                                        self._persist_message(
+                                            "tool",
+                                            _err_msg["content"],
+                                            tool_call_id=tool_call['id'],
+                                        )
+                                        continue
+
                                     executor = self._durable_sync_tool_executor(
                                         self.execute_tool
                                     )
@@ -5066,11 +5865,34 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                         )
                                         else {}
                                     )
-                                    tool_result = executor(
+                                    _tool_started = time_module.perf_counter()
+                                    try:
+                                        tool_result = executor(
+                                            tool_call['function']['name'],
+                                            parsed_args,
+                                            tool_call_id=tool_call.get('id'),
+                                            **iteration_kwargs,
+                                        )
+                                    except Exception as _exec_error:
+                                        # Streaming UIs only learn about tool
+                                        # activity through this callback; report
+                                        # the failure before re-raising.
+                                        self._notify_tool_call(
+                                            tool_call['function']['name'],
+                                            parsed_args,
+                                            {"error": str(_exec_error)},
+                                            elapsed_time=time_module.perf_counter() - _tool_started,
+                                            success=False,
+                                        )
+                                        raise
+                                    # Parity with the non-streaming path, which
+                                    # fires 'tool_call' after every tool run.
+                                    self._notify_tool_call(
                                         tool_call['function']['name'],
                                         parsed_args,
-                                        tool_call_id=tool_call.get('id'),
-                                        **iteration_kwargs,
+                                        tool_result,
+                                        elapsed_time=time_module.perf_counter() - _tool_started,
+                                        success=True,
                                     )
                                     # Add tool result to chat history (multimodal-aware)
                                     from .tool_execution import build_tool_result_message_pair
@@ -5167,6 +5989,11 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                             if piece:
                                 followup_text += piece
                                 followup_last_content_time = time_module.perf_counter()
+                                # Flush the post-tool answer incrementally too so
+                                # an interrupt during the follow-up keeps it
+                                # (Issue #5407, debounced).
+                                active_stream["text"] = followup_text
+                                self._persist_assistant_delta(followup_text)
                                 yield piece
                         if followup_last_content_time:
                             self.stream_emitter.emit(StreamEvent(
@@ -5182,6 +6009,10 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                             self._append_to_chat_history(
                                 {"role": "assistant", "content": followup_text}
                             )
+                            # Finalize the post-tool answer so resume sees a
+                            # completed turn, not a dangling partial (Issue
+                            # #5407).
+                            self._finalize_assistant_turn(followup_text)
                         else:
                             # Tools ran and the model then said nothing. Simply
                             # returning here is indistinguishable from a model
@@ -5197,7 +6028,19 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                         # Add complete response to chat history (text-only response)
                         if response_text:
                             self._append_to_chat_history({"role": "assistant", "content": response_text})
-                        
+                        # Finalize the streamed turn in the store (Issue #5407).
+                        self._finalize_assistant_turn(response_text)
+
+                except GeneratorExit:
+                    # Consumer stopped iterating (e.g. Ctrl-C). Keep whatever
+                    # the *current* phase produced so --continue can recover it.
+                    # After a tool round the recoverable text is the post-tool
+                    # follow-up answer, not the pre-tool response_text that was
+                    # already discarded (Issue #5407).
+                    self._persist_assistant_delta(
+                        active_stream["text"], force=True
+                    )
+                    raise
                 except ToolExecutionError:
                     self._rollback_chat_history_to(chat_history_length)
                     raise
@@ -5206,7 +6049,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                     self._rollback_chat_history_to(chat_history_length)
                     logging.error(f"OpenAI streaming error: {e}")
                     # Fall back to simulated streaming
-                    response = self.chat(prompt, **kwargs)
+                    response = self._stream_fallback_chat(prompt, kwargs, e)
                     if response:
                         words = str(response).split()
                         chunk_size = max(1, len(words) // 20)
@@ -5226,11 +6069,99 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
         except Exception as e:
             # Restore verbose mode on any error
             self.verbose = original_verbose
+            if getattr(e, '_praisonai_stream_fallback_exhausted', False):
+                # The inner fallback already ran chat() and it failed too.
+                # Running it a second time would only bury the streaming
+                # error one level deeper; surface the chained failure as-is.
+                raise
             # Graceful fallback to non-streaming if streaming fails
             logging.warning(f"Streaming failed, falling back to regular response: {e}")
-            response = self.chat(prompt, **kwargs)
+            response = self._stream_fallback_chat(prompt, kwargs, e)
             if response:
                 yield response
+
+    def _stream_fallback_chat(self, prompt: str, kwargs: Dict[str, Any], streaming_error: BaseException) -> Optional[str]:
+        """Run the non-streaming ``chat()`` after a streaming attempt failed.
+
+        ``start(stream=True)`` hands ``_start_stream_impl`` the caller's raw
+        kwargs with ``stream=True`` already set. Forwarding them to ``chat()``
+        unchanged broke the fallback in two ways (#4719): ``stream=True``
+        reached the sync adapter, which refuses to stream; and any sampling
+        knob ``chat()`` does not declare (``max_tokens``, ``top_p``...) raised
+        ``TypeError`` before a request was made. The desktop passes
+        ``max_tokens`` on every turn, so its fallback never worked.
+
+        This builds the call from the subset of kwargs ``chat()`` actually
+        accepts (introspected, so subclass overrides are honoured), forces
+        ``stream=False``, and -- if the fallback fails as well -- raises that
+        failure chained ``from`` the original streaming exception so the real
+        cause is not lost.
+        """
+        import inspect
+
+        # Replay-safety gate (#3860): reissuing chat() after a streaming failure
+        # is still a provider replay. When the turn exposes tools and the
+        # streaming failure is replay-unsafe (a post-dispatch read timeout /
+        # connection reset, possibly wrapped by the LLM path as the cause of a
+        # generic error), a tool call may already have run server-side, so the
+        # turn must not be re-issued. Surface the original failure instead. A
+        # tool-less turn (or a pre-dispatch failure) keeps falling back.
+        request_tools = kwargs.get('tools')
+        instance_tools = getattr(self, 'tools', None)
+        side_effecting = bool(request_tools) or bool(instance_tools)
+        if side_effecting:
+            try:
+                from praisonaiagents.llm.error_classifier import is_replay_unsafe_chain
+            except Exception:  # noqa: BLE001 - never let classification break fallback
+                is_replay_unsafe_chain = None
+            if is_replay_unsafe_chain is not None and is_replay_unsafe_chain(streaming_error):
+                logging.warning(
+                    "Not falling back to non-streaming chat() on a tool turn: the "
+                    "streaming failure is replay-unsafe (post-dispatch); surfacing "
+                    "the original error to avoid re-executing the turn."
+                )
+                raise streaming_error
+
+        try:
+            parameters = inspect.signature(self.chat).parameters
+        except (TypeError, ValueError):
+            parameters = {}
+        accepts_var_kwargs = any(
+            p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values()
+        )
+        accepted = {
+            name for name, p in parameters.items()
+            if p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+        }
+        accepted.discard('prompt')
+
+        fallback_kwargs = {
+            key: value for key, value in kwargs.items()
+            if accepts_var_kwargs or key in accepted
+        }
+        dropped = sorted(set(kwargs) - set(fallback_kwargs))
+        if dropped:
+            logging.debug(
+                f"Streaming fallback: dropping kwargs chat() does not accept: {dropped}"
+            )
+        # The fallback is, by definition, the non-streaming path.
+        if accepts_var_kwargs or 'stream' in accepted:
+            fallback_kwargs['stream'] = False
+        else:
+            fallback_kwargs.pop('stream', None)
+
+        try:
+            return self.chat(prompt, **fallback_kwargs)
+        except Exception as fallback_error:
+            logging.error(
+                f"Streaming failed ({streaming_error!r}) and the non-streaming "
+                f"fallback also failed ({fallback_error!r})"
+            )
+            try:
+                fallback_error._praisonai_stream_fallback_exhausted = True
+            except Exception:
+                pass
+            raise fallback_error from streaming_error
 
     def _create_llm_summarize_function(self):
         """
@@ -5266,6 +6197,28 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
         
         return llm_summarize_async
 
+    def _resolve_compaction_max_tokens(self, execution_cfg):
+        """
+        Resolve the compaction trigger budget.
+
+        An explicit ``ExecutionConfig.max_context_tokens`` always wins. When it
+        is unset, size the trigger to the active model's context window (reusing
+        the model-aware ``budgeter`` the in-loop path already uses) instead of a
+        flat default, so large-context models are not compacted prematurely.
+        Falls back to a static default only for the offline / unknown-model case.
+        """
+        _explicit = getattr(execution_cfg, 'max_context_tokens', None)
+        if _explicit:
+            return _explicit
+        try:
+            from ..context.budgeter import get_model_limit, get_output_reserve
+            model_name = self.llm if isinstance(self.llm, str) else "gpt-4o-mini"
+            limit = get_model_limit(model_name)
+            reserve = get_output_reserve(model_name)
+            return max(1, int(limit * 0.8) - reserve)
+        except Exception:
+            return 8000
+
     def _apply_context_compaction(self, messages, hook_event_class):
         """
         Apply context compaction to messages if enabled (sync version).
@@ -5285,7 +6238,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
             from ..compaction import ContextCompactor
             from ..compaction.strategy import CompactionStrategy
             
-            _max_tok = getattr(_execution_cfg, 'max_context_tokens', None) or 8000
+            _max_tok = self._resolve_compaction_max_tokens(_execution_cfg)
             _strategy = getattr(_execution_cfg, 'compaction_strategy', None) or CompactionStrategy.TRUNCATE
             
             # Create LLM summarization function if strategy is LLM_SUMMARIZE
@@ -5317,17 +6270,20 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
             
             # Perform compaction
             if _strategy == CompactionStrategy.LLM_SUMMARIZE and _llm_fn:
-                import asyncio
-                try:
-                    # Run async compaction in event loop
-                    compacted_msgs, _cr = asyncio.run(_compactor.compact_async(messages))
-                except RuntimeError:
-                    # If already in async context, fall back to sync (naive) compaction
-                    logging.warning(
-                        f"[compaction] {self.name}: LLM_SUMMARIZE fell back to naive summarization "
-                        f"(asyncio.run not available in sync context)"
-                    )
-                    compacted_msgs, _cr = _compactor.compact(messages)
+                # Drive the async summariser through the shared bridge so it runs
+                # correctly whether or not a loop is already running (FastAPI /
+                # Jupyter / a bot handler). The previous code caught bare
+                # RuntimeError from ``asyncio.run`` ("event loop already
+                # running") and silently downgraded LLM summarisation to naive
+                # truncation whenever a loop was live; the bridge removes that
+                # spurious fallback so the real summariser always runs. Provider
+                # errors inside the summariser remain best-effort (see
+                # ``_llm_summarize_async``, which falls back to a naive summary on
+                # failure) — compaction never hard-fails the turn.
+                from ..utils.async_bridge import run_coroutine_from_any_context
+                compacted_msgs, _cr = run_coroutine_from_any_context(
+                    _compactor.compact_async(messages)
+                )
             else:
                 compacted_msgs, _cr = _compactor.compact(messages)
             
@@ -5372,7 +6328,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
             from ..compaction import ContextCompactor
             from ..compaction.strategy import CompactionStrategy
             
-            _max_tok = getattr(_execution_cfg, 'max_context_tokens', None) or 8000
+            _max_tok = self._resolve_compaction_max_tokens(_execution_cfg)
             _strategy = getattr(_execution_cfg, 'compaction_strategy', None) or CompactionStrategy.TRUNCATE
             
             # Create LLM summarization function if strategy is LLM_SUMMARIZE
@@ -5737,6 +6693,13 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
 
     async def _achat_completion_with_retry_core(self, messages, temperature=None, tools=None, stream=None, reasoning_steps=False, task_name=None, task_description=None, task_id=None, response_format=None, stream_callback=None, emit_events=True):
         """Async retry/backoff core for chat completion (middleware-agnostic)."""
+        # Reset the agent-level finish-reason classification at the start of each
+        # async OpenAI-native turn, mirroring the sync ``_chat_completion`` reset,
+        # so a provider block/refusal recorded on a previous run (see
+        # ``_extract_llm_response_content``) never leaks into this one. The LiteLLM
+        # path resets its own backend flag independently.
+        self._last_stop_reason = "completed"
+
         retry_config = getattr(self, '_retry_config', None)
         if not retry_config:
             return await self._execute_unified_achat_completion(

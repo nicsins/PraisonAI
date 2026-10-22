@@ -30,6 +30,7 @@ Usage::
 from __future__ import annotations
 
 import asyncio
+import copy
 import inspect
 import logging
 import math
@@ -95,6 +96,22 @@ class JobResult:
     delivered: bool = False
     delivery_error: Optional[str] = None
     audit_path: Optional[str] = None
+
+
+@dataclass
+class _IncidentRecord:
+    """Minimal ``RunRecord``-shaped view fed to the core ``IncidentTracker``.
+
+    The tracker reads only ``status``/``error``/``job_id``/``job_name``/
+    ``timestamp`` (via ``getattr``); this adapts a :class:`JobResult` + job to
+    that shape without depending on the core ``RunRecord`` model.
+    """
+
+    status: str
+    error: Optional[str]
+    job_id: str
+    job_name: str
+    timestamp: float
 
 
 class ScheduledAgentExecutor:
@@ -194,6 +211,10 @@ class ScheduledAgentExecutor:
 
         for job in due_jobs:
             try:
+                # ``_execute_one`` observes recovery on success and latches
+                # failures internally — the shared choke point for every caller
+                # (tick, CLI poller, host bridge), so recovery is not duplicated
+                # or skipped depending on entry path.
                 result = await self._execute_one(job)
             finally:
                 if atomic_claim:
@@ -248,6 +269,26 @@ class ScheduledAgentExecutor:
     # ── internals ────────────────────────────────────────────────────
 
     async def _execute_one(self, job: "ScheduleJob") -> JobResult:
+        """Execute a single job, observe recovery, and return the result.
+
+        This is the one choke point every production run flows through —
+        ``tick()``, the CLI poller (``schedule.py``), and the host integration
+        (``schedules_runner.py``) all call it. Recovery observation lives here
+        (not in ``tick()``) so a success through any path closes an open
+        incident and emits a single recovery note. Failures are latched inside
+        the inner run via ``_maybe_deliver_failure``.
+        """
+        result = await self._execute_one_inner(job)
+        if getattr(result, "status", None) == "succeeded":
+            try:
+                await self._maybe_deliver_recovery(job, result)
+            except Exception as e:  # pragma: no cover - defensive
+                logger.warning(
+                    "Recovery observation failed for job '%s': %s", job.id, e,
+                )
+        return result
+
+    async def _execute_one_inner(self, job: "ScheduleJob") -> JobResult:
         """Execute a single job and return the result."""
         started = time.time()
 
@@ -526,6 +567,11 @@ class ScheduledAgentExecutor:
             logger.warning("Job '%s' execution failed: %s", job.id, e)
             err = str(e)
             duration = time.time() - started
+            # Provider-quota hold: a 429 / quota failure parks the job past the
+            # provider's own reset window so it stops re-firing and re-failing
+            # every tick against a benched provider. ``e`` (not ``err``) is
+            # passed so the classifier can read the response headers.
+            held_until = self._maybe_hold_on_rate_limit(job, e)
             self._runner.mark_run(job, status="failed", error=err, duration=duration)
             if self._on_failure:
                 self._on_failure(job, err)
@@ -533,11 +579,19 @@ class ScheduledAgentExecutor:
                 job=job, status="failed", error=err, duration=duration,
             )
             await asyncio.to_thread(self._audit_output, job, failed)
-            await self._maybe_deliver_failure(job, failed)
+            if held_until is not None:
+                await self._maybe_deliver_hold(job, failed, held_until)
+            else:
+                await self._maybe_deliver_failure(job, failed)
             return failed
         finally:
             if _restore_tools is not None:
                 _restore_tools()
+
+        # The turn reached the model and returned — clear any prior quota hold
+        # (proof the provider's window reopened), fingerprinted so a stale error
+        # can't keep the job parked.
+        self._clear_quota_hold(job)
 
         # Success - calculate duration before delivery
         duration = time.time() - started
@@ -807,7 +861,7 @@ class ScheduledAgentExecutor:
         delivery = getattr(job, "delivery", None)
         if succeeded and text and not silent and delivery and self._can_deliver(delivery):
             try:
-                delivered = await self._dispatch_delivery(delivery, text)
+                delivered = await self._dispatch_delivery(delivery, text, authored_by="external")
                 if delivered:
                     logger.info(
                         "Delivered backend job '%s' output to %s:%s",
@@ -829,6 +883,15 @@ class ScheduledAgentExecutor:
 
         if succeeded and pending_state_updates:
             self._persist_job_state(job, prior_state, pending_state_updates)
+
+        # Provider-quota hold: a backend turn that reached the model reopens the
+        # window (clear any prior hold); a 429/quota error parks the job past
+        # the provider's reset window like the native-agent path.
+        held_until: Optional[float] = None
+        if succeeded:
+            self._clear_quota_hold(job)
+        else:
+            held_until = self._maybe_hold_on_rate_limit(job, Exception(str(error)))
 
         status = "succeeded" if succeeded else "failed"
         self._runner.mark_run(
@@ -855,7 +918,10 @@ class ScheduledAgentExecutor:
         )
         await asyncio.to_thread(self._audit_output, job, result)
         if not succeeded:
-            await self._maybe_deliver_failure(job, result)
+            if held_until is not None:
+                await self._maybe_deliver_hold(job, result, held_until)
+            else:
+                await self._maybe_deliver_failure(job, result)
         return result
 
     async def _execute_command(
@@ -904,7 +970,7 @@ class ScheduledAgentExecutor:
         delivery = getattr(job, "delivery", None)
         if text and delivery and self._can_deliver(delivery):
             try:
-                delivered = await self._dispatch_delivery(delivery, text)
+                delivered = await self._dispatch_delivery(delivery, text, authored_by="external")
                 if delivered:
                     logger.info(
                         "Delivered command job '%s' output to %s:%s",
@@ -1324,6 +1390,118 @@ class ScheduledAgentExecutor:
 
         return None, _restore
 
+    # ── provider-quota hold helpers ──────────────────────────────────
+
+    def _maybe_hold_on_rate_limit(
+        self, job: "ScheduleJob", error: Exception,
+    ) -> Optional[float]:
+        """Park ``job`` past a provider's rate-limit window on a 429/quota fail.
+
+        Returns the epoch the job is parked until when a hold was applied, else
+        ``None`` (non-quota failure, no usable reset window, or policy disabled).
+        The decision is the core pure helper ``quota_hold_from_failure`` — the
+        reschedule contract lives next to ``is_due``; here we only apply it to
+        the in-memory job so the subsequent ``mark_run`` persists it. The parked
+        instant coalesces intervening fires: ``is_due`` returns ``False`` until
+        it elapses, so the job stops re-firing and re-failing every tick.
+        """
+        policy = self._run_policy
+        if policy is None or not getattr(policy, "hold_on_rate_limit", False):
+            return None
+        try:
+            from praisonaiagents.scheduler import quota_hold_from_failure
+        except Exception:  # pragma: no cover - core primitive always present
+            return None
+        slack = getattr(policy, "hold_slack_seconds", 60.0)
+        hold_until = quota_hold_from_failure(error, time.time(), slack)
+        if hold_until is None:
+            return None
+        # Coalesce: never shorten an existing (later) hold. A fingerprint of the
+        # schedule ties the hold to the job's current cadence so a stale error
+        # cannot keep re-parking a job whose schedule changed underneath it.
+        prior = getattr(job, "hold_until", None)
+        if isinstance(prior, (int, float)) and prior > hold_until:
+            hold_until = prior
+        try:
+            job.hold_until = hold_until
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning("Could not set quota hold for job '%s': %s", job.id, e)
+            return None
+        logger.info(
+            "Job '%s' held until %.0f after provider rate-limit", job.id, hold_until,
+        )
+        return hold_until
+
+    @staticmethod
+    def _clear_quota_hold(job: "ScheduleJob") -> None:
+        """Clear a prior quota hold once a run reaches the model.
+
+        A completed model turn is proof the provider's window reopened, so the
+        park is lifted; the subsequent ``mark_run`` persists the cleared field.
+        No-op when the job was never parked.
+        """
+        if getattr(job, "hold_until", None) is not None:
+            try:
+                job.hold_until = None
+            except Exception:  # pragma: no cover - defensive
+                pass
+
+    async def _maybe_deliver_hold(
+        self, job: "ScheduleJob", result: JobResult, held_until: float,
+    ) -> None:
+        """Emit one "held until N" notice for a parked job via the incident path.
+
+        Reuses the same de-duplicating incident/alert plumbing as
+        :meth:`_maybe_deliver_failure` so a benched provider produces a single
+        notice, not one alert per skipped tick. Falls back to nothing extra when
+        failure delivery is disabled — the hold itself still applies.
+        """
+        if self._run_policy is None or not self._run_policy.deliver_on_failure:
+            return
+        delivery = getattr(job, "delivery", None)
+        if not delivery or not self._can_deliver(delivery):
+            return
+        # A hold is a distinct operational state (the job is now silenced for a
+        # whole provider-reset window) and is emitted at most once per window:
+        # ``is_due`` coalesces intervening fires, so this method only runs on the
+        # tick that *newly* parks the job. It must therefore NOT be gated on the
+        # failure ``alert_after_failures`` threshold — otherwise a job configured
+        # to alert only after N failures would park silently and the operator
+        # would never learn it was held (greptile #3). We still fold the failure
+        # through the incident tracker so failure/recovery accounting stays
+        # consistent, but deliver the hold notice regardless of its alert state.
+        pending: Optional[Dict[str, Any]] = None
+        observed = self._observe_incident(job, result)
+        if observed is not None:
+            _incident, pending = observed
+        try:
+            when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(held_until))
+        except Exception:  # pragma: no cover - defensive
+            when = str(held_until)
+        summary = (
+            f"⏸️ Scheduled job '{getattr(job, 'name', job.id)}' held until "
+            f"{when} (provider rate-limited): {result.error or 'quota exceeded'}"
+        )
+        try:
+            if await self._dispatch_delivery(delivery, summary, authored_by="external"):
+                result.delivered = True
+                self._commit_incident(job, pending)
+                logger.info("Delivered hold notice for job '%s'", job.id)
+            else:
+                result.delivery_error = (
+                    f"hold-notice delivery to {delivery.channel}:"
+                    f"{delivery.channel_id} did not complete"
+                )
+                logger.warning(
+                    "Hold-notice delivery did not complete for job '%s'; "
+                    "leaving incident un-alerted to retry", job.id,
+                )
+        except Exception as e:  # pragma: no cover - defensive
+            result.delivery_error = str(e)
+            logger.warning(
+                "Hold-notice delivery failed for job '%s': %s", job.id, e,
+            )
+
     # ── run-policy helpers ───────────────────────────────────────────
 
     def _assemble_scan_target(self, agent: Any, message: str) -> str:
@@ -1433,7 +1611,7 @@ class ScheduledAgentExecutor:
         return delivery is not None
 
     async def _dispatch_delivery(
-        self, delivery: "DeliveryTarget", text: str,
+        self, delivery: "DeliveryTarget", text: str, authored_by: str = "agent",
     ) -> bool:
         """Deliver ``text`` to ``delivery``, preferring the live adapter.
 
@@ -1451,9 +1629,20 @@ class ScheduledAgentExecutor:
         ``delivered``; a handler that returns ``None`` is treated as delivered,
         preserving the prior behaviour of adapters that report success by not
         raising.
+
+        ``authored_by`` (#5928) is ``"external"`` for non-agent text (command
+        stdout, backend output, system notices) so a session-seeding handler
+        mirrors it honestly; it is only forwarded to handlers that accept it.
         """
         if self._deliver is not None:
-            result = self._deliver(delivery, text)
+            kwargs = {}
+            if authored_by != "agent":
+                try:
+                    if "authored_by" in inspect.signature(self._deliver).parameters:
+                        kwargs["authored_by"] = authored_by
+                except (TypeError, ValueError):  # pragma: no cover - builtins
+                    pass
+            result = self._deliver(delivery, text, **kwargs)
             if inspect.isawaitable(result):
                 result = await result
             return result is not False
@@ -1468,6 +1657,160 @@ class ScheduledAgentExecutor:
         result = await sender(delivery, text)
         return result is not False
 
+    def _incident_tracker(self) -> Optional[Any]:
+        """Lazily build the shared core incident brain from the run policy.
+
+        Returns ``None`` when there is no policy — the stateless behaviour of
+        today. The tracker holds no per-job state itself (that round-trips
+        through the existing :class:`JobStateStoreProtocol`), so one instance
+        per executor is reused across all jobs.
+        """
+        if self._run_policy is None:
+            return None
+        tracker = getattr(self, "_incident_tracker_obj", None)
+        if tracker is None:
+            from praisonaiagents.scheduler import IncidentTracker
+
+            after = getattr(self._run_policy, "alert_after_failures", 1)
+            tracker = IncidentTracker(after_failures=after)
+            self._incident_tracker_obj = tracker
+        return tracker
+
+    def _observe_incident(
+        self, job: "ScheduleJob", result: JobResult,
+    ) -> Optional[Tuple[Optional[Any], Optional[Dict[str, Any]]]]:
+        """Fold one run outcome into the job's incident state via the tracker.
+
+        Loads the per-job incident scratchpad from the existing state store,
+        feeds a lightweight record (``status``/``error``/``job_id``/
+        ``job_name``/``timestamp``) to the core :class:`IncidentTracker`, and
+        computes the post-observation scratchpad **without persisting it**.
+
+        Returns ``(incident, pending_state)`` where ``incident`` is the
+        :class:`Incident` when an operator alert (or recovery note) is due
+        (else ``None``), and ``pending_state`` is the full scratchpad to write
+        once delivery is confirmed (``None`` when nothing changed or a one-shot
+        job is already gone). The caller commits via :meth:`_commit_incident`
+        **after** a successful delivery so a failed send does not consume the
+        alert/recovery and permanently suppress later retries.
+
+        Returns ``None`` (the tuple, not a value) when there is no policy or no
+        state store — the tracker needs durable state to latch, so without it we
+        fall back to the prior stateless behaviour (the caller delivers as
+        before).
+        """
+        store = self._state_store()
+        tracker = self._incident_tracker()
+        if tracker is None or store is None:
+            return None
+        prior = self._get_job_state(job)
+        # The tracker mutates the ``incident``/``consecutive`` keys of the dict
+        # passed in (including the nested ``incident`` sub-dict) — deep-copy them
+        # so observation is side-effect-free until :meth:`_commit_incident`
+        # actually persists. A store that returns aliased nested dicts (or an
+        # in-memory fake) must not see the ``resolved``/``alerted`` transition
+        # before delivery is confirmed, otherwise a failed send is silently
+        # consumed. ``copy.deepcopy`` keeps the round-trip through the same
+        # per-job scratchpad without disturbing any agent/gate watermark.
+        state = {
+            k: copy.deepcopy(prior[k])
+            for k in ("incident", "consecutive")
+            if k in prior
+        }
+        record = _IncidentRecord(
+            status=result.status,
+            error=result.error,
+            job_id=getattr(job, "id", "") or "",
+            job_name=getattr(job, "name", "") or "",
+            timestamp=time.time(),
+        )
+        try:
+            incident = tracker.observe(record, state)
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning("Incident tracking failed for job '%s': %s", job.id, e)
+            return None
+        # Rebuild the would-be scratchpad from prior, replacing the incident
+        # keys with the tracker's post-observation view (``incident`` may have
+        # been popped on a recovery, so drop it when absent). One-shot jobs are
+        # already gone from the store, so there is nothing to persist for them.
+        if getattr(job, "delete_after_run", False):
+            return incident, None
+        merged = {k: v for k, v in prior.items() if k not in ("incident", "consecutive")}
+        merged.update(state)
+        pending = merged if merged != prior else None
+        return incident, pending
+
+    def _commit_incident(
+        self, job: "ScheduleJob", pending_state: Optional[Dict[str, Any]],
+    ) -> None:
+        """Persist a pending incident scratchpad computed by :meth:`_observe_incident`.
+
+        Re-reads the current scratchpad and re-applies only the incident keys so
+        a concurrent tick that updated an unrelated watermark is not clobbered
+        by a stale snapshot. No-op when there is nothing to write.
+        """
+        if not pending_state:
+            return
+        store = self._state_store()
+        if store is None:  # pragma: no cover - defensive
+            return
+        current = self._get_job_state(job)
+        merged = {k: v for k, v in current.items() if k not in ("incident", "consecutive")}
+        for key in ("incident", "consecutive"):
+            if key in pending_state:
+                merged[key] = pending_state[key]
+        if merged == current:
+            return
+        try:
+            store.set_state(job.id, merged)
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning(
+                "Could not persist incident state for job '%s': %s",
+                job.id, e,
+            )
+
+    async def _maybe_deliver_recovery(
+        self, job: "ScheduleJob", result: JobResult,
+    ) -> None:
+        """On a success that closes an open incident, send one recovery note.
+
+        No-op unless failure delivery is enabled (the recovery note is the
+        mirror of the failure alert). The incident transition is committed to
+        durable state **only after** the recovery note is delivered, so a failed
+        send leaves the incident alerted and a later success retries the note.
+        """
+        if self._run_policy is None or not self._run_policy.deliver_on_failure:
+            return
+        observed = self._observe_incident(job, result)
+        if observed is None:
+            return
+        incident, pending = observed
+        if incident is None or getattr(incident, "state", None) != "resolved":
+            # A plain success with no open incident: commit the cleared
+            # ``consecutive`` counter (delivery-independent) and stop.
+            self._commit_incident(job, pending)
+            return
+        delivery = getattr(job, "delivery", None)
+        if not delivery or not self._can_deliver(delivery):
+            # No channel to notify: still commit the resolution so the incident
+            # does not stay latched forever with no way to close it.
+            self._commit_incident(job, pending)
+            return
+        summary = f"✅ Scheduled job '{getattr(job, 'name', job.id)}' recovered."
+        try:
+            if await self._dispatch_delivery(delivery, summary, authored_by="external"):
+                self._commit_incident(job, pending)
+                logger.info("Delivered recovery note for job '%s'", job.id)
+            else:
+                logger.warning(
+                    "Recovery-note delivery did not complete for job '%s'; "
+                    "leaving incident open to retry", job.id,
+                )
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning(
+                "Recovery-note delivery failed for job '%s': %s", job.id, e,
+            )
+
     async def _maybe_deliver_failure(
         self, job: "ScheduleJob", result: JobResult,
     ) -> None:
@@ -1478,19 +1821,45 @@ class ScheduledAgentExecutor:
         is marked ``delivered`` (the payload arrived, so run history and
         delivery monitoring stay accurate); a non-arriving summary records a
         ``delivery_error`` separately from the execution ``error``.
+
+        The failure is folded through the core :class:`IncidentTracker` (when a
+        state store is available): a distinct error alerts **once** and repeats
+        of the same error stay silent until it changes or recovers, so an
+        hourly job with an expired token no longer re-sends the identical
+        summary every tick (alert fatigue). Without a state store the tracker
+        cannot latch, so it falls back to the prior send-on-every-failure path.
+
+        The alerted transition is committed to durable state **only after** the
+        summary is delivered, so a failed send does not consume the alert and
+        permanently silence later identical failures — the next tick re-observes
+        and retries the alert.
         """
         if self._run_policy is None or not self._run_policy.deliver_on_failure:
             return
         delivery = getattr(job, "delivery", None)
         if not delivery or not self._can_deliver(delivery):
             return
+        # Latch through the incident brain when durable state is available;
+        # deliver only when a fresh alert is due. When no state store backs the
+        # executor, ``_observe_incident`` returns ``None`` and we fall through
+        # to the prior stateless send so failure alerting still works.
+        pending: Optional[Dict[str, Any]] = None
+        observed = self._observe_incident(job, result)
+        if observed is not None:
+            incident, pending = observed
+            if incident is None or getattr(incident, "state", None) != "alerted":
+                # Sub-threshold blip or already-alerted repeat: no alert due.
+                # Still commit the advanced counters so the threshold tracks.
+                self._commit_incident(job, pending)
+                return
         summary = (
             f"⚠️ Scheduled job '{getattr(job, 'name', job.id)}' failed: "
             f"{result.error or 'unknown error'}"
         )
         try:
-            if await self._dispatch_delivery(delivery, summary):
+            if await self._dispatch_delivery(delivery, summary, authored_by="external"):
                 result.delivered = True
+                self._commit_incident(job, pending)
                 logger.info("Delivered failure summary for job '%s'", job.id)
             else:
                 result.delivery_error = (
@@ -1498,8 +1867,8 @@ class ScheduledAgentExecutor:
                     f"{delivery.channel_id} did not complete"
                 )
                 logger.warning(
-                    "Failure-summary delivery did not complete for job '%s'",
-                    job.id,
+                    "Failure-summary delivery did not complete for job '%s'; "
+                    "leaving incident un-alerted to retry", job.id,
                 )
         except Exception as e:
             result.delivery_error = str(e)

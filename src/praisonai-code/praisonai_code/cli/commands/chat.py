@@ -162,12 +162,22 @@ def chat_main(
     """
     import os
 
+    _warn_about_unwired_options(ctx)
+
     # Ingest piped stdin so `chat` composes in Unix pipelines and CI, e.g.
     #   echo "$STACKTRACE" | praisonai chat "Explain this"
     # The prompt argument comes first, then the piped body. Non-blocking/EOF-safe
     # so the interactive TUI is never stalled.
     from praisonai_code.cli.utils.stdin import resolve_cli_input
     prompt = resolve_cli_input(prompt)
+
+    # --file/-f attachments appear in this command's own docstring examples
+    # (`praisonai chat "Summarize this" --file README.md`). Resolve them here,
+    # before the credential gate and the --profile branch return, so both the
+    # profiled and non-profiled single-prompt paths receive the attachment
+    # instead of silently dropping it.
+    from praisonai_code.cli.interactive.attachments import prepend_attachments
+    prompt = prepend_attachments(prompt, file)
 
     # --pure / --no-plugins: suppression is scoped by the @scopes_no_plugins
     # decorator, which sets PRAISONAI_NO_PLUGINS for the duration of this call
@@ -231,6 +241,11 @@ def chat_main(
             model=resolved_model,
             verbose=verbose,
             profile_deep=profile_deep,
+            # Honour --tools/--toolset in profiled single-prompt mode too, so the
+            # restriction is not silently dropped on this early-return path
+            # (#5140). Resolved through the same ToolResolver path as the TUI.
+            tools=tools,
+            toolset=toolset,
         )
         return
     
@@ -271,21 +286,66 @@ def chat_main(
     # a full interactive chat session with no `praisonai` wrapper required.
     from praisonai_code.cli.interactive.async_tui import AsyncTUI, AsyncTUIConfig
 
-    # `resolved_model` was resolved above (before the onboarding gate) so the
-    # gate validated the exact model dispatched here — no re-resolution needed.
+    # --continue resumes the most recent stored session. Resolved here rather
+    # than inside the TUI so an explicit --session always wins, and so an empty
+    # store degrades to a fresh session instead of an error. The TUI's own
+    # resume path (Issue #4910) then rehydrates the agent from this id.
+    # Prefer the project session index (the bare-TUI launch path) and fall back
+    # to the flat unified store so either recorded a session is honoured.
+    resolved_session_id = session_id
+    if resolved_session_id is None and continue_session:
+        try:
+            from praisonai_code.cli.state.project_sessions import find_last_session
+
+            resolved_session_id = find_last_session()
+        except Exception:  # noqa: BLE001 - continuity is best-effort
+            resolved_session_id = None
+        if resolved_session_id is None:
+            try:
+                from praisonai_code.cli.session import get_session_store
+
+                resolved_session_id = get_session_store().get_last_session_id()
+            except Exception:  # noqa: BLE001 - continuity is best-effort
+                resolved_session_id = None
+        if resolved_session_id is None:
+            typer.echo("No previous session to continue; starting a new one.", err=True)
+
     tui_config = AsyncTUIConfig(
         model=resolved_model,
         show_logo=not compact,
         show_status_bar=not compact,
-        session_id=session_id,
+        session_id=resolved_session_id,
+        resume=bool(resolved_session_id) and (continue_session or bool(session_id)),
         workspace=workspace,
         debug=debug,
         autonomy_mode=autonomy,
         no_rules=no_rules,
+        # --no-acp/--no-lsp were parsed and dropped, so there was no way to
+        # turn the ACP/LSP runtimes off from `chat` (`code` already passes
+        # these through to the same config).
+        enable_acp=not no_acp,
+        enable_lsp=not no_lsp,
+        # Consolidated capability options: thread the supplied flags onto the
+        # same Agent params `run`/YAML/Python use so interactive sessions honour
+        # them instead of dropping them (issue #4890). Unset flags stay None so
+        # the Agent's own default is preserved.
+        knowledge=knowledge,
+        guardrails=guardrails,
+        web=web,
+        reflection=reflection,
+        planning=planning,
+        context=context,
+        execution=execution,
+        caching=caching,
+        # --tools/--toolset restrict the interactive session's callable set via
+        # the same ToolResolver path `run`/YAML/Python use, so `chat --tools X`
+        # is a genuine restriction rather than a silently-dropped flag (#5140).
+        tools=tools,
+        toolset=toolset,
     )
     
     tui = AsyncTUI(config=tui_config)
-    
+
     if prompt:
         # Single prompt mode - direct response, no streaming
         response = tui.run_single(prompt)
@@ -305,6 +365,8 @@ def _run_profiled_chat(
     model: Optional[str] = None,
     verbose: bool = False,
     profile_deep: bool = False,
+    tools: Optional[str] = None,
+    toolset: Optional[str] = None,
 ):
     """Run chat with profiling enabled."""
     from praisonai_code.cli.features.cli_profiler import (
@@ -338,7 +400,22 @@ def _run_profiled_chat(
     }
     if model:
         agent_config["llm"] = model
-    
+
+    # Honour --tools/--toolset in profiled mode using the same resolver the TUI
+    # uses, so a restriction supplied with --profile is not silently dropped
+    # (#5140). Resolved through a throwaway AsyncTUIConfig to reuse one code path.
+    if tools or toolset:
+        from praisonai_code.cli.interactive.async_tui import (
+            AsyncTUIConfig,
+            _resolve_restricted_tools,
+        )
+
+        restricted = _resolve_restricted_tools(
+            AsyncTUIConfig(tools=tools, toolset=toolset)
+        )
+        if restricted is not None:
+            agent_config["tools"] = restricted
+
     agent = Agent(**agent_config)
     profiler.mark_init_end()
     
@@ -376,6 +453,57 @@ def _run_profiled_chat(
     # only a raised exception or a logged auth error (with no response) exits 1.
     if failed or (not response and log_capture.find_auth_error()):
         raise typer.Exit(1)
+
+
+# Options `chat` declares but never passes to the runtime. The high-value
+# capability options (--knowledge/--guardrails/--web/--reflection/--planning/
+# --context/--execution/--caching) are now threaded onto the AsyncTUIConfig and
+# reach the same Agent params `run`/YAML/Python use (issue #4890), and
+# --tools/--toolset now restrict the interactive session's callable set through
+# the same ToolResolver path `run`/YAML/Python use (issue #5140), so they are no
+# longer listed here. What remains is genuinely unwired: --hooks needs a hooks
+# loader that does not exist, --output needs a machine-readable interactive
+# transcript renderer the async TUI does not have, --user-id has no live
+# consumer while interactive memory itself is still unwired, and the
+# presentational options (--ui-backend, --no-color, --theme) are not honoured by
+# the async TUI renderer. Saying so is one line, and stops the CLI making a
+# promise it does not keep.
+# test_every_listed_option_really_is_unread pins this list against the body so it
+# cannot rot once an option is genuinely wired, and
+# test_every_dropped_option_really_is_listed pins the other direction.
+_UNWIRED_CHAT_OPTIONS = {
+    "hooks": "--hooks",
+    "ui_backend": "--ui-backend",
+    "no_color": "--no-color",
+    "theme": "--theme",
+    "user_id": "--user-id",
+    "output": "--output",
+}
+
+
+def _warn_about_unwired_options(ctx) -> None:
+    """Tell the user which supplied options this command will ignore.
+
+    Only complains about options actually supplied -- an untouched default is
+    not a broken promise. Uses click's parameter source, so a value that merely
+    equals the default is not mistaken for one that was typed.
+    """
+    try:
+        supplied = sorted(
+            flag for name, flag in _UNWIRED_CHAT_OPTIONS.items()
+            if (ctx.get_parameter_source(name) is not None
+                and ctx.get_parameter_source(name).name != "DEFAULT")
+        )
+    except (AttributeError, TypeError):
+        return
+    if supplied:
+        import sys as _sys
+        print(
+            "warning: praisonai chat does not implement "
+            + ", ".join(supplied)
+            + " yet; the value was ignored.",
+            file=_sys.stderr,
+        )
 
 
 def _run_legacy_terminal_chat(

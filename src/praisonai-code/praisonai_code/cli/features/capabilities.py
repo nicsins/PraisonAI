@@ -979,7 +979,7 @@ class CapabilitiesHandler:
         """Handle realtime subcommands."""
         parser = argparse.ArgumentParser(prog="praisonai realtime")
         parser.add_argument("action", choices=["connect", "info"], help="Action")
-        parser.add_argument("--model", "-m", default="gpt-4o-realtime-preview", help="Model")
+        parser.add_argument("--model", "-m", default="gpt-realtime", help="Model")
         
         try:
             parsed = parser.parse_args(unknown_args)
@@ -1007,7 +1007,7 @@ class CapabilitiesHandler:
         """Handle video generation."""
         parser = argparse.ArgumentParser(prog="praisonai videos")
         parser.add_argument("prompt", help="Video description")
-        parser.add_argument("--model", "-m", default="sora", help="Model to use")
+        parser.add_argument("--model", "-m", default="openai/sora-2", help="Model to use")
         parser.add_argument("--output", "-o", help="Output file path")
         
         try:

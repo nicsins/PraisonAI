@@ -54,16 +54,113 @@ import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Union
 
 from .protocols import PlatformCapabilities
 
 __all__ = [
     "SendErrorKind",
+    "SendStatus",
     "SendResult",
     "classify_send_error",
     "BasePlatformAdapter",
+    "CapabilityContractError",
+    "CAPABILITY_BACKING",
+    "verify_capability_contract",
+    "enforce_capability_contract",
 ]
+
+
+class CapabilityContractError(RuntimeError):
+    """A declared ``supports_*`` capability has no backing implementation.
+
+    Raised once, early — when an adapter is built/registered — so a
+    declared-but-unbacked capability can never reach a live turn as a lazy
+    ``NotImplementedError`` buried in the delivery loop. The message names the
+    offending flag and the method that must be overridden to back it.
+    """
+
+
+#: Maps each verifiable ``PlatformCapabilities`` flag to the adapter method that
+#: must be overridden (i.e. not left as the ``BasePlatformAdapter`` default) to
+#: back it. A flag set ``True`` with its backing method still inherited from the
+#: base is a broken promise and fails :func:`verify_capability_contract`.
+#:
+#: Only flags whose backing is a concrete, default-implemented base method are
+#: listed here; purely informational descriptors (e.g.
+#: ``supports_idempotency_token``) carry no method obligation and are omitted.
+CAPABILITY_BACKING: Dict[str, str] = {
+    "supports_edit": "edit_message",
+    "supports_delete": "delete_message",
+}
+
+
+def _resolve_capabilities(adapter: Any) -> Any:
+    """Return the adapter's :class:`PlatformCapabilities` descriptor, if any.
+
+    Prefers the typed ``platform_capabilities`` property (every adapter's
+    canonical descriptor) and falls back to a ``capabilities`` attribute that is
+    itself a :class:`PlatformCapabilities` (the ``BasePlatformAdapter`` shape).
+    Legacy dict-shaped ``capabilities`` (used by some wrapper bots for a
+    different, feature-name mapping) is ignored so it is never misread as the
+    transport descriptor.
+    """
+    caps = getattr(adapter, "platform_capabilities", None)
+    if isinstance(caps, PlatformCapabilities):
+        return caps
+    caps = getattr(adapter, "capabilities", None)
+    if isinstance(caps, PlatformCapabilities):
+        return caps
+    return None
+
+
+def verify_capability_contract(adapter: Any) -> List[str]:
+    """Check that each declared ``supports_*`` flag is actually backed.
+
+    For every flag in :data:`CAPABILITY_BACKING` that the adapter declares
+    ``True``, verify the backing method is present and not left as the unbacked
+    :class:`BasePlatformAdapter` default. Returns the list of human-readable
+    violation strings (empty when the contract holds).
+
+    Callers that want to fail loudly at registration time should call
+    :func:`enforce_capability_contract` instead; this function itself never
+    raises, so it is safe to use in a lenient/warn-only mode.
+    """
+    capabilities = _resolve_capabilities(adapter)
+    if capabilities is None:
+        return []
+
+    violations: List[str] = []
+    name = type(adapter).__name__
+    for flag, method_name in CAPABILITY_BACKING.items():
+        if not bool(getattr(capabilities, flag, False)):
+            continue
+        bound = getattr(type(adapter), method_name, None)
+        base_impl = getattr(BasePlatformAdapter, method_name, None)
+        if bound is None or bound is base_impl or not callable(bound):
+            violations.append(
+                f"{name} declares {flag}=True but does not override "
+                f"{method_name} with a callable implementation"
+            )
+    return violations
+
+
+def enforce_capability_contract(adapter: Any) -> None:
+    """Verify *adapter*'s capability contract and raise on any violation.
+
+    Thin wrapper over :func:`verify_capability_contract` that raises a single
+    :class:`CapabilityContractError` naming every declared-but-unbacked
+    capability, so an adapter cannot advertise something it cannot do. Intended
+    to be called once where adapters are built/registered.
+    """
+    violations = verify_capability_contract(adapter)
+    if violations:
+        raise CapabilityContractError("; ".join(violations))
+
+#: Closed set of delivery outcomes for :attr:`SendResult.status`. Exposed as a
+#: type alias so static callers can verify exhaustive handling of the contract
+#: instead of treating the outcome as an arbitrary ``str``.
+SendStatus = Literal["sent", "failed", "queued", "duplicate"]
 
 
 class SendErrorKind(str, Enum):
@@ -267,6 +364,10 @@ class SendResult:
             behaviour rather than being silently dropped.
         retry_after: Suggested seconds to wait before retrying (from the
             platform's rate-limit response, if provided).
+        queued: True when the send was persisted to a durable outbox for later
+            delivery rather than delivered inline (``status == "queued"``).
+        duplicate: True when a crash-recovered re-send may be a duplicate —
+            an honest at-least-once outcome (``status == "duplicate"``).
         metadata: Additional platform-specific result details.
     """
 
@@ -278,12 +379,32 @@ class SendResult:
     error_kind: Optional[SendErrorKind] = None
     retryable: bool = True
     retry_after: Optional[float] = None
+    queued: bool = False
+    duplicate: bool = False
     metadata: Dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def status(self) -> SendStatus:
+        """Closed, branchable delivery outcome for the send contract.
+
+        One of ``"sent"`` / ``"failed"`` / ``"queued"`` / ``"duplicate"``,
+        derived from the existing flags so a caller of ``BotProtocol``'s
+        ``send_message`` can branch on the outcome without exception-handling
+        (a swallowed exception would otherwise be a silent drop). ``queued``
+        (persisted to a durable outbox) and ``duplicate`` (crash-recovered
+        possible re-send) take precedence over the bare ``ok`` flag.
+        """
+        if self.queued:
+            return "queued"
+        if self.duplicate:
+            return "duplicate"
+        return "sent" if self.ok else "failed"
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to a plain dictionary."""
         return {
             "ok": self.ok,
+            "status": self.status,
             "message_id": self.message_id,
             "chat_id": self.chat_id,
             "message_ids": list(self.message_ids),
@@ -291,6 +412,8 @@ class SendResult:
             "error_kind": self.error_kind.value if self.error_kind else None,
             "retryable": self.retryable,
             "retry_after": self.retry_after,
+            "queued": self.queued,
+            "duplicate": self.duplicate,
             "metadata": self.metadata,
         }
 
@@ -442,6 +565,44 @@ class BasePlatformAdapter(ABC):
         await self.disconnect()
 
     # ------------------------------------------------------------------ #
+    # Identity canonicalization seam.                                     #
+    #                                                                     #
+    # The gateway keys each conversation on the platform-supplied user id.#
+    # When a platform changes the *native* id for the *same human*        #
+    # (WhatsApp JID→LID migration, a renamed handle-as-id, a              #
+    # phone-number↔UUID alias flip) the raw id changes and the session    #
+    # would silently fork — history/memory/run-state orphaned. This seam  #
+    # lets an adapter map a volatile raw id to a stable canonical id      #
+    # *before* it becomes part of the session key; the resolver's         #
+    # explicit link/pairing lookup then runs on the stabilised id.        #
+    #                                                                     #
+    # It fulfils ``IdentityCanonicalizerProtocol`` (praisonaiagents.      #
+    # gateway.protocols) so an adapter *is* its own canonicalizer: pass   #
+    # ``self`` where that protocol is accepted.                           #
+    # ------------------------------------------------------------------ #
+
+    def canonicalize(self, platform: str, raw_user_id: str) -> str:
+        """Map a raw, potentially-volatile platform id to a stable canonical id.
+
+        Consulted on the session-key path *before* link/pairing resolution so
+        an alias/format change for the *same* human (e.g. WhatsApp's JID→LID
+        migration, a number↔UUID alias flip) collapses to one stable session
+        key — preserving transcript, memory and in-flight run-state — instead
+        of silently forking the conversation.
+
+        This is the :class:`~praisonaiagents.gateway.protocols.
+        IdentityCanonicalizerProtocol` method, so a ``BasePlatformAdapter``
+        conforms structurally and can be handed anywhere that protocol is
+        accepted.
+
+        Default is the identity function, so adapters that do not override this
+        are fully backward-compatible (the raw id keys the session exactly as
+        before). Implementations MUST be deterministic and total: return the
+        raw id unchanged when no canonical form is known, never raise.
+        """
+        return raw_user_id
+
+    # ------------------------------------------------------------------ #
     # Capability helpers                                                  #
     # ------------------------------------------------------------------ #
 
@@ -463,6 +624,11 @@ class BasePlatformAdapter(ABC):
     def supports_typing(self) -> bool:
         """Whether the platform supports typing indicators."""
         return bool(self._cap("supports_typing", False))
+
+    @property
+    def supports_delete(self) -> bool:
+        """Whether the platform supports deleting a sent message."""
+        return bool(self._cap("supports_delete", False))
 
     # ------------------------------------------------------------------ #
     # Default-implemented, capability-driven — override only to improve.  #
@@ -527,8 +693,22 @@ class BasePlatformAdapter(ABC):
         )
 
     async def delete_message(self, chat_id: Any, message_id: str) -> bool:
-        """Delete a message. Default: not supported → returns False."""
-        return False
+        """Delete a previously sent message.
+
+        Default behaviour is capability-gated for parity with
+        :meth:`edit_message`: when ``supports_delete`` is False the platform
+        genuinely cannot delete, so this returns ``False`` (unsupported). When
+        an adapter declares ``supports_delete=True`` it MUST override this — the
+        default then raises so the broken promise is caught rather than silently
+        no-opping. :func:`verify_capability_contract` catches this mismatch at
+        registration time, before any live turn.
+        """
+        if not self.supports_delete:
+            return False
+        raise NotImplementedError(
+            "capabilities.supports_delete is True but delete_message is not "
+            "implemented; override delete_message in the adapter."
+        )
 
     def classify_error(self, exc: BaseException) -> SendResult:
         """Map a native send exception into a classified :class:`SendResult`.
@@ -589,6 +769,15 @@ class BasePlatformAdapter(ABC):
             if not result.ok:
                 result.message_ids = aggregate.message_ids + result.message_ids
                 return result
+            # Preserve non-``sent`` outcomes: a chunk persisted to a durable
+            # outbox (``queued``) or crash-recovered as a possible re-send
+            # (``duplicate``) must propagate to the aggregate, otherwise a
+            # deferred/at-least-once delivery would be silently reported as
+            # ``sent`` and the outcome the receipt exists to carry is erased.
+            if result.queued:
+                aggregate.queued = True
+            if result.duplicate:
+                aggregate.duplicate = True
             if result.message_id:
                 aggregate.message_ids.append(result.message_id)
                 aggregate.message_id = result.message_id

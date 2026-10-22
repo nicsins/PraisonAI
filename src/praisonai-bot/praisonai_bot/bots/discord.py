@@ -45,6 +45,12 @@ from ._commands import (
 )
 from ._failure import failure_reply_text
 from ._session import BotSessionManager
+from ._streaming import (
+    StreamingConfig,
+    StreamingMode,
+    DraftStreamer,
+    build_streaming_config,
+)
 from ._debounce import InboundDebouncer
 from ._ack import AckReactor
 from ._unknown_user import UnknownUserHandler, BotContext
@@ -102,7 +108,12 @@ class DiscordBot(OutboundResilienceMixin, ChatCommandMixin, MessageHookMixin):
         
         # Initialize allow_silence from config
         self._allow_silence = getattr(self.config, 'allow_silence', False)
-        
+
+        # Initialize streaming config based on BotConfig (shared with Telegram /
+        # Slack so ``streaming.mode: draft|auto`` is honoured identically across
+        # channels that support in-place edits — Issue #5415).
+        self._streaming_config = build_streaming_config(self.config)
+
         self._is_running = False
         self._bot_user: Optional[BotUser] = None
         self._client = None
@@ -139,6 +150,15 @@ class DiscordBot(OutboundResilienceMixin, ChatCommandMixin, MessageHookMixin):
         self._register_interactive_handlers()
         self._bot_context: Optional[BotContext] = None
     
+    def configure_streaming(self, config: StreamingConfig) -> None:
+        """Configure streaming reply mode.
+
+        Args:
+            config: Streaming configuration. Set mode=StreamingMode.OFF to disable.
+        """
+        self._streaming_config = config
+        logger.debug("DiscordBot: streaming configured, mode=%s", config.mode)
+
     @property
     def is_running(self) -> bool:
         return self._is_running
@@ -146,7 +166,26 @@ class DiscordBot(OutboundResilienceMixin, ChatCommandMixin, MessageHookMixin):
     @property
     def platform(self) -> str:
         return "discord"
-    
+
+    def _event_classes(self) -> set:
+        """Opt-in inbound platform-event classes for this gateway (Issue #5161).
+
+        Sourced from the existing ``BotConfig.metadata`` seam under an
+        ``events`` key (a list like ``["reactions", "edits", "members"]``); no
+        new typed knob is added. Empty by default so nothing new is subscribed
+        unless a gateway opts in — the capability is purely additive and
+        capability-gated, mirroring the outbound reactions gate.
+        """
+        metadata = getattr(self.config, "metadata", None)
+        if not isinstance(metadata, dict):
+            return set()
+        classes = metadata.get("events")
+        if not classes:
+            return set()
+        if isinstance(classes, str):
+            classes = [classes]
+        return {str(c).strip().lower() for c in classes}
+
     @property
     def bot_user(self) -> Optional[BotUser]:
         return self._bot_user
@@ -175,6 +214,7 @@ class DiscordBot(OutboundResilienceMixin, ChatCommandMixin, MessageHookMixin):
             max_message_length=2000,  # Discord's limit for regular messages
             length_unit="codepoints",
             supports_edit=True,  # Discord supports message editing
+            supports_delete=True,  # Discord supports deleting bot messages
             supports_typing=True,
             markdown_dialect="discord_markdown",
             needs_rate_limit=False,  # Discord.py handles rate limiting
@@ -202,7 +242,15 @@ class DiscordBot(OutboundResilienceMixin, ChatCommandMixin, MessageHookMixin):
         intents = discord.Intents.default()
         intents.message_content = True
         intents.guilds = True
-        
+
+        # Opt-in inbound platform events (Issue #5161): enable only the
+        # privileged intents the gateway asked for so nothing new is subscribed
+        # by default. Reactions/edits/deletes are covered by the default
+        # intents; membership requires the privileged ``members`` intent.
+        _event_classes = self._event_classes()
+        if "members" in _event_classes:
+            intents.members = True
+
         self._client = commands.Bot(
             command_prefix=self.config.command_prefix,
             intents=intents,
@@ -238,7 +286,17 @@ class DiscordBot(OutboundResilienceMixin, ChatCommandMixin, MessageHookMixin):
         @self._client.event
         async def on_message(message):
             if message.author.bot:
-                return
+                # Never react to ourselves. Other bots are dropped unless the
+                # channel opts into bot-authored messages (#5062); when it does,
+                # the BotLoopGuard breaks a runaway A<->B reply loop.
+                _self_id = getattr(self._client.user, "id", None)
+                if _self_id is not None and message.author.id == _self_id:
+                    return
+                if not self.bot_loop_allows(
+                    self._convert_message(message).sender,
+                    self_bot_id=str(_self_id or ""),
+                ):
+                    return
             
             bot_message = self._convert_message(message)
             
@@ -436,20 +494,95 @@ class DiscordBot(OutboundResilienceMixin, ChatCommandMixin, MessageHookMixin):
                     
                     async def _send_agent_response():
                         text_to_send = await self._debouncer.debounce(user_id, bot_message.text)
+                        channel_id = str(message.channel.id)
+
+                        # Streaming path: progressively edit a placeholder in
+                        # place using the shared DraftStreamer, mirroring Telegram
+                        # (Issue #5415). Only engaged when streaming is configured.
+                        streaming_enabled = (
+                            self._streaming_config is not None
+                            and self._streaming_config.mode != StreamingMode.OFF
+                        )
+                        if streaming_enabled:
+                            streamer = DraftStreamer(
+                                adapter=self,
+                                channel_id=channel_id,
+                                config=self._streaming_config,
+                                platform="discord",
+                            )
+                            placeholder_message_id = await streamer.start()
+                            try:
+                                response = await self._session.chat(
+                                    self._agent, user_id, text_to_send,
+                                    chat_id=channel_id,
+                                    user_name=str(getattr(message.author, "name", "")),
+                                    message_id=str(message.id),
+                                    account=getattr(self.config, "account", "default"),
+                                    stream_callback=streamer.on_event,
+                                )
+                                send_result = self.fire_message_sending(
+                                    channel_id, str(response),
+                                )
+                                if send_result["cancel"]:
+                                    try:
+                                        await self.delete_message(
+                                            channel_id, placeholder_message_id
+                                        )
+                                    except Exception:
+                                        pass
+                                    return
+                                final_content = send_result["content"]
+                                # A streamed answer longer than Discord's hard
+                                # cap cannot be delivered by editing the single
+                                # placeholder (both the edit and the send
+                                # fallback 400 on >2000 chars), which would drop
+                                # the whole reply. Fall back to the chunked
+                                # reply path so long answers are split and keep
+                                # the reply reference (Greptile #3 / #5).
+                                _cap = min(self.config.max_message_length, 2000)
+                                if len(final_content) > _cap:
+                                    try:
+                                        await self.delete_message(
+                                            channel_id, placeholder_message_id
+                                        )
+                                    except Exception:
+                                        pass
+                                    await self._send_long_message(
+                                        message.channel, final_content,
+                                        reference=message,
+                                    )
+                                else:
+                                    await streamer.finalize(final_content)
+                                self.fire_message_sent(channel_id, final_content)
+                            except Exception:
+                                try:
+                                    await self.delete_message(
+                                        channel_id, placeholder_message_id
+                                    )
+                                except Exception:
+                                    pass
+                                raise
+                            if ack_ctx:
+                                await self._ack.done(
+                                    ack_ctx, react_fn=_discord_react,
+                                    unreact_fn=_discord_unreact,
+                                )
+                            return
+
                         response = await self._session.chat(
                             self._agent, user_id, text_to_send,
-                            chat_id=str(message.channel.id),
+                            chat_id=channel_id,
                             user_name=str(getattr(message.author, "name", "")),
                             message_id=str(message.id),
                             account=getattr(self.config, "account", "default"),
                         )
                         send_result = self.fire_message_sending(
-                            str(message.channel.id), str(response),
+                            channel_id, str(response),
                         )
                         if send_result["cancel"]:
                             return
                         await self._send_long_message(message.channel, send_result["content"], reference=message)
-                        self.fire_message_sent(str(message.channel.id), send_result["content"])
+                        self.fire_message_sent(channel_id, send_result["content"])
                         # Done reaction - show completion
                         if ack_ctx:
                             await self._ack.done(ack_ctx, react_fn=_discord_react, unreact_fn=_discord_unreact)
@@ -467,9 +600,119 @@ class DiscordBot(OutboundResilienceMixin, ChatCommandMixin, MessageHookMixin):
                         except Exception as e:
                             logger.error(f"Agent error: {e}")
                             await message.reply(failure_reply_text(e))
-        
+
+        # Inbound platform events (Issue #5161): opt-in, capability-gated.
+        # Each handler translates the native discord.py event into a normalised
+        # core ``PlatformEvent`` and emits it through the shared
+        # ``fire_platform_event`` seam, so hooks/plugins subscribe uniformly.
+        self._register_platform_event_handlers(_event_classes)
+
         await self._client.start(self._token)
-    
+
+    def _register_platform_event_handlers(self, event_classes: set) -> None:
+        """Register opt-in discord.py handlers for inbound platform events.
+
+        Only the event classes the gateway opted into (via
+        ``config.metadata['events']``) are wired; everything else is left
+        unsubscribed so the default request→reply behaviour is unchanged. The
+        translation to a core :class:`PlatformEvent` is deliberately thin — the
+        native payload is preserved in ``raw`` as an escape hatch.
+        """
+        if not event_classes:
+            return
+        from praisonaiagents.bots import PlatformEvent
+
+        def _reaction_event(payload, kind: str):
+            emoji = getattr(payload, "emoji", None)
+            return PlatformEvent(
+                kind=kind,
+                platform="discord",
+                chat_id=str(getattr(payload, "channel_id", "") or ""),
+                user_id=str(getattr(payload, "user_id", "") or ""),
+                message_id=str(getattr(payload, "message_id", "") or ""),
+                emoji=str(emoji) if emoji is not None else None,
+                raw={"payload": payload},
+            )
+
+        if "reactions" in event_classes:
+            @self._client.event
+            async def on_raw_reaction_add(payload):
+                if str(getattr(payload, "user_id", "")) == str(
+                    getattr(self._client.user, "id", "")
+                ):
+                    return
+                self.fire_platform_event(_reaction_event(payload, "reaction_added"))
+
+            @self._client.event
+            async def on_raw_reaction_remove(payload):
+                # Ignore the bot's own reaction removals (e.g. ack/done cleanup)
+                # so internal acknowledgement housekeeping is never mistaken for
+                # an inbound user reaction — symmetric with the add handler.
+                if str(getattr(payload, "user_id", "")) == str(
+                    getattr(self._client.user, "id", "")
+                ):
+                    return
+                self.fire_platform_event(_reaction_event(payload, "reaction_removed"))
+
+        if "edits" in event_classes:
+            @self._client.event
+            async def on_message_edit(before, after):
+                if getattr(getattr(after, "author", None), "bot", False):
+                    return
+                self.fire_platform_event(PlatformEvent(
+                    kind="message_edited",
+                    platform="discord",
+                    chat_id=str(getattr(getattr(after, "channel", None), "id", "") or ""),
+                    user_id=str(getattr(getattr(after, "author", None), "id", "") or ""),
+                    message_id=str(getattr(after, "id", "") or ""),
+                    new_text=getattr(after, "content", None),
+                    raw={"before": before, "after": after},
+                ))
+
+            @self._client.event
+            async def on_message_delete(message):
+                self.fire_platform_event(PlatformEvent(
+                    kind="message_deleted",
+                    platform="discord",
+                    chat_id=str(getattr(getattr(message, "channel", None), "id", "") or ""),
+                    user_id=str(getattr(getattr(message, "author", None), "id", "") or ""),
+                    message_id=str(getattr(message, "id", "") or ""),
+                    raw={"message": message},
+                ))
+
+        if "members" in event_classes:
+            @self._client.event
+            async def on_member_join(member):
+                self.fire_platform_event(PlatformEvent(
+                    kind="member_joined",
+                    platform="discord",
+                    chat_id=str(getattr(getattr(member, "guild", None), "id", "") or ""),
+                    user_id=str(getattr(member, "id", "") or ""),
+                    raw={"member": member},
+                ))
+
+            @self._client.event
+            async def on_member_remove(member):
+                self.fire_platform_event(PlatformEvent(
+                    kind="member_left",
+                    platform="discord",
+                    chat_id=str(getattr(getattr(member, "guild", None), "id", "") or ""),
+                    user_id=str(getattr(member, "id", "") or ""),
+                    raw={"member": member},
+                ))
+
+        if "threads" in event_classes:
+            @self._client.event
+            async def on_thread_create(thread):
+                self.fire_platform_event(PlatformEvent(
+                    kind="thread_created",
+                    platform="discord",
+                    chat_id=str(getattr(getattr(thread, "parent", None), "id", "") or ""),
+                    user_id=str(getattr(thread, "owner_id", "") or ""),
+                    thread_id=str(getattr(thread, "id", "") or ""),
+                    raw={"thread": thread},
+                ))
+
     async def stop(self) -> None:
         """Stop the Discord bot."""
         if not self._is_running:

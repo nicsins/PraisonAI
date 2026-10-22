@@ -222,6 +222,39 @@ test("refused events are announced at the end, and NOT during the stream", () =>
   const ended = apply(midStream, end);
   const second = tick(first.state, ended, 10_000);
   assert.equal(second.announcements.some((a) => a.reason === "dropped"), true);
+
+  // And exactly ONCE. Dropping `spokenDropped = turn.dropped.length` survived
+  // the whole suite: the cursor never advances, so every later publish of the
+  // same finished turn re-announces the same decoder gap. A screen-reader user
+  // hears "1 event could not be read" on a loop, and it is assertive, so it
+  // interrupts whatever else was being read each time.
+  const third = tick(second.state, ended, 20_000);
+  assert.equal(
+    third.announcements.some((a) => a.reason === "dropped"),
+    false,
+    "a gap already announced must not be announced again",
+  );
+  const fourth = tick(third.state, ended, 30_000);
+  assert.equal(fourth.announcements.some((a) => a.reason === "dropped"), false);
+});
+
+test("a SECOND refused event after the first was announced is announced too", () => {
+  // The pair. A cursor that simply latched "already said something" would pass
+  // the test above and then stay silent about every later gap in the same turn
+  // -- so the count is what advances, not a flag.
+  const one = run(start, delta("Working. "), { type: "delta", msgId: "other", text: "stray" });
+  const endedOnce = apply(one, end);
+  const said = tick(initialAnnouncer, endedOnce, 0);
+  assert.equal(said.announcements.some((a) => a.reason === "dropped"), true);
+
+  const endedTwice = apply(endedOnce, { type: "delta", msgId: "other", text: "stray again" });
+  assert.equal(endedTwice.dropped.length, 2, "the reducer recorded a second gap");
+  const again = tick(said.state, endedTwice, 10_000);
+  assert.equal(
+    again.announcements.some((a) => a.reason === "dropped"),
+    true,
+    "a new gap must still be reported",
+  );
 });
 
 test("a new turn starts the cursor over instead of skipping the answer", () => {
@@ -241,9 +274,15 @@ test("a new turn starts the cursor over instead of skipping the answer", () => {
 });
 
 test("nothing to say returns the very same state object", () => {
-  // A caller uses identity to decide whether to touch the live region at all.
-  // A fresh object every tick means writing to the region on every publish,
-  // which is the mutation storm this whole policy avoids.
+  // A fresh object every tick would mean writing to the live region on every
+  // publish, which is the mutation storm this whole policy avoids.
+  //
+  // The guarantee is "nothing MOVED", not "nothing was said". Two cursors
+  // advance without producing speech -- `lastStreamAtMs` when the sentence
+  // check runs, and `spokenChars` when the completed prefix trims to nothing
+  // -- and the identity short-circuit used to discard both, so the expensive
+  // check re-ran on the very next publish forever. Within the interval, where
+  // 74 of every 75 publishes land, nothing moves and identity holds.
   const turn = run(start, delta("half a sen"));
   // The first tick genuinely changes something: it records which turn is being
   // announced, which is what makes the next answer start over correctly.
@@ -251,9 +290,41 @@ test("nothing to say returns the very same state object", () => {
   assert.deepEqual(first.announcements, []);
   assert.notEqual(first.state.turnKey, null);
 
-  const second = tick(first.state, turn, 10_000);
+  const second = tick(first.state, turn, ANNOUNCE_INTERVAL_MS - 1);
   assert.deepEqual(second.announcements, []);
   assert.equal(Object.is(second.state, first.state), true);
+
+  // And a third within the same interval, so this is not one lucky tick.
+  const third = tick(second.state, turn, ANNOUNCE_INTERVAL_MS - 1);
+  assert.equal(Object.is(third.state, second.state), true);
+});
+
+test("a sentence check that finds nothing still costs only ONE check per interval", () => {
+  // The measured defect. `completedLength` segments the whole accumulated
+  // answer; when no sentence completes -- a markdown table, a code block, a
+  // JSON dump -- the clock never advanced and the identity short-circuit threw
+  // away the advance anyway, so it ran on every publish. 533 full
+  // segmentations over 607 publishes of a 160 kB answer, quadratic in its
+  // length, ~700 ms of blocked main thread on a phone.
+  //
+  // Asserted through the state rather than by timing: after a check, the
+  // announcer must record that it ran, so the next publish inside the interval
+  // is skipped.
+  const turn = run(start, delta("| col a | col b | row "));
+  const first = tick(initialAnnouncer, turn, 0);
+  assert.deepEqual(first.announcements, [], "nothing completed, so nothing is said");
+
+  const later = tick(first.state, turn, ANNOUNCE_INTERVAL_MS);
+  assert.deepEqual(later.announcements, [], "still nothing to say");
+  assert.equal(
+    later.state.lastStreamAtMs,
+    ANNOUNCE_INTERVAL_MS,
+    "but the check RAN, and the announcer must remember that it did",
+  );
+
+  // The next publish is inside the new interval, so it must not check again.
+  const soon = tick(later.state, turn, ANNOUNCE_INTERVAL_MS + 16);
+  assert.equal(Object.is(soon.state, later.state), true, "no check, nothing moved");
 });
 
 test("Japanese text is announced, so the policy is not silently ASCII-only", () => {

@@ -6,6 +6,7 @@ Manages context window by compacting messages when needed.
 
 import re
 import threading
+import logging
 from typing import List, Dict, Any, Optional, Callable, Awaitable, Tuple
 import asyncio
 
@@ -13,6 +14,8 @@ from .config import CompactionConfig, COMPACTION_PREFIX, SUMMARY_TEMPLATE
 from .strategy import CompactionStrategy
 from .result import CompactionResult
 from .protocols import ToolResultPrunerProtocol, MessageFormatterProtocol, SummaryBuilderProtocol
+
+logger = logging.getLogger(__name__)
 
 
 # Cache for the one-time offline-safe tiktoken probe (see estimate_tokens).
@@ -45,12 +48,11 @@ def _accurate_tokeniser_available() -> bool:
 
         def _probe() -> None:
             try:
-                from ..context.tokens import estimate_tokens_accurate
-                # Force real tokeniser init; heuristic fallback returns >0 too,
-                # but a network download would block here (bounded by the thread
-                # timeout below rather than hanging the caller).
-                estimate_tokens_accurate("probe", "gpt-4")
-                result.append(True)
+                from ..context.tokens import _get_tiktoken_encoder
+                # Force real tokeniser init; a network download would block
+                # here (bounded by the thread timeout below rather than
+                # hanging the caller). None means the load failed.
+                result.append(_get_tiktoken_encoder("gpt-4") is not None)
             except Exception:
                 result.append(False)
 
@@ -139,7 +141,12 @@ class ContextCompactor:
         # Anti-thrashing state tracking
         self._last_savings_pct: float = 100.0  # Start high to allow first compaction
         self._low_savings_streak: int = 0
-        
+        # Token count at the moment the streak reached its cap. The guard is
+        # released once the conversation grows materially past this, so a
+        # compactor that once could not shrink the context is never disabled
+        # for the rest of the session.
+        self._low_savings_tokens: int = 0
+
         # Iterative summary state
         self._previous_summary: Optional[str] = None
         self._previous_summary_global_idx: int = 0
@@ -208,14 +215,56 @@ class ContextCompactor:
         - Token count is below threshold
         - We've had too many consecutive low-savings attempts
         """
-        if self.count_total_tokens(messages) <= self.max_tokens:
+        total_tokens = self.count_total_tokens(messages)
+        if total_tokens <= self.max_tokens:
             return False
-            
-        # Anti-thrashing: skip if we've had too many low-savings attempts
-        if self._low_savings_streak >= self.config.max_consecutive_low_savings:
+
+        # Anti-thrashing: skip if we've had too many low-savings attempts,
+        # unless the conversation has grown enough to be worth re-testing.
+        if self._should_skip_low_savings(total_tokens):
             return False
-            
+
         return True
+
+    #: Growth factor that releases the anti-thrashing guard. A conversation
+    #: 25% larger than the one we gave up on is materially different input,
+    #: so the earlier "not worth compacting" verdict is re-tested.
+    _LOW_SAVINGS_RETRY_GROWTH = 1.25
+
+    def _should_skip_low_savings(self, original_tokens: int) -> bool:
+        """Whether the anti-thrashing guard should skip this pass.
+
+        The guard stops a compactor that cannot shrink a conversation from
+        burning a summarisation call every turn. It must not be permanent:
+        ``_low_savings_streak`` is only cleared *after* a compaction actually
+        runs, so a compactor that trips the cap would otherwise skip forever
+        and let the context grow without bound -- the precise opposite of what
+        the guard is for.
+
+        Growth past the size we gave up on is new evidence, so the verdict is
+        retried and the streak reset.
+        """
+        if self._low_savings_streak < self.config.max_consecutive_low_savings:
+            return False
+        if self._low_savings_tokens and original_tokens >= (
+            self._low_savings_tokens * self._LOW_SAVINGS_RETRY_GROWTH
+        ):
+            self._low_savings_streak = 0
+            self._low_savings_tokens = 0
+            return False
+        return True
+
+    def _record_savings_outcome(self, savings_pct: float, original_tokens: int) -> None:
+        """Update anti-thrashing state after a completed compaction pass."""
+        self._last_savings_pct = savings_pct
+        if savings_pct >= self.config.min_savings_pct:
+            self._low_savings_streak = 0
+            self._low_savings_tokens = 0
+            return
+        self._low_savings_streak += 1
+        if self._low_savings_streak >= self.config.max_consecutive_low_savings:
+            # Remember the size we gave up at, so growth can release the guard.
+            self._low_savings_tokens = original_tokens
     
     def compact(
         self,
@@ -254,7 +303,7 @@ class ContextCompactor:
         # Anti-thrashing: if prior passes yielded too little savings, skip and
         # surface it on the result so callers can detect the skip. Without this
         # the documented ``was_skipped_due_to_low_savings`` flag never fired.
-        if self._low_savings_streak >= self.config.max_consecutive_low_savings:
+        if self._should_skip_low_savings(original_tokens):
             result = CompactionResult(
                 original_tokens=original_tokens,
                 compacted_tokens=original_tokens,
@@ -290,18 +339,28 @@ class ContextCompactor:
             compacted = self._prune(processed_messages)
         elif self.strategy == CompactionStrategy.LLM_SUMMARIZE:
             if self.llm_summarize_fn:
-                # For sync calls with LLM function, we need to run async
+                # Route through the canonical sync-to-async bridge so the
+                # user-configured LLM summariser runs identically whether or not
+                # a loop is already running (e.g. an agent hosted in FastAPI,
+                # aiohttp, Jupyter or a bot handler). The naive fallback is kept
+                # only for genuine failures, and is now logged so a silent
+                # degradation in context quality is visible.
+                #
+                # Keep the bridge's bounded default timeout rather than
+                # ``timeout=None`` so a summariser that never completes (a hung
+                # network call that ignores cancellation) falls back to the
+                # naive summary below instead of pinning the caller's thread
+                # indefinitely. ``TimeoutError`` is caught by the ``except`` here.
+                from ..utils.async_bridge import run_coroutine_from_any_context
                 try:
-                    # Check if we're already in an async context
-                    try:
-                        loop = asyncio.get_running_loop()
-                        # If in async context, fallback to naive summarization
-                        compacted = self._summarize(processed_messages)
-                    except RuntimeError:
-                        # No running loop, safe to create one
-                        compacted = asyncio.run(self._llm_summarize_async(processed_messages, focus_topic))
+                    compacted = run_coroutine_from_any_context(
+                        self._llm_summarize_async(processed_messages, focus_topic),
+                    )
                 except Exception:
-                    # Fallback to naive summarization if async fails
+                    logger.warning(
+                        "LLM summarisation failed; using naive summary",
+                        exc_info=True,
+                    )
                     compacted = self._summarize(processed_messages)
             else:
                 compacted = self._llm_summarize(processed_messages, focus_topic)
@@ -323,11 +382,7 @@ class ContextCompactor:
         result.calculate_savings_pct()
         
         # Update anti-thrashing tracking based on actual results
-        self._last_savings_pct = result.savings_pct
-        if result.savings_pct >= self.config.min_savings_pct:
-            self._low_savings_streak = 0
-        else:
-            self._low_savings_streak += 1
+        self._record_savings_outcome(result.savings_pct, original_tokens)
         
         return compacted, result
 
@@ -365,7 +420,7 @@ class ContextCompactor:
         # Anti-thrashing: if prior passes yielded too little savings, skip and
         # surface it on the result so callers can detect the skip. Without this
         # the documented ``was_skipped_due_to_low_savings`` flag never fired.
-        if self._low_savings_streak >= self.config.max_consecutive_low_savings:
+        if self._should_skip_low_savings(original_tokens):
             result = CompactionResult(
                 original_tokens=original_tokens,
                 compacted_tokens=original_tokens,
@@ -416,11 +471,7 @@ class ContextCompactor:
         result.calculate_savings_pct()
         
         # Update anti-thrashing tracking based on actual results
-        self._last_savings_pct = result.savings_pct
-        if result.savings_pct >= self.config.min_savings_pct:
-            self._low_savings_streak = 0
-        else:
-            self._low_savings_streak += 1
+        self._record_savings_outcome(result.savings_pct, original_tokens)
         
         return compacted, result
 
@@ -521,6 +572,63 @@ class ContextCompactor:
                 break
 
         return cut_index
+
+    def shrink_to_fit(
+        self, messages: List[Dict[str, Any]], target_tokens: int
+    ) -> List[Dict[str, Any]]:
+        """Shrink ``messages`` toward ``target_tokens`` after a provider overflow.
+
+        Reactive counterpart to ``compact``: used once a provider has rejected
+        a request as too long. It never drops the user message that opened
+        the in-flight turn or anything after it (its tool calls and results). It first
+        drops the oldest turns before that message, snapped so tool-call pairs
+        stay together, then trims oversized tool results to head + tail.
+        Returns a new list; the input is not mutated.
+        """
+        system = [m for m in messages if m.get("role") == "system"]
+        rest = [m for m in messages if m.get("role") != "system"]
+        anchor = max(len(rest) - 1, 0)
+        # Tool loops add their own user messages (media follow-ups, steering,
+        # repair prompts) after tool results or other user messages. The turn
+        # opens at the latest user message that follows a plain assistant
+        # reply (or nothing), so walk back past the synthesized ones.
+        for i in reversed(range(len(rest))):
+            if rest[i].get("role") != "user":
+                continue
+            anchor = i
+            prev = rest[i - 1] if i else None
+            if prev is None or (prev.get("role") == "assistant" and not prev.get("tool_calls")):
+                break
+
+        total = self.count_total_tokens(system + rest)
+        cut = 0
+        while cut < anchor and total > target_tokens:
+            total -= self.count_message_tokens(rest[cut])
+            cut += 1
+        kept = rest[self._snap_to_pair_boundary(rest, cut):]
+
+        if self.count_total_tokens(system + kept) > target_tokens:
+            n_tools = sum(1 for m in kept if m.get("role") == "tool")
+            # ~4 chars/token: tool results share roughly half the target budget
+            cap = max(500, target_tokens * 2 // max(n_tools, 1))
+            trimmed = []
+            for m in kept:
+                content = m.get("content")
+                if m.get("role") == "tool" and isinstance(content, str) and len(content) > cap:
+                    marker = (
+                        f"\n...[truncated {len(content):,} chars to fit the "
+                        f"context window]...\n"
+                    )
+                    # Keep the marker inside the cap so the result never grows.
+                    keep = max(cap - len(marker), 0)
+                    head, tail = content[: keep * 2 // 3], content[len(content) - keep // 3:]
+                    shortened = f"{head}{marker}{tail}"
+                    if len(shortened) < len(content):
+                        m = {**m, "content": shortened}
+                trimmed.append(m)
+            kept = trimmed
+
+        return system + kept
 
     def preview_older_slice(
         self, messages: List[Dict[str, Any]]

@@ -30,7 +30,7 @@ Usage::
     store = SqliteTranscriptStore(db_path="~/.praisonai/sessions/sessions.db")
     agent = Agent(..., session_store=store)      # drop-in for DefaultSessionStore
     store.add_message("s1", "user", "hi")        # single-row transactional write
-    store.search("refund")                        # indexed candidate lookup
+    store.search("refund")                        # decoded transcript scoring
 """
 
 import json
@@ -92,20 +92,24 @@ class SqliteTranscriptStore(DefaultSessionStore):
         with self._db_lock:
             if self._db_ready:
                 return self._conn
-            import sqlite3  # lazy import — stdlib, no heavy dependency
+            import sqlite3 as _sqlite3  # noqa: F401 - availability guard
 
             if self.db_path != ":memory:":
                 os.makedirs(os.path.dirname(self.db_path) or ".", exist_ok=True)
-            conn = sqlite3.connect(
-                self.db_path, check_same_thread=False, isolation_level=None
+            # Hardened factory: WAL where the filesystem supports it, safe
+            # DELETE fallback on NFS/SMB/FUSE/virtiofs (Issue #5264). WAL lets
+            # readers proceed concurrently with a writer where available.
+            from ..storage.sqlite import connect as _sqlite_connect
+
+            # guard=True: quick_check on open + forensic backup + bounded
+            # least-destructive repair so a malformed transcript DB recovers
+            # instead of taking the durable path down (Issue #5387).
+            conn = _sqlite_connect(
+                self.db_path,
+                isolation_level=None,
+                busy_timeout_ms=int(self.lock_timeout * 1000),
+                guard=True,
             )
-            try:
-                # WAL lets readers proceed concurrently with a writer.
-                conn.execute("PRAGMA journal_mode=WAL")
-                conn.execute("PRAGMA synchronous=NORMAL")
-                conn.execute("PRAGMA busy_timeout=%d" % int(self.lock_timeout * 1000))
-            except Exception:  # pragma: no cover - PRAGMA best-effort
-                pass
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS sessions ("
                 "  session_id TEXT PRIMARY KEY,"
@@ -154,7 +158,9 @@ class SqliteTranscriptStore(DefaultSessionStore):
         if not session_dir or not os.path.isdir(session_dir):
             return
         try:
-            filenames = [f for f in os.listdir(session_dir) if f.endswith(".json")]
+            filenames = sorted(
+                f for f in os.listdir(session_dir) if f.endswith(".json")
+            )
         except OSError:
             return
         if not filenames:
@@ -171,7 +177,7 @@ class SqliteTranscriptStore(DefaultSessionStore):
             try:
                 with open(filepath, "r", encoding="utf-8") as f:
                     data = json.load(f)
-            except (OSError, json.JSONDecodeError, TypeError):
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError):
                 continue
             if not isinstance(data, dict):
                 continue
@@ -210,7 +216,7 @@ class SqliteTranscriptStore(DefaultSessionStore):
         except (json.JSONDecodeError, TypeError):
             return None
 
-    def _write_row(self, session: SessionData, conn=None) -> bool:
+    def _write_row(self, session: SessionData, conn=None, *, overwrite: bool = True) -> bool:
         own_lock = conn is None
         if conn is None:
             conn = self._connect()
@@ -229,17 +235,21 @@ class SqliteTranscriptStore(DefaultSessionStore):
             getattr(session, "updated_at", None),
         )
         sql = (
-            "INSERT OR REPLACE INTO sessions "
+            ("INSERT OR REPLACE" if overwrite else "INSERT OR IGNORE") + " INTO sessions "
             "(session_id, data, agent_name, gateway_session_id, agent_id, updated_at) "
             "VALUES (?, ?, ?, ?, ?, ?)"
         )
         try:
             if own_lock:
                 with self._db_lock:
-                    conn.execute(sql, params)
+                    cursor = conn.execute(sql, params)
             else:
-                conn.execute(sql, params)
+                cursor = conn.execute(sql, params)
+            if not overwrite and cursor.rowcount == 0:
+                raise FileExistsError(session.session_id)
             return True
+        except FileExistsError:
+            raise
         except Exception as exc:
             logger.error("Failed to write session %s: %s", session.session_id, exc)
             return False
@@ -281,6 +291,52 @@ class SqliteTranscriptStore(DefaultSessionStore):
             with self._lock:
                 self._cache[session.session_id] = session
             return True
+
+    def _save_imported_session(self, session: SessionData, *, overwrite: bool = True) -> bool:
+        """Restore to the database without applying the destination's window."""
+        session.updated_at = datetime.now(timezone.utc).isoformat()
+        with self._db_lock:
+            # INSERT OR IGNORE makes no-clobber atomic across store instances;
+            # checking session_exists before a replace would still race.
+            if not self._write_row(session, overwrite=overwrite):
+                return False
+            with self._lock:
+                self._cache[session.session_id] = session
+            return True
+
+    def export_all(self) -> Dict[str, Any]:
+        """Export durable database rows, not legacy JSON sidecar files."""
+        return {
+            "version": self.PORTABLE_VERSION,
+            "sessions": [data for data in self._all_rows() if isinstance(data, dict)],
+        }
+
+    def _collect_lineage(
+        self, session: SessionData, *, exclude: str
+    ) -> List[Dict[str, Any]]:
+        """Collect persisted database records from the same conversation chain."""
+        lineage = self._lineage_key(session.to_dict())
+        if not lineage:
+            return []
+
+        def record_lineage(raw):
+            # Preserve the writer's Python JSON semantics (including NaN)
+            # and the shared lineage precedence, without retaining other rows.
+            try:
+                data = json.loads(raw)
+                return self._lineage_key(data) if isinstance(data, dict) else None
+            except (json.JSONDecodeError, TypeError, AttributeError):
+                return None
+
+        conn = self._connect()
+        with self._db_lock:
+            conn.create_function("portable_session_lineage", 1, record_lineage)
+            rows = conn.execute(
+                "SELECT data FROM sessions WHERE session_id != ? "
+                "AND portable_session_lineage(data) = ? ORDER BY updated_at DESC",
+                (exclude, lineage),
+            ).fetchall()
+        return [json.loads(row[0]) for row in rows]
 
     def _modify_session_locked(
         self,
@@ -457,7 +513,7 @@ class SqliteTranscriptStore(DefaultSessionStore):
             ).fetchall()
         return [r[0] for r in rows]
 
-    # ── search: indexed candidate lookup + inherited scoring ──────────
+    # ── search: transcript scan + inherited scoring ──────────
 
     def search(
         self,
@@ -466,13 +522,30 @@ class SqliteTranscriptStore(DefaultSessionStore):
         limit: int = 5,
         window: int = 5,
     ) -> List[Any]:
-        """Full-text search over transcripts using an indexed candidate lookup.
+        """Full-text search over decoded SQLite transcripts.
 
-        Candidate sessions are found with a bounded ``LIKE`` query against the
-        stored JSON payload (not an ``os.listdir`` scan); the parent store's
+        Stored JSON rows are streamed without a pre-scoring candidate cap;
+        lowercasing is applied to decoded message content. The parent store's
         per-session scoring, bookends, automated-demotion and lineage-dedup are
-        then reused verbatim so results are identical in shape.
+        then reused verbatim so results are identical in shape. Scanning spans
+        the shared archived-plus-active projection so compacted history stays
+        recallable (Issue #5031). A dedicated read snapshot keeps membership and
+        ordering stable across batches without holding the writer's connection
+        lock during decoded scoring. In-memory stores use a temporary database
+        snapshot because their connection cannot be independently reopened.
+        Non-WAL files are also copied before scoring so slow decoding cannot
+        retain a source read transaction that prevents writers from committing.
+        This copies the full database once per non-WAL search. If temporary
+        storage is full or concurrent writes interrupt the copy, a stable
+        source read transaction preserves search
+        availability but can delay DELETE-mode writers until scoring completes.
+        Non-WAL copies release source locks between bounded steps. Repeated
+        concurrent writes can restart a copy; exhausting its step budget
+        discards the incomplete copy and uses that source read transaction.
+        Only the completed copy or a complete source snapshot is scored.
         """
+        from contextlib import closing
+
         from .protocols import SessionHit
 
         query = (query or "").strip()
@@ -483,76 +556,171 @@ class SqliteTranscriptStore(DefaultSessionStore):
         terms = [t for t in needle.split() if t]
 
         conn = self._connect()
-        like = "%" + query.replace("%", "").replace("_", "") + "%"
-        fetch = max(limit * 5, limit)
-        with self._db_lock:
-            rows = conn.execute(
-                "SELECT data FROM sessions WHERE lower(data) LIKE lower(?) "
-                "ORDER BY updated_at DESC LIMIT ?",
-                (like, fetch),
-            ).fetchall()
+        def records():
+            # Score decoded messages from every row: a recency-first cap can
+            # exclude stronger hits or fill up with one conversation lineage.
+            # Stream payloads rather than materializing all transcript JSON.
+            import sqlite3
+            import errno
+            from tempfile import TemporaryDirectory
+
+            temporary = None
+            if self.db_path == ":memory:":
+                snapshot = sqlite3.connect(":memory:")
+            else:
+                from ..storage.sqlite import connect as _sqlite_connect
+                snapshot = _sqlite_connect(
+                    self.db_path, isolation_level=None,
+                    busy_timeout_ms=int(self.lock_timeout * 1000),
+                )
+            try:
+                if self.db_path == ":memory:":
+                    import time
+
+                    def allow_writes(status, remaining, total):
+                        if remaining <= 0:
+                            return
+                        # SQLite releases its native locks after each step.
+                        # Writes through this same source connection update the
+                        # backup rather than restarting it. Keep native calls
+                        # serialized, but let queued store operations run here.
+                        self._db_lock.release()
+                        try:
+                            time.sleep(0)
+                        finally:
+                            self._db_lock.acquire()
+
+                    with self._db_lock:
+                        conn.backup(snapshot, pages=128, progress=allow_writes)
+                elif snapshot.execute("PRAGMA journal_mode").fetchone()[0].lower() != "wal":
+                    source = snapshot
+                    interrupted = False
+                    try:
+                        temporary = TemporaryDirectory(prefix="praison-search-")
+                        snapshot = sqlite3.connect(os.path.join(temporary.name, "snapshot.db"))
+                        steps = 0
+                        step_limit = None
+
+                        def bound_restarts(status, remaining, total):
+                            nonlocal steps, step_limit, interrupted
+                            if step_limit is None:
+                                # Allow several complete copies plus retry room,
+                                # while keeping sustained peer writes bounded.
+                                step_limit = 4 * ((total + 127) // 128) + 8
+                            steps += 1
+                            if remaining > 0 and steps >= step_limit:
+                                interrupted = True
+                                raise sqlite3.OperationalError(
+                                    "Search snapshot interrupted by concurrent writes"
+                                )
+
+                        # Native locks are released between steps. A completed
+                        # backup is consistent; never score an interrupted copy.
+                        source.backup(snapshot, pages=128, progress=bound_restarts)
+                    except (sqlite3.Error, OSError) as exc:
+                        if isinstance(exc, OSError):
+                            full = exc.errno == errno.ENOSPC
+                        else:
+                            # Python 3.10 has neither SQLite error attributes
+                            # nor SQLITE_* constants. SQLite's primary FULL
+                            # code is 13; older runtimes expose only its text.
+                            code = getattr(exc, "sqlite_errorcode", None)
+                            full = (
+                                code & 0xFF == 13 if code is not None
+                                else str(exc) == "database or disk is full"
+                            )
+                        if not full and not interrupted:
+                            raise
+                        if snapshot is not source:
+                            snapshot.close()
+                        # Keep the independently opened source connection for
+                        # a consistent streaming read without another copy.
+                        snapshot = source
+                        source = None
+                        reason = "interrupted by concurrent writes" if interrupted else "storage is full"
+                        logger.warning("Search snapshot %s; reading the source transaction instead", reason)
+                    finally:
+                        if source is not None:
+                            source.close()
+                snapshot.execute("BEGIN")
+                cursor = snapshot.execute("SELECT data FROM sessions ORDER BY updated_at DESC")
+                while True:
+                    batch = cursor.fetchmany(128)
+                    if not batch:
+                        break
+                    # The independent read view cannot be reordered by writes
+                    # on the store connection while this batch is scored.
+                    yield from batch
+            finally:
+                snapshot.close()
+                if temporary is not None:
+                    temporary.cleanup()
 
         hits: List[tuple] = []
-        for row in rows:
-            try:
-                data = json.loads(row[0])
-            except (json.JSONDecodeError, TypeError):
-                continue
-            messages = data.get("messages", [])
-            if not isinstance(messages, list):
-                continue
-
-            best_index = -1
-            best_score = 0.0
-            total_score = 0.0
-            for idx, msg in enumerate(messages):
-                if not isinstance(msg, dict):
+        with closing(records()) as rows:
+            for row in rows:
+                try:
+                    data = json.loads(row[0])
+                except (json.JSONDecodeError, TypeError):
                     continue
-                content = str(msg.get("content", ""))
-                if not content:
+                if not isinstance(data, dict):
                     continue
-                lowered = content.lower()
-                score = 0.0
-                if needle in lowered:
-                    score += 2.0
-                score += sum(1.0 for term in terms if term in lowered)
-                total_score += score
-                if score > best_score:
-                    best_score = score
-                    best_index = idx
+                messages = self._searchable_messages(data)
+                if not messages:
+                    continue
 
-            if best_index < 0:
-                continue
+                best_index = -1
+                best_score = 0.0
+                total_score = 0.0
+                for idx, msg in enumerate(messages):
+                    if not isinstance(msg, dict):
+                        continue
+                    content = str(msg.get("content", ""))
+                    if not content:
+                        continue
+                    lowered = content.lower()
+                    score = 0.0
+                    if needle in lowered:
+                        score += 2.0
+                    score += sum(1.0 for term in terms if term in lowered)
+                    total_score += score
+                    if score > best_score:
+                        best_score = score
+                        best_index = idx
 
-            start = max(0, best_index - window)
-            end = min(len(messages), best_index + window + 1)
-            context = [
-                {
-                    "index": i,
-                    "role": messages[i].get("role", ""),
-                    "content": messages[i].get("content", ""),
-                    "timestamp": messages[i].get("timestamp"),
-                }
-                for i in range(start, end)
-                if isinstance(messages[i], dict)
-            ]
+                if best_index < 0:
+                    continue
 
-            if self._is_automated_session(data, messages):
-                total_score *= self.AUTOMATED_DEMOTION
+                start = max(0, best_index - window)
+                end = min(len(messages), best_index + window + 1)
+                context = [
+                    {
+                        "index": i,
+                        "role": messages[i].get("role", ""),
+                        "content": messages[i].get("content", ""),
+                        "timestamp": messages[i].get("timestamp"),
+                        "archived": bool(messages[i].get("archived")),
+                    }
+                    for i in range(start, end)
+                    if isinstance(messages[i], dict)
+                ]
 
-            hit = SessionHit(
-                session_id=data.get("session_id", ""),
-                title=self._session_title(data),
-                when=data.get("updated_at") or data.get("created_at"),
-                snippet=self._make_snippet(
-                    messages[best_index].get("content", ""), query
-                ),
-                score=total_score,
-                anchor_index=best_index,
-                messages=context,
-                bookends=self._bookends(messages, self.BOOKEND_SIZE),
-            )
-            hits.append((self._lineage_key(data), hit))
+                if self._is_automated_session(data, messages):
+                    total_score *= self.AUTOMATED_DEMOTION
+
+                hit = SessionHit(
+                    session_id=data.get("session_id", ""),
+                    title=self._session_title(data),
+                    when=data.get("updated_at") or data.get("created_at"),
+                    snippet=self._make_snippet(
+                        messages[best_index].get("content", ""), query
+                    ),
+                    score=total_score,
+                    anchor_index=best_index,
+                    messages=context,
+                    bookends=self._bookends(messages, self.BOOKEND_SIZE),
+                )
+                hits.append((self._lineage_key(data), hit))
 
         hits.sort(key=lambda item: (item[1].score, item[1].when or ""), reverse=True)
 
@@ -567,3 +735,8 @@ class SqliteTranscriptStore(DefaultSessionStore):
             if len(deduped) >= limit:
                 break
         return deduped
+
+    # Portable export/import overrides for DB-backed transcripts (Issue #5517)
+    # live above on ``export_all``, ``_collect_lineage``, and
+    # ``_save_imported_session`` — do not redeclare them here (would shadow
+    # ``overwrite`` and break import restore tests).

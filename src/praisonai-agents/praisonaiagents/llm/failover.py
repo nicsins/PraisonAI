@@ -359,10 +359,17 @@ class FailoverManager:
                 if profile.cooldown_until and current_time >= profile.cooldown_until:
                     profile.reset()
             
-            # Find first available profile
-            for profile in self._profiles:
-                if profile.is_available:
-                    return profile
+            # Find available profiles (already priority-sorted by add_profile).
+            available = [p for p in self._profiles if p.is_available]
+            if available:
+                if self.config.rotate_on_success:
+                    # Round-robin among the current highest-priority tier only,
+                    # so equal-priority credentials configured to spread load
+                    # actually share traffic instead of one absorbing all of it.
+                    top_priority = available[0].priority
+                    tier = [p for p in available if p.priority == top_priority]
+                    return tier[self._current_index % len(tier)]
+                return available[0]
             
             # If none available, return the one with shortest remaining cooldown
             available_profiles = [p for p in self._profiles if p.status != ProviderStatus.DISABLED]
@@ -443,6 +450,10 @@ class FailoverManager:
             profile: The profile that succeeded
         """
         with self._lock:
+            # Advance the round-robin cursor so the next get_next_profile()
+            # hands work to a different equal-priority credential.
+            if self.config.rotate_on_success:
+                self._current_index += 1
             if profile.status != ProviderStatus.AVAILABLE:
                 # Snapshot the cooldown this success is recovering from BEFORE
                 # resetting, so we can avoid clobbering a newer fleet-wide bench.
@@ -513,10 +524,43 @@ class FailoverManager:
             }
     
     def reset_all(self) -> None:
-        """Reset all profiles to available status."""
+        """Reset all profiles to available status.
+
+        Clears both the local profile state and any retained coordinator
+        benches. Without clearing the coordinator, a subsequent
+        ``get_next_profile()`` would re-apply the old cooldown via
+        ``_sync_bench_from_coordinator()`` and silently undo the reset.
+
+        ``reset_all()`` is a deliberate, operator-initiated override that
+        forces every credential back to AVAILABLE, so the coordinator bench is
+        cleared unconditionally — unlike ``mark_success()``, which only
+        recovers from a specific known cooldown and must not clobber a newer
+        concurrent bench. On a shared coordinator this therefore also clears
+        benches other replicas may have recorded; that is intended for an
+        explicit reset.
+
+        Fail-open with best-effort durability: a coordinator hiccup must never
+        wedge the local reset, but a single transient ``clear()`` failure must
+        not silently undo the reset either (the stale bench would be re-imported
+        on the next ``get_next_profile()``). We therefore verify the clear and
+        retry once before giving up and warning.
+        """
         with self._lock:
             for profile in self._profiles:
                 profile.reset()
+                cred_id = profile.credential_id
+                for attempt in range(2):
+                    try:
+                        self._coordinator.clear(cred_id)
+                        if self._coordinator.benched_until(cred_id) is None:
+                            break
+                    except Exception as e:  # pragma: no cover - defensive
+                        if attempt == 0:
+                            continue
+                        logger.warning(
+                            f"Quota coordinator clear failed for '{profile.name}': {e}; "
+                            f"local reset applied but shared bench may persist"
+                        )
 
 
 @runtime_checkable

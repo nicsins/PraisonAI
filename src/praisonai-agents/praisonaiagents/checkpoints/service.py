@@ -83,7 +83,8 @@ class CheckpointService:
         auto_checkpoint: bool = True,
         max_checkpoints: int = 100,
         user_name: str = "PraisonAI Checkpoints",
-        user_email: str = "checkpoints@praison.ai"
+        user_email: str = "checkpoints@praison.ai",
+        max_file_size: int = 2 * 1024 * 1024,
     ):
         """
         Initialize the checkpoint service.
@@ -93,9 +94,14 @@ class CheckpointService:
             storage_dir: Where to store checkpoint data
             enabled: Whether checkpoints are enabled
             auto_checkpoint: Auto-checkpoint before file modifications
-            max_checkpoints: Maximum checkpoints to keep
+            max_checkpoints: Maximum checkpoints kept in the in-memory view
+                (``get_checkpoint``) and searched by ``restore(step=...)``.
+                The shadow git repo retains every commit, so this does not
+                bound disk usage; use ``delete_all()`` to reclaim storage.
             user_name: Git user.name for commits (default: "PraisonAI Checkpoints")
             user_email: Git user.email for commits (default: "checkpoints@praison.ai")
+            max_file_size: Skip staging files larger than this many bytes
+                (default 2 MB); 0 disables the cap.
         """
         self.config = CheckpointConfig(
             workspace_dir=workspace_dir,
@@ -104,11 +110,20 @@ class CheckpointService:
             auto_checkpoint=auto_checkpoint,
             max_checkpoints=max_checkpoints,
             user_name=user_name,
-            user_email=user_email
+            user_email=user_email,
+            max_file_size=max_file_size,
         )
         
         self._initialized = False
+        # Save counter used to run `git gc --auto` on a bounded cadence so the
+        # shadow object store is periodically pruned during long sessions.
+        self._saves_since_gc = 0
         self._checkpoints: List[Checkpoint] = []
+        # Serialises git operations that touch HEAD/index/worktree so
+        # concurrent save()/restore() calls don't race on git's lock files.
+        # Created lazily per event loop to stay loop-agnostic.
+        self._op_lock: Optional[asyncio.Lock] = None
+        self._op_lock_loop: Optional[asyncio.AbstractEventLoop] = None
         self._event_handlers: Dict[CheckpointEvent, List[Callable]] = {
             event: [] for event in CheckpointEvent
         }
@@ -145,6 +160,14 @@ class CheckpointService:
             except Exception as e:
                 logger.warning(f"Event handler error: {e}")
     
+    def _get_op_lock(self) -> asyncio.Lock:
+        """Return the operation lock bound to the currently running loop."""
+        loop = asyncio.get_running_loop()
+        if self._op_lock is None or self._op_lock_loop is not loop:
+            self._op_lock = asyncio.Lock()
+            self._op_lock_loop = loop
+        return self._op_lock
+
     async def initialize(self) -> bool:
         """
         Initialize the shadow git repository.
@@ -184,6 +207,78 @@ class CheckpointService:
         
         return True
     
+    async def _get_project_objects_dir(self) -> Optional[str]:
+        """
+        Return the object database directory of the project's real git repo if
+        the workspace is inside one, else None.
+
+        Uses ``--git-common-dir`` so worktrees resolve to the shared object
+        store. Best-effort: any failure (no git, not a repo) returns None so the
+        shadow repo falls back to the standalone path unchanged.
+        """
+        try:
+            env = self._get_sanitized_env()
+            for flag in ("--git-common-dir", "--git-dir"):
+                process = await asyncio.create_subprocess_exec(
+                    "git", "rev-parse", flag,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    env=env,
+                    cwd=self.config.workspace_dir,
+                )
+                stdout, _ = await asyncio.wait_for(process.communicate(), timeout=30)
+                if process.returncode != 0:
+                    continue
+                git_dir = stdout.decode().strip()
+                if not git_dir:
+                    continue
+                if not os.path.isabs(git_dir):
+                    git_dir = os.path.join(self.config.workspace_dir, git_dir)
+                objects_dir = os.path.join(git_dir, "objects")
+                if os.path.isdir(objects_dir):
+                    return os.path.realpath(objects_dir)
+        except Exception as e:
+            logger.debug(f"Could not resolve project git objects dir: {e}")
+        return None
+
+    async def _apply_large_repo_config(self) -> None:
+        """
+        Apply large-repo git settings so index writes and untracked scans stay
+        fast. Each setting is best-effort: older git versions may not support
+        every key, and a failure must never break checkpointing.
+        """
+        settings = [
+            ("feature.manyFiles", "true"),
+            ("index.version", "4"),
+            ("core.untrackedCache", "true"),
+            ("core.fsmonitor", "true"),
+        ]
+        for key, value in settings:
+            try:
+                await self._run_git("config", key, value)
+            except Exception as e:
+                logger.debug(f"Skipping large-repo config {key}={value}: {e}")
+
+    async def _seed_from_project_objects(self, objects_dir: str) -> bool:
+        """
+        Point the shadow object store at the project's objects via a file-based
+        ``objects/info/alternates`` so new blobs resolve against existing
+        objects instead of being re-hashed and re-stored.
+
+        A file is used (not GIT_ALTERNATE_OBJECT_DIRECTORIES) because
+        ``_get_sanitized_env`` strips that env var. Returns True on success.
+        """
+        try:
+            info_dir = os.path.join(self.git_dir, "objects", "info")
+            os.makedirs(info_dir, exist_ok=True)
+            with open(os.path.join(info_dir, "alternates"), "w") as f:
+                f.write(f"{objects_dir}\n")
+            logger.debug(f"Seeded shadow git objects from {objects_dir}")
+            return True
+        except Exception as e:
+            logger.debug(f"Could not seed shadow git from project objects: {e}")
+            return False
+
     async def _init_shadow_git(self) -> bool:
         """Initialize the shadow git repository."""
         try:
@@ -196,7 +291,17 @@ class CheckpointService:
             
             # Set worktree to workspace
             await self._run_git("config", "core.worktree", self.config.workspace_dir)
-            
+
+            # Seed objects from the project's real repo (if any) so the first
+            # checkpoint only stores changed files, and tune for large repos.
+            # Both are best-effort: no real repo → unchanged standalone path.
+            objects_dir = await self._get_project_objects_dir()
+            if objects_dir and objects_dir != os.path.realpath(
+                os.path.join(self.git_dir, "objects")
+            ):
+                await self._seed_from_project_objects(objects_dir)
+            await self._apply_large_repo_config()
+
             # Create exclude file
             exclude_dir = os.path.join(self.git_dir, "info")
             os.makedirs(exclude_dir, exist_ok=True)
@@ -223,7 +328,14 @@ class CheckpointService:
         """Run a git command in the shadow repository."""
         env = self._get_sanitized_env()
         
-        cmd = ["git", f"--git-dir={self.git_dir}", f"--work-tree={self.config.workspace_dir}"]
+        # Housekeeping is driven by _maybe_gc. Stop git from spawning detached
+        # `maintenance run --auto` after commits: it holds maintenance.lock in
+        # the shadow dir and races delete_all(). Passed per-command so shadow
+        # repos created by older versions are covered too.
+        cmd = [
+            "git", "-c", "maintenance.auto=false", "-c", "gc.autoDetach=false",
+            f"--git-dir={self.git_dir}", f"--work-tree={self.config.workspace_dir}",
+        ]
         cmd.extend(args)
         
         process = await asyncio.create_subprocess_exec(
@@ -259,6 +371,64 @@ class CheckpointService:
             env.pop(var, None)
         
         return env
+
+    async def _unstage_oversized_files(self) -> None:
+        """
+        Remove files larger than ``config.max_file_size`` from the index so they
+        are not committed into the shadow store. Best-effort: any failure leaves
+        staging exactly as ``git add -A`` produced it and never breaks the turn.
+        """
+        max_size = self.config.max_file_size
+        if not max_size or max_size <= 0:
+            return
+        try:
+            # NUL-delimited so paths with spaces/newlines are handled safely.
+            staged = await self._run_git("diff", "--cached", "--name-only", "-z")
+            for path in staged.split("\0"):
+                if not path:
+                    continue
+                abs_path = os.path.join(self.config.workspace_dir, path)
+                try:
+                    # Use lstat so symlinks are measured by the link itself, not
+                    # their target: a small link to a large file must stay in the
+                    # checkpoint. Skip anything that isn't a regular file.
+                    if os.path.islink(abs_path) or not os.path.isfile(abs_path):
+                        continue
+                    if os.lstat(abs_path).st_size > max_size:
+                        # Keep the file on disk; only drop it from the index.
+                        await self._run_git("rm", "--cached", "--quiet", "--", path)
+                        logger.debug(f"Skipped oversized file from checkpoint: {path}")
+                except Exception as e:
+                    logger.debug(f"Could not evaluate size of {path}: {e}")
+        except Exception as e:
+            logger.debug(f"Oversized-file skip pass failed (continuing): {e}")
+
+    async def _maybe_gc(self, cadence: int = 20) -> None:
+        """
+        Every ``cadence`` saves, pack the shadow repo and make it self-contained.
+
+        We seed the shadow store from the project's objects via ``alternates``
+        for a fast first checkpoint, but a borrowed object can disappear if the
+        project repo later prunes or repacks it — which would make checkpoint
+        history unreadable. To keep ``/undo``/``/revert`` durable we periodically
+        run ``git repack -a -d`` (without ``--local``) so every reachable object,
+        including borrowed ones, is copied into a local pack the shadow store
+        owns. ``git gc --auto`` still handles pruning/packing of loose objects.
+
+        Best-effort: failures are swallowed so a gc issue never breaks a turn.
+        """
+        self._saves_since_gc += 1
+        if self._saves_since_gc < cadence:
+            return
+        self._saves_since_gc = 0
+        try:
+            # -a: pack all reachable objects; -d: drop redundant packs. Omitting
+            # --local pulls borrowed (alternate) objects into the local pack so
+            # the shadow store no longer depends on the project object database.
+            await self._run_git("repack", "-a", "-d", "--quiet")
+            await self._run_git("gc", "--auto", "--quiet")
+        except Exception as e:
+            logger.debug(f"Shadow-store gc skipped: {e}")
     
     async def save(
         self,
@@ -292,10 +462,21 @@ class CheckpointService:
         if step is not None:
             message = f"[step-{step}] {_STEP_TAG_RE.sub('', message)}"
         
+        async with self._get_op_lock():
+            return await self._save_unlocked(message, allow_empty)
+
+    async def _save_unlocked(self, message: str, allow_empty: bool) -> CheckpointResult:
+        """Commit the current workspace state. Caller must hold the op lock."""
         try:
             # Stage all changes
             await self._run_git("add", "-A")
-            
+
+            # Drop oversized files from the index so the shadow store never
+            # copies giant blobs (build outputs, model weights, media). This
+            # mirrors the existing "never fail the turn" contract: any error
+            # here is swallowed and staging proceeds as before.
+            await self._unstage_oversized_files()
+
             # Check if there are changes
             try:
                 await self._run_git("diff", "--cached", "--quiet")
@@ -329,7 +510,12 @@ class CheckpointService:
             
             # Prune old checkpoints if needed
             await self._prune_checkpoints()
-            
+
+            # Periodically let git pack loose objects and drop unreachable ones
+            # so the shadow store doesn't leak disk over a long session. Bounded
+            # cadence keeps the per-turn cost near zero; best-effort only.
+            await self._maybe_gc()
+
             self._emit(CheckpointEvent.CHECKPOINT_CREATED, checkpoint)
             logger.info(f"Created checkpoint: {checkpoint.short_id} - {message}")
             
@@ -373,11 +559,32 @@ class CheckpointService:
         if checkpoint_id is None:
             return CheckpointResult.fail("No checkpoint id or step provided")
         
+        async with self._get_op_lock():
+            # Snapshot uncommitted work first so the restore itself can be
+            # undone via restore(<pre-restore id>). Abort rather than destroy
+            # work if the snapshot fails for any reason other than "no changes".
+            pre = await self._save_unlocked("[pre-restore] auto-save", allow_empty=False)
+            if not pre.success and pre.error != "No changes to checkpoint":
+                return CheckpointResult.fail(f"Pre-restore snapshot failed: {pre.error}")
+            if pre.success:
+                # The reset below moves HEAD off the snapshot; pin it with a ref
+                # so gc never prunes it while it is off the HEAD timeline.
+                try:
+                    await self._run_git(
+                        "update-ref", f"refs/pre-restore/{pre.checkpoint.id}", pre.checkpoint.id
+                    )
+                except Exception as e:
+                    logger.debug(f"Could not pin pre-restore checkpoint: {e}")
+                logger.info(f"Saved unsaved work as checkpoint {pre.checkpoint.short_id} before restore")
+            return await self._restore_unlocked(checkpoint_id)
+
+    async def _restore_unlocked(self, checkpoint_id: str) -> CheckpointResult:
+        """Reset the workspace to ``checkpoint_id``. Caller must hold the op lock."""
         try:
-            # Clean untracked files
-            await self._run_git("clean", "-f", "-d")
-            
-            # Reset to checkpoint
+            # No ``git clean``: the pre-restore snapshot already committed every
+            # untracked file, so the only ones left are those it could not
+            # capture (e.g. over ``max_file_size``). Deleting them would lose
+            # work with no recoverable copy; ``reset --hard`` removes the rest.
             await self._run_git("reset", "--hard", checkpoint_id)
             
             # Get checkpoint info
@@ -475,11 +682,13 @@ class CheckpointService:
                     "diff", "--stat", "--numstat", from_id, to_id
                 )
             else:
-                # Diff against working directory
-                await self._run_git("add", "-A")  # Stage to include untracked
-                diff_output = await self._run_git(
-                    "diff", "--stat", "--numstat", "--cached", from_id
-                )
+                # Diff against working directory; staging mutates the index so
+                # it must not interleave with save()/restore().
+                async with self._get_op_lock():
+                    await self._run_git("add", "-A")  # Stage to include untracked
+                    diff_output = await self._run_git(
+                        "diff", "--stat", "--numstat", "--cached", from_id
+                    )
             
             # Parse diff output
             files = self._parse_diff_output(diff_output)

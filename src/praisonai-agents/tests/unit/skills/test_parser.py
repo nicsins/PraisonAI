@@ -229,7 +229,7 @@ Instructions.
             assert props.compatibility == "Requires pypdf"
             assert props.allowed_tools == "Read Write"
             assert props.metadata["author"] == "test"
-    
+
     def test_read_properties_missing_skill_md(self):
         """Test error when SKILL.md is missing."""
         from praisonaiagents.skills.parser import read_properties
@@ -287,6 +287,53 @@ Body.
             except ValidationError as e:
                 assert "description" in str(e).lower()
     
+    def test_read_properties_with_automation(self):
+        """Test reading an automation block from metadata.praisonai.automation."""
+        from praisonaiagents.skills.parser import read_properties
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            skill_dir = Path(tmpdir) / "morning-brief"
+            skill_dir.mkdir()
+            (skill_dir / "SKILL.md").write_text("""---
+name: morning-brief
+description: Summarise my day.
+metadata:
+  praisonai:
+    automation:
+      schedule: "cron:0 8 * * mon-fri"
+      deliver: "origin"
+      prompt: "Give me today's brief."
+---
+
+Body.
+""")
+
+            props = read_properties(skill_dir)
+
+            assert props.automation is not None
+            assert props.automation.schedule == "cron:0 8 * * mon-fri"
+            assert props.automation.deliver == "origin"
+            assert props.automation.prompt == "Give me today's brief."
+
+    def test_read_properties_without_automation(self):
+        """Test that automation is None when not declared."""
+        from praisonaiagents.skills.parser import read_properties
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            skill_dir = Path(tmpdir) / "plain"
+            skill_dir.mkdir()
+            (skill_dir / "SKILL.md").write_text("""---
+name: plain
+description: No automation here.
+---
+
+Body.
+""")
+
+            props = read_properties(skill_dir)
+
+            assert props.automation is None
+
     def test_read_properties_utf8_encoding(self):
         """Test reading UTF-8 encoded SKILL.md files.
         
@@ -337,3 +384,55 @@ Works with internationalization!
             assert "José María" in props.metadata["author"]  # accented characters
             assert "naïve" in props.metadata["notes"]  # accented character
             assert "émphasis" in props.metadata["notes"]  # accented character
+
+
+class TestReadPropertiesAutomation:
+    """Tests for parsing the optional automation frontmatter block."""
+
+    def test_read_properties_parses_automation(self):
+        from praisonaiagents.skills.parser import read_properties
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            skill_dir = Path(tmpdir) / "morning-brief"
+            skill_dir.mkdir()
+            (skill_dir / "SKILL.md").write_text("""---
+name: morning-brief
+description: Summarise my calendar and unread priorities for the day.
+metadata:
+  praisonai:
+    automation:
+      schedule: "cron:0 8 * * mon-fri"
+      deliver: "origin"
+      prompt: "Give me today's brief."
+---
+
+# Morning Brief
+""")
+
+            props = read_properties(skill_dir)
+
+            assert props.automation is not None
+            assert props.automation.schedule == "cron:0 8 * * mon-fri"
+            assert props.automation.deliver == "origin"
+            assert props.automation.prompt == "Give me today's brief."
+
+    def test_read_properties_no_automation_defaults_none(self):
+        from praisonaiagents.skills.parser import read_properties
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            skill_dir = Path(tmpdir) / "plain-skill"
+            skill_dir.mkdir()
+            (skill_dir / "SKILL.md").write_text("""---
+name: plain-skill
+description: A skill with no automation block.
+metadata:
+  author: test-org
+---
+
+# Plain Skill
+""")
+
+            props = read_properties(skill_dir)
+
+            assert props.automation is None
+            assert props.metadata["author"] == "test-org"

@@ -260,6 +260,31 @@ def find_session_model(
     return None
 
 
+def find_session_reasoning_effort(
+    session_id: str, project_path: Optional[str] = None
+) -> Optional[str]:
+    """Return the reasoning effort a resumable session was last run with.
+
+    Mirrors :func:`find_session_model`: searches the canonical CLI stores in the
+    same order and returns the first recorded graded effort so
+    ``--continue``/``--session`` can restore it alongside the model (Issue #4452).
+    Returns ``None`` when none was recorded, letting the caller fall back to the
+    default / per-invocation value.
+    """
+    if not session_id:
+        return None
+    for store in canonical_cli_stores(project_path):
+        try:
+            if not store.session_exists(session_id):
+                continue
+            effort = store.get_session_reasoning_effort(session_id)
+        except Exception:
+            continue
+        if isinstance(effort, str) and effort:
+            return effort
+    return None
+
+
 def build_cli_memory_config(
     session_id: Optional[str] = None,
     auto_save: Optional[str] = None,
@@ -317,6 +342,13 @@ def apply_cli_session_continuity(agent, session_id: str, project_path: Optional[
             model_name = getattr(model, "model", None)
             if isinstance(model_name, str):
                 fields["model"] = model_name
+        # Persist the graded reasoning effort alongside the model so a resume can
+        # restore the effort the conversation was running (Issue #4452), mirroring
+        # the model-persist precedent (Issue #3685). The agent's setter already
+        # normalises to a portable graded level, so record it only when set.
+        effort = getattr(agent, "reasoning_effort", None)
+        if isinstance(effort, str) and effort:
+            fields["reasoning_effort"] = effort
         store.update_session_metadata(session_id, **fields)
     except Exception:
         pass
@@ -541,3 +573,115 @@ def accumulate_session_usage(
         return current
 
     return updated
+
+
+def _first_exchange(history: List[Dict[str, Any]]) -> tuple:
+    """Return ``(user_msg, assistant_msg)`` for the first user↔assistant turn.
+
+    Returns ``(None, None)`` when the pair is not yet present or the contents
+    are not plain non-empty strings.
+    """
+    user_msg = None
+    assistant_msg = None
+    for msg in history or []:
+        role = msg.get("role")
+        content = msg.get("content")
+        if role == "user" and not user_msg:
+            if isinstance(content, str) and content.strip():
+                user_msg = content
+        elif role == "assistant" and not assistant_msg and user_msg:
+            if isinstance(content, str) and content.strip():
+                assistant_msg = content
+                break
+    return user_msg, assistant_msg
+
+
+def maybe_auto_title_session(
+    session_id: str,
+    project_path: Optional[str] = None,
+    explicit_title: bool = False,
+) -> Optional[str]:
+    """Auto-generate a human-readable title after the first CLI exchange.
+
+    Composes the already-shipped ``generate_title_async`` helper so
+    ``session list`` / resume pickers show meaningful names instead of opaque
+    ids (Issue #5141). No-op when a title already exists, when ``--title`` was
+    given (``explicit_title``), or before the first user↔assistant pair lands.
+
+    Best-effort: any failure degrades silently to the existing id/agent-name
+    fallback and never blocks or errors the run. Returns the generated title
+    when one was set, else ``None``.
+    """
+    if not session_id or explicit_title:
+        return None
+
+    store = _resolve_usage_store(session_id, project_path) or get_project_session_store(project_path)
+    if store is None:
+        return None
+
+    try:
+        data = store.get_session(session_id)
+        metadata = dict(getattr(data, "metadata", {}) or {})
+    except Exception:
+        return None
+
+    existing = metadata.get("title")
+    if isinstance(existing, str) and existing.strip():
+        return None
+
+    try:
+        history = store.get_chat_history(session_id) or []
+    except Exception:
+        return None
+
+    user_msg, assistant_msg = _first_exchange(history)
+    if not user_msg or not assistant_msg:
+        return None
+
+    try:
+        from praisonaiagents.session.title import generate_title_async
+
+        primary_model = None
+        model = metadata.get("model")
+        if isinstance(model, str) and model:
+            primary_model = model
+
+        async def _run() -> str:
+            return await generate_title_async(
+                user_msg, assistant_msg, primary_model=primary_model
+            )
+
+        try:
+            import asyncio
+
+            asyncio.get_running_loop()
+        except RuntimeError:
+            import asyncio
+
+            title = asyncio.run(_run())
+        else:
+            # Running inside an event loop (e.g. TUI): run the coroutine in a
+            # dedicated worker loop so we never block or reuse the caller's.
+            import asyncio
+            import concurrent.futures
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                title = pool.submit(asyncio.run, _run()).result()
+
+        if title and title.strip():
+            # Re-check under the freshest read: a manual `rename_session` from
+            # another process may have landed while the model request was in
+            # flight. Never clobber a user-chosen title with a generated one.
+            try:
+                latest = store.get_session(session_id)
+                latest_title = dict(getattr(latest, "metadata", {}) or {}).get("title")
+                if isinstance(latest_title, str) and latest_title.strip():
+                    return None
+            except Exception:
+                pass
+            store.rename_session(session_id, title.strip())
+            return title.strip()
+    except Exception:
+        return None
+
+    return None

@@ -83,10 +83,28 @@ class RunPolicy:
             injection patterns before it reaches the model.
         deliver_on_failure: On failure, deliver a compact failure summary to
             the job's delivery target (fail-closed delivery).
+        alert_after_failures: When ``deliver_on_failure`` is on, only alert
+            after this many *consecutive* failures of the same error signature
+            (default 1 = alert on the first failure). This latches the failure
+            summary through the core :class:`IncidentTracker` so a broken job
+            alerts **once** per distinct error and sends a single recovery note
+            on the next success, instead of re-sending the identical summary on
+            every failing tick (alert fatigue). Values below 1 are treated as 1.
         audit_dir: Directory where full run output is persisted regardless of
             delivery outcome.  ``None`` disables the durable output audit.
         scanner: Optional callable ``(prompt: str) -> PromptScanResult`` that
             overrides the built-in heuristic scan (e.g. a guardrail plugin).
+        hold_on_rate_limit: When ``True`` (default) a run that fails with a
+            provider rate-limit / quota signal parks the job past the provider's
+            own reset window (its ``Retry-After`` / usage-reset plus
+            ``hold_slack_seconds``) instead of re-firing and re-failing every
+            tick against a benched provider.  Intervening fires coalesce; the
+            executor emits one "held until N" notice via the incident path and
+            clears the hold on the first run that reaches the model.  Set
+            ``False`` to keep the prior fire-every-tick behaviour.
+        hold_slack_seconds: Extra seconds added past the provider's reset window
+            when parking (default 60) so the job does not re-fire the instant
+            the window reopens (clock skew / provider rounding).
     """
 
     allowed_toolsets: Optional[Set[str]] = None
@@ -97,6 +115,11 @@ class RunPolicy:
     deliver_on_failure: bool = True
     audit_dir: Optional[str] = None
     scanner: Optional[Any] = None
+    # Appended last to keep the pre-existing positional constructor order of
+    # ``audit_dir``/``scanner`` stable for callers that pass them positionally.
+    alert_after_failures: int = 1
+    hold_on_rate_limit: bool = True
+    hold_slack_seconds: float = 60.0
 
     # ── toolset scoping ──────────────────────────────────────────────
 

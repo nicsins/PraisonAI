@@ -13,6 +13,7 @@ from datetime import datetime
 
 from ..llm.protocols import LLMProviderProtocol
 from .tokens import estimate_messages_tokens, get_estimator
+from ..llm.model_providers import default_auxiliary_model
 
 
 @dataclass
@@ -83,6 +84,8 @@ class ContextCompressor:
         )
     """
     
+    _MAX_SESSION_HISTORY = 100
+
     def __init__(
         self,
         llm: Optional[LLMProviderProtocol] = None,
@@ -189,6 +192,8 @@ class ContextCompressor:
                 summary_text=summary_text,
             )
             self._session_history.append(compression_session)
+            # Bounded so reused compressors don't retain every summary forever
+            del self._session_history[:-self._MAX_SESSION_HISTORY]
         
         return CompressResult(
             messages=compressed_messages,
@@ -374,7 +379,7 @@ Provide a concise summary under {max_tokens} tokens that preserves the essential
                 # Try common OpenAI-compatible interface - check if async
                 if hasattr(self.llm.chat.completions, 'acreate'):
                     response = await self.llm.chat.completions.acreate(
-                        model=model or "gpt-4o-mini",
+                        model=default_auxiliary_model(model),
                         messages=[{"role": "user", "content": summary_prompt}],
                         max_tokens=max_tokens,
                         temperature=0.3,
@@ -382,7 +387,7 @@ Provide a concise summary under {max_tokens} tokens that preserves the essential
                 else:
                     # Fallback to sync create (blocking in async context)
                     response = self.llm.chat.completions.create(
-                        model=model or "gpt-4o-mini",
+                        model=default_auxiliary_model(model),
                         messages=[{"role": "user", "content": summary_prompt}],
                         max_tokens=max_tokens,
                         temperature=0.3,

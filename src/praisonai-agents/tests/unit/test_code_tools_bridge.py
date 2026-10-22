@@ -17,6 +17,24 @@ from praisonaiagents.tools.tool_proxy import (
 from praisonaiagents.tools.python_tools import execute_code_with_tools
 
 
+@pytest.fixture(autouse=True)
+def _clean_approval_context():
+    """Every test here starts with nothing pre-approved.
+
+    Approvals are remembered in a contextvar so a granted tool is not re-asked.
+    That is correct behaviour and fatal for these tests: an approval left by an
+    earlier test made a denial test see an already-approved tool and not raise
+    (DID NOT RAISE PermissionError), and made the every-call gate test count one
+    callback invocation instead of two. Both passed alone and failed under a
+    random seed.
+    """
+    from praisonaiagents.approval import clear_approval_context
+
+    clear_approval_context()
+    yield
+    clear_approval_context()
+
+
 @pytest.fixture
 def registry():
     reg = ToolRegistry()
@@ -185,6 +203,59 @@ def test_positional_args_visible_to_approval(registry):
         remove_approval_requirement("fetch")
 
 
+def test_positional_call_with_allow_policy_hook_does_not_break(registry):
+    # Regression: an active policy hook that ALLOWS a call without rewriting its
+    # arguments must not force keyword-only redispatch. Because the hook is
+    # handed a *copy* of the bound kwargs, an identity check on its return would
+    # always trigger a rebind and corrupt a positional call to a decorated tool
+    # (mapping the value onto ``*args``/``**kwargs`` param names). The proxy must
+    # compare by value and dispatch the original positional call unchanged.
+    def allow_no_rewrite(name, arguments):
+        return None, arguments
+
+    proxy = ToolProxy(["fetch"], registry=registry, policy_hook=allow_no_rewrite)
+    assert proxy.fetch("a") == 1
+    assert proxy.fetch(url="b") == 2
+
+
+def test_policy_hook_guardrail_rewrite_is_honoured(registry):
+    # A guardrail that rewrites an argument must apply to the actual tool call
+    # (not be discarded), on both the positional and keyword forms.
+    def rewrite(name, arguments):
+        new = dict(arguments)
+        new["url"] = "c"
+        return None, new
+
+    proxy = ToolProxy(["fetch"], registry=registry, policy_hook=rewrite)
+    assert proxy.fetch("a") == 3
+    assert proxy.fetch(url="b") == 3
+
+
+def test_policy_hook_denies(registry):
+    def deny(name, arguments):
+        return "blocked by policy", arguments
+
+    proxy = ToolProxy(["fetch"], registry=registry, policy_hook=deny)
+    with pytest.raises(PermissionError):
+        proxy.fetch("a")
+
+
+def test_legacy_bare_string_policy_hook_still_supported(registry):
+    # Older/third-party hooks return a bare denial string / None (no tuple).
+    def legacy_deny(name, arguments):
+        return "nope"
+
+    proxy = ToolProxy(["fetch"], registry=registry, policy_hook=legacy_deny)
+    with pytest.raises(PermissionError):
+        proxy.fetch("a")
+
+    def legacy_allow(name, arguments):
+        return None
+
+    proxy_ok = ToolProxy(["fetch"], registry=registry, policy_hook=legacy_allow)
+    assert proxy_ok.fetch("a") == 1
+
+
 def test_init_reinitialization_bypass_blocked(registry):
     # Sandboxed code must not be able to call tools.__init__([...]) to re-bind
     # the proxy's allow-list/registry and reach a disallowed tool.
@@ -216,6 +287,13 @@ def test_approval_gate_required_for_every_call(registry):
         clear_approval_context,
         ApprovalDecision,
     )
+
+    # The registry remembers approvals for the life of the process, so a grant
+    # from an earlier test in the same run satisfied one of the two calls below
+    # and this counted 1. The precondition of "every call is gated" is that
+    # nothing is pre-approved, so establish it rather than inherit it.
+    from praisonaiagents.approval import get_approval_registry
+    get_approval_registry().clear_approved()
 
     calls = {"count": 0}
 
@@ -381,6 +459,124 @@ def test_serve_tool_call_rejects_unregistered(registry):
         serve_tool_call("ghost", [], {}, allowed=["ghost"], registry=registry)
 
 
+# ---------------------------------------------------------------------------
+# Shipped default transport — LocalProcessBridge (subprocess + bridged tools)
+# ---------------------------------------------------------------------------
+
+
+def test_local_process_bridge_satisfies_protocol():
+    from praisonaiagents.tools.tool_proxy import LocalProcessBridge
+
+    assert isinstance(LocalProcessBridge(), CodeToolBridge)
+
+
+def test_isolated_multi_step_pipeline_over_bridge(registry):
+    from praisonaiagents.tools.tool_proxy import LocalProcessBridge
+
+    code = (
+        "vals = [fetch(u) for u in ['a', 'b', 'c']]\n"
+        "best = max(double(v) for v in vals)\n"
+        "best\n"
+    )
+    result = execute_code_with_tools(
+        code,
+        allowed_tools=["fetch", "double"],
+        registry=registry,
+        bridge=LocalProcessBridge(),
+    )
+    assert result["success"] is True
+    assert result["result"] == "6"
+
+
+def test_isolated_stdout_only_returns(registry):
+    from praisonaiagents.tools.tool_proxy import LocalProcessBridge
+
+    code = "print('answer:', fetch('a') + fetch('b'))\n"
+    result = execute_code_with_tools(
+        code,
+        allowed_tools=["fetch"],
+        registry=registry,
+        bridge=LocalProcessBridge(),
+    )
+    assert result["success"] is True
+    assert "answer: 3" in result["stdout"]
+
+
+def test_isolated_rejects_disallowed_bare_name(registry):
+    # A disallowed tool is simply not present in the isolated child's namespace,
+    # so the script fails outright (stronger than the in-process path: the name
+    # never even resolves to a proxy).
+    from praisonaiagents.tools.tool_proxy import LocalProcessBridge
+
+    result = execute_code_with_tools(
+        "double(2)\n",
+        allowed_tools=["fetch"],
+        registry=registry,
+        bridge=LocalProcessBridge(),
+    )
+    assert result["success"] is False
+
+
+def test_isolated_rejects_disallowed_via_tools_namespace(registry):
+    # The tools.<name> form DOES cross the boundary; the parent-side gate must
+    # reject it (authoritative), surfacing as PermissionError to the caller.
+    from praisonaiagents.tools.tool_proxy import LocalProcessBridge
+
+    with pytest.raises(PermissionError):
+        execute_code_with_tools(
+            "tools.double(x=2)\n",
+            allowed_tools=["fetch"],
+            registry=registry,
+            bridge=LocalProcessBridge(),
+        )
+
+
+def test_isolated_blocks_imports(registry):
+    from praisonaiagents.tools.tool_proxy import LocalProcessBridge
+
+    result = execute_code_with_tools(
+        "import os\nprint(os.getcwd())\n",
+        allowed_tools=["fetch"],
+        registry=registry,
+        bridge=LocalProcessBridge(),
+    )
+    assert result["success"] is False
+
+
+def test_build_code_execution_tools_isolated_mode(registry):
+    from praisonaiagents.tools.python_tools import build_code_execution_tools
+
+    tools = build_code_execution_tools(
+        code_mode="isolated",
+        allowed_tools=["fetch"],
+        registry=registry,
+    )
+    assert len(tools) == 1
+    assert tools[0].__name__ == "execute_code"
+
+
+def test_build_code_execution_tools_rejects_unknown_mode():
+    from praisonaiagents.tools.python_tools import build_code_execution_tools
+
+    with pytest.raises(ValueError):
+        build_code_execution_tools(code_mode="bogus")
+
+
+def test_execution_config_accepts_isolated():
+    from praisonaiagents.config.feature_configs import ExecutionConfig
+
+    cfg = ExecutionConfig(code_execution=True, code_mode="isolated")
+    assert cfg.code_mode == "isolated"
+    assert ExecutionConfig.from_dict(cfg.to_dict()).code_mode == "isolated"
+
+
+def test_execution_config_rejects_unknown_code_mode():
+    from praisonaiagents.config.feature_configs import ExecutionConfig
+
+    with pytest.raises(ValueError):
+        ExecutionConfig(code_execution=True, code_mode="bogus")
+
+
 def test_serve_tool_call_honours_approval_gate(registry):
     from praisonaiagents.approval import (
         add_approval_requirement,
@@ -403,3 +599,85 @@ def test_serve_tool_call_honours_approval_gate(registry):
     finally:
         set_approval_callback(None)
         remove_approval_requirement("fetch")
+
+
+def test_isolated_blocks_introspection_escape(registry):
+    # A dunder-attribute traversal that could recover unrestricted builtins must
+    # be rejected before the child runs (same posture as the in-process path).
+    from praisonaiagents.tools.tool_proxy import LocalProcessBridge
+
+    result = execute_code_with_tools(
+        "type(tools).__subclasses__()\n",
+        allowed_tools=["fetch"],
+        registry=registry,
+        bridge=LocalProcessBridge(),
+    )
+    assert result["success"] is False
+
+
+def test_isolated_ordinary_tool_error_is_not_reraised(registry):
+    # An allowed tool raising an ordinary error must NOT escape the bridge as an
+    # exception; it must return a structured success=False result.
+    from praisonaiagents.tools.tool_proxy import LocalProcessBridge
+
+    reg = ToolRegistry()
+
+    def boom():
+        raise ValueError("kaboom")
+
+    reg.register(boom, name="boom")
+    result = execute_code_with_tools(
+        "boom()\n",
+        allowed_tools=["boom"],
+        registry=reg,
+        bridge=LocalProcessBridge(),
+    )
+    assert result["success"] is False
+    assert "kaboom" in (result.get("stderr") or "")
+
+
+def test_serve_tool_call_awaits_async_tool(registry):
+    # An async def tool must be awaited to its value, not returned as a coroutine.
+    from praisonaiagents.tools.tool_proxy import serve_tool_call
+
+    reg = ToolRegistry()
+
+    async def afetch(url):
+        return {"a": 10}[url]
+
+    reg.register(afetch, name="afetch")
+    value = serve_tool_call("afetch", ["a"], {}, allowed=["afetch"], registry=reg)
+    assert value == 10
+
+
+def test_scoped_registry_does_not_discover_plugins():
+    # A discovery-disabled registry must NOT auto-discover global plugins on a
+    # missing-name lookup: the agent-scoped tool boundary is authoritative.
+    reg = ToolRegistry(discovery_enabled=False)
+    called = {"n": 0}
+
+    def _spy():
+        called["n"] += 1
+        return 0
+
+    reg.discover_plugins = _spy  # type: ignore[assignment]
+    assert reg.get("some_installed_plugin") is None
+    assert called["n"] == 0
+
+
+def test_isolated_startup_error_returns_structured_failure(registry, monkeypatch):
+    # A subprocess launch failure must surface as the documented failure dict,
+    # not a raw exception on the caller.
+    import subprocess
+
+    from praisonaiagents.tools.tool_proxy import LocalProcessBridge
+
+    def _boom(*a, **k):
+        raise OSError("cannot start process")
+
+    monkeypatch.setattr(subprocess, "Popen", _boom)
+    result = LocalProcessBridge().run_code(
+        "fetch('a')\n", allowed_tools=["fetch"], registry=registry
+    )
+    assert result["success"] is False
+    assert "could not start child" in (result.get("stderr") or "")

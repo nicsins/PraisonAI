@@ -82,6 +82,30 @@ def _get_call_module():
     call_module = getattr(_mod, 'call')
     return call_module
 
+
+def _build_call_args(args, argv=None):
+    """Build the ``praisonai.api.call.main()`` argv from parsed CLI args.
+
+    ``--port``/``--host`` are forwarded only when the user typed them. The
+    call server's own defaults (``$PORT``, else 8090 / 127.0.0.1) differ from
+    the shared argparse defaults (8005 / 127.0.0.1), so always forwarding
+    ``args.port`` would silently move the server off its documented port.
+    """
+    raw = sys.argv[1:] if argv is None else list(argv)
+
+    def _typed(flag):
+        return any(a == flag or a.startswith(flag + "=") for a in raw)
+
+    call_args = []
+    if getattr(args, "public", False):
+        call_args.append("--public")
+    if _typed("--port") and getattr(args, "port", None) is not None:
+        call_args.extend(["--port", str(args.port)])
+    if _typed("--host") and getattr(args, "host", None) is not None:
+        call_args.extend(["--host", str(args.host)])
+    return call_args
+
+
 def _get_gradio():
     """Lazy import gradio only when gradio UI is used.
     
@@ -368,7 +392,10 @@ class PraisonAI:
                 'approval',
                 'approve_all_tools',
                 'approval_timeout',
+                'permissions_config',
                 'output',
+                'max_tokens',
+                '_max_tokens_explicit',
             ):
                 if hasattr(preserved_args, attr):
                     setattr(args, attr, getattr(preserved_args, attr))
@@ -648,10 +675,7 @@ class PraisonAI:
                 print("[red]ERROR: Call feature is not installed. Install with:[/red]")
                 print("\npip install \"praisonai[call]\"\n")
                 return
-            call_args = []
-            if args.public:
-                call_args.append('--public')
-            _get_call_module().main(call_args)
+            _get_call_module().main(_build_call_args(args))
             return
 
         if args.command == 'train':
@@ -1058,9 +1082,7 @@ class PraisonAI:
                 print("\npip install \"praisonai[call]\"\n")
                 sys.exit(1)
             
-            call_args = []
-            if args.public:
-                call_args.append('--public')
+            call_args = _build_call_args(args)
             _get_call_module().main(call_args)
             sys.exit(0)
 
@@ -1181,16 +1203,20 @@ class PraisonAI:
                         if '=' in var:
                             key, value = var.split('=', 1)
                             workflow_vars[key] = value
-                self.handle_workflow_command(action, action_args, workflow_vars, args)
-                sys.exit(0)
+                # Propagate the handler's exit code. This used to be a
+                # hard-coded sys.exit(0): a run whose only step failed still
+                # reported success, so a CI job that ran a workflow doing
+                # nothing stayed green.
+                sys.exit(self.handle_workflow_command(action, action_args, workflow_vars, args) or 0)
 
             elif args.command == 'hooks':
                 self._require_agents()
                 
                 # Get action from remaining args
                 action = unknown_args[0] if unknown_args else 'list'
-                self.handle_hooks_command(action)
-                sys.exit(0)
+                # Propagate the handler's exit code: an unknown action used to
+                # print an error and still exit 0, so scripts saw success.
+                sys.exit(self.handle_hooks_command(action) or 0)
 
             elif args.command == 'knowledge':
                 self._require_agents()
@@ -1380,16 +1406,39 @@ class PraisonAI:
                         or os.path.exists(first)
                     )
                 )
-                if is_yaml_target:
+                if is_yaml_target and os.environ.get("PRAISONAI_IN_MODERN_RUN"):
+                    # We are already *inside* a modern ``run`` invocation
+                    # (``commands/run.py`` delegated the YAML to this legacy
+                    # executor). Re-dispatching to ``run_app`` would re-enter the
+                    # same Typer app and recurse forever ("maximum recursion depth
+                    # exceeded", issue #5597). Execute the YAML directly instead:
+                    # set it as the agent file and fall through to the normal
+                    # legacy execution path below.
+                    #
+                    # Prefer the constructor-provided ``agent_file`` over the
+                    # relative ``sys.argv`` token: the modern runner resolves the
+                    # target to an absolute path *before* a ``--worktree`` chdir
+                    # and passes it here (``self.agent_file`` is still pristine at
+                    # this point), so an untracked/ignored YAML absent from the
+                    # fresh worktree still loads. Fall back to ``first`` only when
+                    # no explicit path was supplied (default ``agents.yaml``
+                    # sentinel from ``__init__``).
+                    if self.agent_file and self.agent_file != "agents.yaml":
+                        pass  # keep the resolved constructor path
+                    else:
+                        self.agent_file = first
+                    args.command = None
+                elif is_yaml_target:
                     # Modern engine (``commands/run.py`` run_main); the first
                     # arg is passed as the Typer ``target`` (YAML file/prompt).
                     from ..commands.run import app as run_app
                     run_app(unknown_args)
                     sys.exit(0)
-                # Run command - async jobs API for long-running tasks
-                from ..features.jobs import handle_run_command
-                handle_run_command(unknown_args, verbose=getattr(args, 'verbose', False))
-                sys.exit(0)
+                else:
+                    # Run command - async jobs API for long-running tasks
+                    from ..features.jobs import handle_run_command
+                    handle_run_command(unknown_args, verbose=getattr(args, 'verbose', False))
+                    sys.exit(0)
             
             elif args.command == 'managed':
                 # Managed agents — delegate to Typer app
@@ -2015,6 +2064,9 @@ class PraisonAI:
         approval_timeout = getattr(self.args, 'approval_timeout', None)
         if approval_timeout is not None:
             cli_config['approval_timeout'] = approval_timeout
+        permissions_config = getattr(self.args, 'permissions_config', None)
+        if permissions_config:
+            cli_config['permissions_config'] = permissions_config
             
         # Extract streaming configuration for YAML CLI parity
         stream = getattr(self.args, 'stream', False)
@@ -2024,11 +2076,27 @@ class PraisonAI:
             if stream_metrics:
                 cli_config['stream_metrics'] = True
 
+        # Extract --metrics / --metrics-json so YAML team runs report usage
+        if getattr(self.args, 'metrics', False):
+            cli_config['metrics'] = True
+        if getattr(self.args, 'metrics_json', False):
+            cli_config['metrics_json'] = True
+
         output_mode = getattr(self.args, 'output', None)
         if output_mode is None:
             output_mode = getattr(self.args, 'output_format', None)
         if output_mode is not None:
             cli_config['output'] = output_mode
+
+        max_tokens = getattr(self.args, 'max_tokens', None)
+        if max_tokens is not None:
+            cli_config['max_tokens'] = max_tokens
+        # Newer callers mark whether the CLI option was explicitly supplied;
+        # retain that bit so YAML agent-level budgets are not shadowed by a
+        # parser default of 16000.
+        explicit_max_tokens = getattr(self.args, '_max_tokens_explicit', None)
+        if explicit_max_tokens is not None:
+            cli_config['_max_tokens_explicit'] = bool(explicit_max_tokens)
 
         # Extract handoff configuration for YAML CLI parity
         handoff = getattr(self.args, 'handoff', None)

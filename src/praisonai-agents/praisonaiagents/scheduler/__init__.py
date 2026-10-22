@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     from .store import FileScheduleStore
     from .config_store import ConfigYamlScheduleStore
     from .parser import parse_schedule
+    from .due import quota_hold_from_failure
     from .runner import ScheduleRunner
     from .loop import ScheduleLoop, InProcessScheduleProvider
     from .protocols import (
@@ -34,6 +35,7 @@ if TYPE_CHECKING:
         GateResult,
         SchedulerProviderProtocol,
     )
+    from .incidents import Incident, IncidentTracker, error_signature, normalise_error
 
 _module_cache = {}
 
@@ -105,6 +107,11 @@ def __getattr__(name: str):
         _module_cache[name] = parse_schedule
         return parse_schedule
 
+    if name == "quota_hold_from_failure":
+        from .due import quota_hold_from_failure
+        _module_cache[name] = quota_hold_from_failure
+        return quota_hold_from_failure
+
     if name == "ScheduleRunner":
         from .runner import ScheduleRunner
         _module_cache[name] = ScheduleRunner
@@ -142,6 +149,14 @@ def __getattr__(name: str):
         _module_cache["SchedulerProviderProtocol"] = SchedulerProviderProtocol
         return _module_cache[name]
 
+    if name in ("Incident", "IncidentTracker", "error_signature", "normalise_error"):
+        from .incidents import Incident, IncidentTracker, error_signature, normalise_error
+        _module_cache["Incident"] = Incident
+        _module_cache["IncidentTracker"] = IncidentTracker
+        _module_cache["error_signature"] = error_signature
+        _module_cache["normalise_error"] = normalise_error
+        return _module_cache[name]
+
     if name in ("Blueprint", "BlueprintSlot", "BlueprintStoreProtocol"):
         from .blueprint_defs import Blueprint, BlueprintSlot, BlueprintStoreProtocol
         _module_cache["Blueprint"] = Blueprint
@@ -167,6 +182,7 @@ __all__ = [
     "FileScheduleStore",
     "ConfigYamlScheduleStore",
     "parse_schedule",
+    "quota_hold_from_failure",
     "ScheduleRunner",
     "ScheduleLoop",
     "InProcessScheduleProvider",
@@ -175,6 +191,10 @@ __all__ = [
     "JobStateStoreProtocol",
     "GateResult",
     "SchedulerProviderProtocol",
+    "Incident",
+    "IncidentTracker",
+    "error_signature",
+    "normalise_error",
     "Blueprint",
     "BlueprintSlot",
     "BlueprintStoreProtocol",

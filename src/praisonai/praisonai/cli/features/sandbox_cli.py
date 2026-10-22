@@ -109,7 +109,8 @@ class SandboxHandler:
             finally:
                 await sandbox.stop()
         
-        exit_code = asyncio.run(execute())
+        from praisonai._async_bridge import run_cli_coro
+        exit_code = run_cli_coro(execute())
         sys.exit(exit_code)
     
     def shell(
@@ -156,37 +157,45 @@ class SandboxHandler:
         print("Type 'exit' or Ctrl+D to quit")
         print()
         
-        async def run_shell():
-            await sandbox.start()
-            try:
-                while True:
-                    try:
-                        code = input(">>> ")
-                        if code.strip().lower() == "exit":
-                            break
-                        if not code.strip():
-                            continue
-                        
-                        result = await sandbox.execute(
+        # Keep the blocking terminal input() and its Ctrl+C handling on the
+        # main/CLI thread: SIGINT is only delivered to the main thread, so if
+        # input() ran inside a coroutine on the shared bridge loop the shell's
+        # `except KeyboardInterrupt` would never fire and the interrupt would
+        # instead abort the whole command. Only the async sandbox operations
+        # are dispatched onto the shared bridge (one call each) so per-loop
+        # pools survive without ever blocking that loop on user input.
+        from praisonai._async_bridge import run_cli_coro
+
+        run_cli_coro(sandbox.start())
+        try:
+            while True:
+                try:
+                    code = input(">>> ")
+                    if code.strip().lower() == "exit":
+                        break
+                    if not code.strip():
+                        continue
+
+                    result = run_cli_coro(
+                        sandbox.execute(
                             code,
                             limits=ResourceLimits(timeout_seconds=30),
                         )
-                        
-                        if result.stdout:
-                            print(result.stdout, end="")
-                        if result.stderr:
-                            print(result.stderr, file=sys.stderr, end="")
-                        if result.error:
-                            print(f"Error: {result.error}")
-                    except EOFError:
-                        break
-                    except KeyboardInterrupt:
-                        print()
-                        continue
-            finally:
-                await sandbox.stop()
-        
-        asyncio.run(run_shell())
+                    )
+
+                    if result.stdout:
+                        print(result.stdout, end="")
+                    if result.stderr:
+                        print(result.stderr, file=sys.stderr, end="")
+                    if result.error:
+                        print(f"Error: {result.error}")
+                except EOFError:
+                    break
+                except KeyboardInterrupt:
+                    print()
+                    continue
+        finally:
+            run_cli_coro(sandbox.stop())
     
     def status(self) -> None:
         """Check sandbox backend availability."""
@@ -201,29 +210,3 @@ class SandboxHandler:
                 print(f"  {name}: {flag}")
         except ImportError as exc:
             print(f"  Error: {exc}")
-
-
-def handle_sandbox_command(args) -> None:
-    """Handle sandbox CLI command."""
-    handler = SandboxHandler()
-    
-    subcommand = getattr(args, "sandbox_command", None) or "status"
-    
-    if subcommand == "run":
-        handler.run(
-            code=getattr(args, "code", None),
-            file=getattr(args, "file", None),
-            sandbox_type=getattr(args, "type", "subprocess"),
-            image=getattr(args, "image", "python:3.11-slim"),
-            timeout=getattr(args, "timeout", 60),
-        )
-    elif subcommand == "shell":
-        handler.shell(
-            sandbox_type=getattr(args, "type", "subprocess"),
-            image=getattr(args, "image", "python:3.11-slim"),
-        )
-    elif subcommand == "status":
-        handler.status()
-    else:
-        print(f"Unknown sandbox command: {subcommand}")
-        print("Available commands: run, shell, status")

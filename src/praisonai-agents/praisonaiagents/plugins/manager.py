@@ -22,6 +22,87 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 
+# Lifecycle hooks that carry the user's prompt / conversation content and can
+# rewrite it (transform-style). Dispatching these to an arbitrary pip-installed
+# entry-point plugin lets a transitively-installed dependency read or tamper
+# with every user's messages, so they are gated behind an explicit grant.
+#
+# This deliberately covers BOTH directions of the conversation: the inbound
+# prompt/messages/model-response events AND the outbound message-delivery
+# events (``message_sending`` can rewrite the assistant reply sent to the
+# user; ``message_sent`` / ``message_undelivered`` expose that reply). Gating
+# only the inbound half would let an ungranted plugin still read or tamper with
+# every outbound reply.
+CONVERSATION_HOOKS = frozenset({
+    PluginHook.MESSAGE_RECEIVED,
+    PluginHook.BEFORE_LLM,
+    PluginHook.AFTER_LLM,
+    PluginHook.BEFORE_AGENT,
+    PluginHook.AFTER_AGENT,
+    PluginHook.MESSAGE_SENDING,
+    PluginHook.MESSAGE_SENT,
+    PluginHook.MESSAGE_UNDELIVERED,
+})
+
+
+def _package_root() -> Optional[Path]:
+    """Filesystem directory of the installed ``praisonaiagents`` package.
+
+    Used to verify first-party provenance by real file location rather than a
+    self-asserted ``__module__`` string. Returns ``None`` if it cannot be
+    resolved (in which case provenance falls back to failing closed).
+    """
+    try:
+        import praisonaiagents
+
+        file = getattr(praisonaiagents, "__file__", None)
+        if not file:
+            return None
+        return Path(file).resolve().parent
+    except Exception:
+        return None
+
+
+def _is_first_party(plugin: Plugin) -> bool:
+    """True only for plugins genuinely bundled inside the framework.
+
+    First-party plugins are shipped and reviewed with the framework, so they
+    are trusted with conversation content. A plugin's ``__module__`` string is
+    self-asserted and therefore spoofable — a third-party pip package could set
+    ``__module__ = "praisonaiagents.evil"`` to falsely claim first-party trust.
+
+    To make the trust decision on provenance the plugin cannot forge, we
+    require BOTH:
+
+    1. the class's ``__module__`` sits under the ``praisonaiagents`` namespace, and
+    2. the module's real ``__file__`` resolves to a path *inside* the installed
+       ``praisonaiagents`` package directory.
+
+    Any plugin failing either check — notably an auto-discovered
+    ``praisonai.plugins`` entry point from an arbitrary distribution — is
+    treated as third-party and denied conversation access by default.
+    """
+    cls = type(plugin)
+    module_name = getattr(cls, "__module__", "") or ""
+    if module_name != "praisonaiagents" and not module_name.startswith("praisonaiagents."):
+        return False
+
+    root = _package_root()
+    if root is None:
+        # Cannot verify provenance — fail closed rather than trust a string.
+        return False
+
+    module = sys.modules.get(module_name)
+    module_file = getattr(module, "__file__", None) if module is not None else None
+    if not module_file:
+        return False
+    try:
+        resolved = Path(module_file).resolve()
+    except Exception:
+        return False
+    return root == resolved.parent or root in resolved.parents
+
+
 def _env_plugins_suppressed() -> bool:
     """Return True when external plugins are suppressed via env for this run.
 
@@ -73,6 +154,41 @@ class PluginManager:
         # (e.g. Python ``plugins=False`` parity) forces suppression regardless.
         self._disabled = disabled
         self._suppression_notified = False
+        # Optional instance-local allow-list governing whether *late* plugin
+        # registrations default to enabled. ``None`` (default) means no
+        # restriction — every registration starts enabled, preserving the
+        # behaviour of standalone managers. The facade sets this only on the
+        # singleton used by ``plugins.enable([...])`` so selective enablement
+        # never leaks into independently constructed managers.
+        self._registration_allow_list: Optional[frozenset] = None
+
+    def set_registration_allow_list(
+        self, names: Optional[List[str]]
+    ) -> None:
+        """Set (or clear) the instance-local late-registration allow-list.
+
+        When ``names`` is a list, plugins registered after this call default to
+        disabled unless their name is included. Passing ``None`` clears the
+        restriction so future registrations start enabled again. An immutable
+        snapshot is stored so later mutations of the caller's list cannot
+        silently change registration behaviour.
+        """
+        with self._lock:
+            self._registration_allow_list = (
+                None if names is None else frozenset(names)
+            )
+
+    def _default_enabled_for_registration(self, plugin_name: str) -> bool:
+        """Whether a newly registered plugin should start enabled.
+
+        When a selective allow-list is active on *this* manager, late
+        registrations default to disabled unless explicitly allowed. Managers
+        without an allow-list keep registrations enabled by default.
+        """
+        allow_list = self._registration_allow_list
+        if allow_list is not None:
+            return plugin_name in allow_list
+        return True
 
     def is_discovery_disabled(self) -> bool:
         """Return True when external plugin discovery is suppressed this run.
@@ -174,10 +290,17 @@ class PluginManager:
                     return False
                 
                 self._plugins[info.name] = plugin
-                self._enabled[info.name] = True
+                self._enabled[info.name] = self._default_enabled_for_registration(info.name)
                 
                 # Initialize plugin
                 plugin.on_init({})
+
+                # Make the initialization observable to the hook system
+                # too. ``plugin.on_init`` is the plugin's *own* callback;
+                # ON_INIT is the runtime event other listeners
+                # (metrics/audit plugins, gateways) subscribe to. Without
+                # this emit the enum member was declared but never fired.
+                _emit_plugin_init(plugin)
                 
                 logger.info(f"Registered plugin: {info.name} v{info.version}")
                 return True
@@ -195,26 +318,31 @@ class PluginManager:
         Returns:
             True if unregistered successfully
         """
-        if name not in self._plugins:
-            return False
-        
+        with self._lock:
+            plugin = self._plugins.get(name)
+            if plugin is None:
+                return False
+            del self._plugins[name]
+            self._enabled.pop(name, None)
+
         try:
-            plugin = self._plugins[name]
             plugin.on_shutdown()
         except Exception as e:
             logger.warning(f"Error during plugin shutdown: {e}")
-        
-        del self._plugins[name]
-        del self._enabled[name]
-        
+
+        # Counterpart to the ON_INIT emit in register(): the plugin is going
+        # away, and a listener that saw it arrive must be able to see it leave.
+        _emit_plugin_shutdown(plugin)
+
         logger.info(f"Unregistered plugin: {name}")
         return True
     
     def enable(self, name: str) -> bool:
         """Enable a plugin."""
-        if name in self._enabled:
-            self._enabled[name] = True
-            return True
+        with self._lock:
+            if name in self._enabled:
+                self._enabled[name] = True
+                return True
         return False
     
     def disable(self, name: str) -> bool:
@@ -224,18 +352,40 @@ class PluginManager:
         hook registry, so disabling actually stops its lifecycle methods from
         firing during subsequent agent execution.
         """
-        if name in self._enabled:
+        with self._lock:
+            if name not in self._enabled:
+                return False
             self._enabled[name] = False
-            try:
-                self.unwire_from_hook_registry(name)
-            except Exception as e:
-                logger.debug(f"Failed to unwire plugin '{name}': {e}")
-            return True
-        return False
+        try:
+            self.unwire_from_hook_registry(name)
+        except Exception as e:
+            logger.debug(f"Failed to unwire plugin '{name}': {e}")
+        return True
     
     def is_enabled(self, name: str) -> bool:
         """Check if a plugin is enabled."""
         return self._enabled.get(name, False)
+
+    def _granted_conversation_access(self, name: str) -> bool:
+        """Whether a plugin may receive conversation-content hooks.
+
+        Least-privilege, safe-by-default: a plugin sees ``before_llm`` /
+        ``after_llm`` / ``before_agent`` / ``after_agent`` / ``message_received``
+        (which carry — and can rewrite — the user's prompt/messages) only when
+
+        - it is **first-party** (bundled in the framework), or
+        - the operator **granted** it in the per-plugin config options map via
+          ``allow_conversation: true`` (e.g. ``plugins.<name>.allow_conversation``).
+
+        Any other plugin — notably an auto-discovered ``praisonai.plugins``
+        entry point from an arbitrary pip package — is denied these hooks by
+        default while still receiving its tool/channel/utility hooks.
+        """
+        plugin = self._plugins.get(name)
+        if plugin is not None and _is_first_party(plugin):
+            return True
+        options = self._plugin_options.get(name) or {}
+        return options.get("allow_conversation") is True
     
     def get_plugin(self, name: str) -> Optional[Plugin]:
         """Get a plugin by name."""
@@ -364,12 +514,26 @@ class PluginManager:
             The result (may be modified by plugins)
         """
         result = args[0] if args else None
-        
-        for name, plugin in self._plugins.items():
-            if not self._enabled.get(name, False):
-                continue
-            
+
+        # Snapshot the enabled (name, plugin) pairs under the lock so a
+        # concurrent register/unregister cannot mutate the dict mid-iteration
+        # (which would raise RuntimeError and crash the firing hook point for
+        # every agent sharing this manager).
+        with self._lock:
+            enabled_plugins = [
+                (name, plugin)
+                for name, plugin in self._plugins.items()
+                if self._enabled.get(name, False)
+            ]
+
+        for name, plugin in enabled_plugins:
             if hook not in plugin.info.hooks:
+                continue
+
+            # Least-privilege gate: conversation-content hooks are default-deny
+            # for third-party/ungranted plugins so a pip-installed dependency
+            # cannot silently read or rewrite every user's prompt/messages.
+            if hook in CONVERSATION_HOOKS and not self._granted_conversation_access(name):
                 continue
             
             try:
@@ -421,21 +585,106 @@ class PluginManager:
             lambda: self.execute_hook(hook, *args, **kwargs)
         )
     
-    def get_all_tools(self) -> List[Dict[str, Any]]:
-        """Get all tools from all enabled plugins."""
+    def get_all_tools_with_sources(self) -> List[Tuple[str, Any]]:
+        """Get enabled plugin tools together with their owning plugin names.
+
+        The ownership information lets an Agent re-check plugin state after
+        construction.  This matters because an Agent keeps its own tool list;
+        disabling or unregistering a plugin must not leave copied tools
+        executable through that stale list.
+        """
         tools = []
-        
-        for name, plugin in self._plugins.items():
-            if not self._enabled.get(name, False):
-                continue
-            
+
+        # Snapshot the enabled (name, plugin) pairs under the lock so a
+        # concurrent register/unregister cannot mutate the dict mid-iteration
+        # (which would raise RuntimeError and drop every plugin tool).
+        with self._lock:
+            enabled_plugins = [
+                (name, plugin)
+                for name, plugin in self._plugins.items()
+                if self._enabled.get(name, False)
+            ]
+
+        for name, plugin in enabled_plugins:
             try:
                 plugin_tools = plugin.get_tools()
-                tools.extend(plugin_tools)
+                tools.extend((name, tool) for tool in (plugin_tools or []))
             except Exception as e:
                 logger.error(f"Error getting tools from plugin {name}: {e}")
-        
+
         return tools
+
+    def get_all_tools(self) -> List[Any]:
+        """Get all tools from all enabled plugins."""
+        return [tool for _plugin_name, tool in self.get_all_tools_with_sources()]
+
+    def _enabled_of_type(self, plugin_type: "PluginType") -> List[Tuple[str, Plugin]]:
+        """Snapshot enabled ``(name, plugin)`` pairs of a given declared type.
+
+        Dispatch key for the typed subsystems: a plugin only contributes a
+        guardrail / skill / policy when it *declares* the matching
+        ``PluginType`` in its ``PluginInfo``. Snapshotting under the lock keeps
+        this safe against concurrent register/unregister in multi-agent runs.
+        """
+        from .plugin import PluginType
+
+        with self._lock:
+            result: List[Tuple[str, Plugin]] = []
+            for name, plugin in self._plugins.items():
+                if not self._enabled.get(name, False):
+                    continue
+                try:
+                    declared = getattr(plugin.info, "plugin_type", PluginType.HOOK)
+                except Exception:
+                    declared = PluginType.HOOK
+                if declared == plugin_type:
+                    result.append((name, plugin))
+            return result
+
+    def get_all_guardrails(self) -> List[Any]:
+        """Guardrail objects contributed by enabled ``GUARDRAIL`` plugins.
+
+        Calls ``as_guardrail()`` on each enabled plugin declared
+        ``PluginType.GUARDRAIL`` and returns the non-``None`` guardrail objects
+        the Agent folds into its ``GuardrailChain`` (so they see
+        ``validate_tool_call`` / ``validate_tool_result``, not just final text).
+        """
+        from .plugin import PluginType
+
+        guardrails: List[Any] = []
+        for name, plugin in self._enabled_of_type(PluginType.GUARDRAIL):
+            try:
+                g = plugin.as_guardrail()
+            except Exception as e:
+                logger.error(f"Error getting guardrail from plugin {name}: {e}")
+                continue
+            if g is not None:
+                guardrails.append(g)
+        return guardrails
+
+    def get_all_skills(self) -> List[Any]:
+        """Skill sources/dirs contributed by enabled ``SKILL`` plugins."""
+        from .plugin import PluginType
+
+        skills: List[Any] = []
+        for name, plugin in self._enabled_of_type(PluginType.SKILL):
+            try:
+                skills.extend(plugin.get_skills() or [])
+            except Exception as e:
+                logger.error(f"Error getting skills from plugin {name}: {e}")
+        return skills
+
+    def get_all_policies(self) -> List[Any]:
+        """Policy rules contributed by enabled ``POLICY`` plugins."""
+        from .plugin import PluginType
+
+        policies: List[Any] = []
+        for name, plugin in self._enabled_of_type(PluginType.POLICY):
+            try:
+                policies.extend(plugin.get_policies() or [])
+            except Exception as e:
+                logger.error(f"Error getting policies from plugin {name}: {e}")
+        return policies
     
     def shutdown(self):
         """Shutdown all plugins."""
@@ -641,12 +890,23 @@ class PluginManager:
                 if getattr(plugin, "_wired_into_registry", None) is registry:
                     # Avoid double-registration on repeated enable() calls
                     continue
+                allow_conversation = self._granted_conversation_access(name)
                 hook_ids: List[str] = []
                 for event, func in _adapt_plugin_hooks(plugin):
+                    # Same least-privilege gate as execute_hook(): never bridge
+                    # a conversation-content hook of an ungranted plugin into the
+                    # runtime the Agent actually consults, so a third-party
+                    # entry-point plugin cannot read/rewrite prompts even though
+                    # its tool/channel hooks still wire in.
+                    if event in CONVERSATION_HOOKS and not allow_conversation:
+                        continue
                     hook_id = registry.register_function(
                         event=event,
                         func=func,
                         name=f"{name}:{event.value}",
+                        # Delivery policies compose in order: apply a rewrite
+                        # before the next policy, and stop the chain on denial.
+                        sequential=event == PluginHook.MESSAGE_SENDING,
                     )
                     hook_ids.append(hook_id)
                     count += 1
@@ -688,6 +948,65 @@ class PluginManager:
             except Exception:
                 pass
             return removed
+
+
+def _emit_plugin_init(plugin: Plugin) -> None:
+    """Emit ON_INIT for a plugin that has just been registered."""
+    from ..hooks.types import HookEvent
+
+    _emit_plugin_lifecycle(HookEvent.ON_INIT, plugin)
+
+
+def _emit_plugin_shutdown(plugin: Plugin) -> None:
+    """Emit ON_SHUTDOWN for a plugin that is being unregistered."""
+    from ..hooks.types import HookEvent
+
+    _emit_plugin_lifecycle(HookEvent.ON_SHUTDOWN, plugin)
+
+
+def _emit_plugin_lifecycle(event: "HookEvent", plugin: Plugin) -> None:
+    """Best-effort emit of ON_INIT / ON_SHUTDOWN for a plugin.
+
+    Fully guarded and skipped entirely when nothing is listening, so plugin
+    registration keeps working (and stays cheap) whether or not the hook
+    system is in use. Observability must never break plugin lifecycle.
+    """
+    try:
+        import os
+        from datetime import datetime, timezone
+
+        from ..hooks.registry import get_default_registry
+
+        registry = get_default_registry()
+        if not registry.has_hooks(event):
+            return
+
+        from ..hooks.events import PluginLifecycleInput
+        from ..hooks.runner import HookRunner
+
+        try:
+            info = plugin.info
+            name = getattr(info, "name", "") or ""
+            version = getattr(info, "version", "") or ""
+            description = getattr(info, "description", "") or ""
+        except Exception:
+            name, version, description = "", "", ""
+
+        HookRunner(registry).execute_sync(
+            event,
+            PluginLifecycleInput(
+                session_id="plugin-manager",
+                cwd=os.getcwd(),
+                event_name=event.value,
+                timestamp=datetime.now(timezone.utc).isoformat(),
+                plugin_name=name,
+                plugin_version=version,
+                plugin_description=description,
+            ),
+        )
+    except Exception:  # pragma: no cover - observability must never break loading
+        logger.debug("Plugin lifecycle hook failed", exc_info=True)
+
 
 def _write_back(data, attr: str, new_value: dict) -> None:
     """Write a plugin's returned dict back onto the hook payload.
@@ -889,9 +1208,18 @@ def _adapt_plugin_hooks(plugin: Plugin) -> Iterator[Tuple["HookEvent", Callable]
 
     if _overrides("after_message"):
         def after_message_hook(data, _p=plugin):
-            new = _p.after_message(_message_payload(data))
+            try:
+                new = _p.after_message(_message_payload(data))
+            except GuardrailBlocked as e:
+                return HookResult.block(e.reason)
+            decision = _as_decision(new)
+            if decision is not None:
+                return decision
             if isinstance(new, dict) and "content" in new and hasattr(data, "content"):
                 data.content = new["content"]
+                # Bot delivery reads the canonical rewrite field on the result,
+                # not just the mutated event payload.
+                return HookResult(modified_input={"content": data.content})
             return HookResult.allow()
         yield HookEvent.MESSAGE_SENDING, after_message_hook
 
@@ -990,6 +1318,51 @@ def _adapt_plugin_hooks(plugin: Plugin) -> Iterator[Tuple["HookEvent", Callable]
             return HookResult.allow()
         yield HookEvent.CLI_BACKEND_EXECUTE, cli_backend_execute_hook
 
+    # Generic, declaration-driven tail. The explicit branches above give
+    # rewrite/deny semantics to the conversation/tool/channel events that need
+    # them. Everything else a plugin declares in ``PluginInfo.hooks`` — the
+    # gateway/schedule/kanban/compaction/subagent/model-fallback lifecycle — is
+    # observe-only, so a single loop bridges it by method name (``event.value``)
+    # without a hand-written branch per event. This keeps the coverage matrix
+    # from drifting: any future emitted event becomes first-class the moment a
+    # plugin declares it and defines the matching method.
+    yielded = {
+        HookEvent.BEFORE_AGENT, HookEvent.AFTER_AGENT,
+        HookEvent.BEFORE_LLM, HookEvent.AFTER_LLM,
+        HookEvent.BEFORE_TOOL, HookEvent.AFTER_TOOL,
+        HookEvent.BEFORE_TOOL_DEFINITIONS,
+        HookEvent.MESSAGE_RECEIVED, HookEvent.MESSAGE_SENDING,
+        HookEvent.MESSAGE_SENT, HookEvent.MESSAGE_UNDELIVERED,
+        HookEvent.ON_PERMISSION_ASK, HookEvent.ON_CONFIG, HookEvent.ON_AUTH,
+        HookEvent.SESSION_START, HookEvent.SESSION_END, HookEvent.ON_ERROR,
+        HookEvent.CLI_BACKEND_EXECUTE,
+    }
+
+    def _make_observe_hook(method):
+        def observe_hook(data, _m=method):
+            payload = data.to_dict() if hasattr(data, "to_dict") else {}
+            _m(payload)
+            return HookResult.allow()
+        return observe_hook
+
+    declared = getattr(plugin.info, "hooks", None) or []
+    seen: set = set()
+    for event in declared:
+        if not isinstance(event, HookEvent) or event in yielded or event in seen:
+            continue
+        seen.add(event)
+        method = getattr(plugin, event.value, None)
+        if not callable(method):
+            continue
+        parent = getattr(base, event.value, None)
+        own = getattr(type(plugin), event.value, None)
+        # A base no-op that the plugin did not override yields nothing (avoids
+        # registering dead hooks). Methods with no base counterpart (e.g.
+        # ``kanban_task_created``) are treated as genuine overrides.
+        if parent is not None and own is parent:
+            continue
+        yield event, _make_observe_hook(method)
+
 
 # Global plugin manager instance
 _default_manager: Optional[PluginManager] = None
@@ -1000,3 +1373,15 @@ def get_plugin_manager() -> PluginManager:
     if _default_manager is None:
         _default_manager = PluginManager()
     return _default_manager
+
+
+def has_registered_plugins() -> bool:
+    """Return whether the global manager has any plugins registered.
+
+    Cheap, allocation-free fast path for the hot Agent-init merge calls: when
+    the singleton has not been created or holds no plugins (the common case),
+    callers can skip constructing/scanning the manager entirely. Does NOT
+    create the singleton as a side effect.
+    """
+    manager = _default_manager
+    return manager is not None and bool(manager._plugins)

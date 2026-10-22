@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import json
 import logging
@@ -6,9 +7,7 @@ from praisonaiagents._logging import get_logger
 import asyncio
 import contextlib
 import threading
-import concurrent.futures
-import random
-from typing import List, Optional, Any, Dict, Union, Literal, TYPE_CHECKING, Callable, Generator
+from typing import List, Optional, Any, Dict, Union, Literal, TYPE_CHECKING, Callable
 from collections import OrderedDict
 import inspect
 
@@ -21,9 +20,12 @@ from .tool_execution import ToolExecutionMixin, BackoffPolicy
 from .chat_handler import ChatHandlerMixin
 from .session_manager import SessionManagerMixin
 from .async_safety import AsyncSafeState, DualLock
-# NOTE: UnifiedExecutionMixin is deprecated and unused by any production path
-# (Issue #2644). It is kept in the MRO for backward compatibility during the
-# deprecation cycle and will be removed afterwards.
+# NOTE: UnifiedExecutionMixin's *public* methods are deprecated and unused by
+# any production path (Issue #2644); it is kept in the MRO for backward
+# compatibility during the deprecation cycle and will be removed afterwards.
+# The one live helper it used to own (_run_async_in_sync_context) has been
+# relocated to async_safety.run_async_in_sync_context, so dropping this mixin
+# from the MRO is a true no-op.
 from .unified_execution_mixin import UnifiedExecutionMixin
 from .sandbox_mixin import SandboxMixin
 from .message_steering import SteeringMixin
@@ -220,6 +222,28 @@ from ..errors import BudgetExceededError
 # Import retry configuration
 from .retry_utils import RetryBackoffConfig
 
+# Completion-signal detection patterns (compiled once at import — see
+# Agent._is_completion_signal). Negation patterns that should NOT be treated
+# as completion.
+_COMPLETION_NEGATION_RE = re.compile(
+    r'\b(?:not|never|no longer|hardly|barely|isn\'t|aren\'t|wasn\'t|weren\'t|hasn\'t|haven\'t|hadn\'t|won\'t|wouldn\'t|can\'t|couldn\'t|shouldn\'t|don\'t|doesn\'t|didn\'t)\b'
+    r'.{0,20}'   # up to 20 chars between negation and keyword
+)
+# Word-boundary patterns to avoid substring false positives
+_COMPLETION_PATTERNS = (
+    (re.compile(r'\btask\s+completed?\b'), False),         # no negation check needed
+    (re.compile(r'\bcompleted\s+successfully\b'), False),
+    (re.compile(r'\ball\s+done\b'), False),
+    (re.compile(r'\bdone\b'), True),          # 'done' needs negation check
+    (re.compile(r'\bfinished\b'), True),      # 'finished' needs negation check
+)
+
+# Emitted at most once per process: pointing at a non-OpenAI endpoint without
+# naming a model silently falls back to OpenAI's default, which that endpoint
+# almost certainly does not serve.
+_LOCAL_ENDPOINT_DEFAULT_MODEL_WARNED = False
+
+
 class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, UnifiedExecutionMixin, ToolExecutionMixin, ChatHandlerMixin, SessionManagerMixin, ChatMixin, ExecutionMixin, MemoryMixin, AsyncMemoryMixin):
     # Class-level counter for generating unique display names for nameless agents
     _agent_counter = 0
@@ -243,6 +267,7 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
         "rate_limiter": None,           # -> execution=ExecutionConfig(rate_limiter=obj)
         "verification_hooks": None,     # -> autonomy=AutonomyConfig(verification_hooks=[...])
         "cli_backend": None,            # -> runtime=
+        "retrieval_config": None,       # RAG tuning, merged into the knowledge= config
     }
 
     @property
@@ -284,6 +309,15 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
                     cls._env_output_checked = True
         return cls._env_output_mode
     
+    @staticmethod
+    def _local_discovery(target):
+        """Re-read the discovery for a resolved local target (cached upstream)."""
+        try:
+            from ..local import probe_endpoint
+            return probe_endpoint(target.base_url, expect=target.engine)
+        except Exception:
+            return None
+
     # Ordered (credential env-var, provider-appropriate default model). The
     # first provider whose credential is present wins. OpenAI is first so
     # existing OpenAI users keep their default; any other single configured
@@ -361,9 +395,26 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
             self._llm_init_params = params
             self._using_custom_llm = True
 
+    def _wire_deferred_history_callback(self):
+        """Point the LLM instance's deferred re-injection at the Agent's own history.
+
+        The LLM's own ``chat_history`` list has no readers when driven by an
+        Agent (Agent passes its separately-maintained history as a parameter),
+        so a resolved ``defer(...)`` result appended there would be lost. Wiring
+        the Agent's thread-safe append here lets background-completed deferred
+        tool results reach the next turn's context.
+        """
+        inst = self._llm_instance
+        if inst is not None:
+            try:
+                inst._agent_history_append = self._append_to_chat_history
+            except Exception:
+                pass
+
     def _ensure_llm_instance(self):
         """Lazy-create LLM instance from deferred init params (avoids import at Agent())."""
         if self._llm_instance is not None:
+            self._wire_deferred_history_callback()
             return self._llm_instance
         if self._panel_descriptor is not None:
             try:
@@ -380,6 +431,7 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
                     "LLM features requested but dependencies not installed. "
                     "Please install with: pip install \"praisonaiagents[llm]\""
                 ) from e
+            self._wire_deferred_history_callback()
             return self._llm_instance
         if self._llm_init_params:
             try:
@@ -390,6 +442,7 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
                     "LLM features requested but dependencies not installed. "
                     "Please install with: pip install \"praisonaiagents[llm]\""
                 ) from e
+        self._wire_deferred_history_callback()
         return self._llm_instance
 
     @property
@@ -401,6 +454,7 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
         self._llm_instance = value
         if value is not None:
             self._llm_init_params = None
+            self._wire_deferred_history_callback()
 
     def _ensure_loop_guard(self):
         """Lazy-create loop guard on first tool execution."""
@@ -626,6 +680,7 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
         message_steering: Optional[Union[bool, 'MessageSteeringProtocol']] = False,  # Real-time message steering during execution
         sandbox: Optional[Union[bool, 'SandboxConfig']] = None,  # Sandbox for safe code execution
         retry: Optional[Union[bool, Dict[str, Any], 'RetryBackoffConfig']] = None,  # Retry configuration with exponential backoff
+        reasoning_effort: Optional[str] = None,  # Provider-portable reasoning effort: off|minimal|low|medium|high (Issue #4452)
         **legacy_kwargs: Any,  # Deprecated params (see _LEGACY_AGENT_PARAMS) consolidated into config objects
     ):
         """Initialize an Agent instance.
@@ -659,6 +714,9 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
                 - bool: True enables defaults
                 - List[str]: File paths, URLs, or text content
                 - KnowledgeConfig: Custom configuration
+            retrieval_config: Optional RAG tuning merged on top of the config
+                derived from ``knowledge=``. Accepts a dict or RetrievalConfig
+                (e.g. ``retrieval_config={"citations": True, "top_k": 5}``).
             planning: Planning mode. Accepts:
                 - bool: True enables with defaults
                 - PlanningConfig: Custom configuration
@@ -687,6 +745,12 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
                 - bool: True enables with defaults
                 - Callable: Validation function
                 - GuardrailConfig: Custom configuration
+                A validator rejects an answer by returning ``(False, "why")`` or
+                by raising ``GuardrailRetry("why")``. Either way the reason is
+                appended to the same conversation and the model gets another
+                attempt in the same run, up to
+                ``GuardrailConfig(max_retries=...)`` (default 3); see
+                ``guardrail_retry_count``.
             web: Web search/fetch. Accepts:
                 - bool: True enables with defaults
                 - WebConfig: Custom configuration
@@ -799,6 +863,10 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
         # LLMConfig(fallback_models=[...])), so accept it here without exposing
         # it in the signature and seed the local below.
         _cloned_fallback_models = legacy_kwargs.pop("fallback_models", None)
+        # `thinking_budget` is a backward-compatible alias for `reasoning_effort`
+        # (Issue #4452); accept it here (like fallback_models) without exposing
+        # it in the signature so the unknown-kwarg guard below does not reject it.
+        _thinking_budget_alias = legacy_kwargs.pop("thinking_budget", None)
         _unknown = set(legacy_kwargs) - _legacy_defaults.keys()
         if _unknown:
             # Unknown kwargs are rejected rather than swallowed, so a typo can
@@ -816,6 +884,19 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
                     "streaming moved into output=; use "
                     "output=OutputConfig(stream=True)."
                 ),
+                # Same migration, different container: these two were flat
+                # kwargs before they were grouped into tool_config. Without a
+                # hint the user gets a bare "unexpected keyword argument" and
+                # has to search a 41-parameter signature for a name that is not
+                # in it.
+                "tool_retry_policy": (
+                    "tool retry moved into tool_config=; use "
+                    "tool_config=ToolConfig(retry_policy=RetryPolicy(...))."
+                ),
+                "tool_timeout": (
+                    "tool timeout moved into tool_config=; use "
+                    "tool_config=ToolConfig(timeout=...)."
+                ),
             }
             _hint = "".join(
                 f"\n  {name}: {_HINTS[name]}" for name in sorted(_unknown) if name in _HINTS
@@ -831,6 +912,7 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
         rate_limiter = legacy_kwargs.get("rate_limiter", _legacy_defaults["rate_limiter"])
         verification_hooks = legacy_kwargs.get("verification_hooks", _legacy_defaults["verification_hooks"])
         cli_backend = legacy_kwargs.get("cli_backend", _legacy_defaults["cli_backend"])
+        _user_retrieval_config = legacy_kwargs.get("retrieval_config", _legacy_defaults["retrieval_config"])
 
         # ── where does this agent run? ───────────────────────────────────────
         # Resolved before anything else is built so a contradiction fails at the
@@ -1026,7 +1108,11 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
         planning_reasoning = False
         policy = None
         output_style = None
-        thinking_budget = None
+        # `thinking_budget` (popped above) is a backward-compatible alias for
+        # `reasoning_effort` (Issue #4452). Fold the legacy int budget / graded
+        # level into one internal effort value for the LLM request pipeline.
+        if reasoning_effort is None and _thinking_budget_alias is not None:
+            reasoning_effort = _thinking_budget_alias
         skills_dirs = None
         
         # ─────────────────────────────────────────────────────────────────────
@@ -1289,12 +1375,28 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
                 array_mode=ArrayMode.PASSTHROUGH,
                 default=None,
             )
+        # Per-agent event-hook registry (isolates BEFORE_TOOL/AFTER_AGENT/...
+        # hooks so they never fire on unrelated agents sharing the default
+        # registry). A bare HookRegistry passed as ``hooks=`` still works too.
+        _hooks_registry = None
         if _hooks_config is not None:
             if isinstance(_hooks_config, list):
                 _hooks_list = _hooks_config
             elif isinstance(_hooks_config, HooksConfig):
                 step_callback = _hooks_config.on_step
-                _hooks_list = _hooks_config.middleware or []
+                _hooks_list = list(_hooks_config.middleware or [])
+                _hooks_registry = getattr(_hooks_config, "registry", None)
+                # Route on_step / on_tool_call onto the SAME middleware chain
+                # that already powers ``hooks=[...]`` (MiddlewareManager). Both
+                # keys used to be stored-and-never-called, so the TypeError that
+                # advertises them ("Valid keys: on_step, on_tool_call,
+                # middleware") promised behaviour that did not exist.
+                if _hooks_config.on_step is not None or _hooks_config.on_tool_call is not None:
+                    from ..hooks.middleware import as_step_hook, as_tool_call_hook
+                    if _hooks_config.on_step is not None:
+                        _hooks_list.append(as_step_hook(_hooks_config.on_step))
+                    if _hooks_config.on_tool_call is not None:
+                        _hooks_list.append(as_tool_call_hook(_hooks_config.on_tool_call))
         
         # ─────────────────────────────────────────────────────────────────────
         # Resolve SKILLS param - FAST PATH
@@ -1397,7 +1499,16 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
                 elif memory_backend == "file":
                     memory = True
                 elif _memory_config.config:
-                    memory = _memory_config.config
+                    # Carry the backend into the dict. _init_memory reads the
+                    # provider as memory.get("provider", memory.get("backend",
+                    # "file")), so handing it the bare config lost the backend
+                    # entirely and silently fell back to FileMemory --
+                    # MemoryConfig(backend="sqlite", config={...}) built a
+                    # FileMemory while to_dict() went on reporting "sqlite".
+                    # An explicit provider/backend inside config still wins.
+                    memory = dict(_memory_config.config)
+                    if "provider" not in memory and "backend" not in memory:
+                        memory["provider"] = memory_backend
                 else:
                     memory = memory_backend
             elif hasattr(_memory_config, 'search') and hasattr(_memory_config, 'add'):
@@ -1420,9 +1531,18 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
             if learn is False:
                 _learn_config = None
             elif learn is True:
-                # learn=True shorthand enables AGENTIC mode (auto-learning)
+                # learn=True is a coordinated posture (Issue #4864): enable
+                # AGENTIC extraction AND a conversational-aware nudge cadence in
+                # one switch, so an always-on companion bot actually learns.
+                # nudge_min_tool_iters=0 lets a chat-only turn (no tool calls)
+                # still nudge; auto_memory is turned on below so durable facts
+                # are captured on every turn, not just tool-using ones.
                 from ..memory.learn.protocols import LearnMode
-                _learn_config = LearnConfig(mode=LearnMode.AGENTIC)
+                _learn_config = LearnConfig(
+                    mode=LearnMode.AGENTIC,
+                    nudge_interval=10,
+                    nudge_min_tool_iters=0,
+                )
             elif isinstance(learn, LearnConfig):
                 _learn_config = learn
             elif isinstance(learn, dict):
@@ -1469,6 +1589,14 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
         elif _learn_config is not None and isinstance(memory, dict):
             # Merge learn config into memory dict
             memory["learn"] = _learn_config.to_dict() if hasattr(_learn_config, 'to_dict') else _learn_config
+
+        # Coordinated learn posture (Issue #4864): the ``learn=True`` shorthand
+        # turns on conversational fact extraction too, so an always-on companion
+        # accrues durable persona/preferences from plain chat — not just from
+        # tool-using turns. Only defaults it on when the caller did not set
+        # auto_memory explicitly (via MemoryConfig), so an explicit choice wins.
+        if learn is True and auto_memory is None:
+            auto_memory = True
         
         # ─────────────────────────────────────────────────────────────────────
         # Resolve HISTORY from MemoryConfig - FAST PATH
@@ -1622,6 +1750,17 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
                 knowledge = _knowledge_config
         elif knowledge is False:
             knowledge = None
+
+        # Explicit retrieval_config= (the RAG tuning surface shown in the docs
+        # and docstring examples) is merged on top of whatever the knowledge=
+        # param derived. A dict overrides the derived keys; a RetrievalConfig
+        # instance (or when no knowledge= was given) replaces it wholesale so
+        # the downstream RetrievalConfig resolver (below) receives it unchanged.
+        if _user_retrieval_config is not None:
+            if isinstance(_user_retrieval_config, dict) and isinstance(retrieval_config, dict):
+                retrieval_config.update(_user_retrieval_config)
+            else:
+                retrieval_config = _user_retrieval_config
         
         # ─────────────────────────────────────────────────────────────────────
         # Resolve PLANNING param - FAST PATH
@@ -1980,7 +2119,11 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
         # Lazy init for HookRunner and StreamEventEmitter (zero overhead when not used)
         self.__hook_runner = None  # Will be initialized on first access
         self.__stream_emitter = None  # Will be initialized on first access
-        self._hooks_registry_param = hooks  # Store for lazy init
+        # Prefer a per-agent registry declared via HooksConfig(registry=...) so
+        # this agent's event hooks stay isolated; else fall back to the raw
+        # ``hooks`` value (a bare HookRegistry still isolates, anything else
+        # resolves to the shared default registry in the _hook_runner property).
+        self._hooks_registry_param = _hooks_registry if _hooks_registry is not None else hooks
         
         # Handle llm= deprecation: model= is the preferred parameter name
         # llm= still works but shows deprecation warning
@@ -2092,6 +2235,91 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
             'claude_memory': claude_memory,
             **_retry_init_params,
         }
+        # Forward the unified reasoning-effort control to every LLM-construction
+        # branch (Issue #4452). Only set when provided so unset stays a no-op and
+        # older dict/string branches that don't spread these kwargs are unaffected.
+        if reasoning_effort is not None:
+            self._llm_option_kwargs['reasoning_effort'] = reasoning_effort
+
+        # Local-runtime descriptor: llm="local" (or "local:<engine>/<model>").
+        # Opt-in only -- discovery never fires for any other spec, so a fully
+        # configured agent pays nothing. Resolved here into a concrete
+        # provider/model so the normal LLM path handles it unchanged.
+        if isinstance(llm, str) and (llm == "local" or llm.startswith("local:")):
+            from ..local import LocalEngine as _LocalEngine
+            from ..local import resolve as _resolve_local
+            _spec = llm[len("local:"):] if llm.startswith("local:") else None
+            _target = _resolve_local(_spec or None)
+            llm = _target.litellm_model
+            if base_url is None:
+                # Ollama's litellm provider builds its own /api paths from the
+                # server root, so it takes base_url. Every other local engine
+                # speaks OpenAI and serves under /v1 -- handing it the bare root
+                # sent chat to /chat/completions, which a real LM Studio, vLLM
+                # or llama-server answers with 404.
+                base_url = (_target.base_url
+                            if _target.engine is _LocalEngine.OLLAMA
+                            else _target.openai_base_url)
+            if api_key is None:
+                api_key = _target.api_key
+            self._local_target = _target
+
+            # Keep a local agent local end to end. Without this, chat went to
+            # the local server while knowledge/memory embedded against OpenAI --
+            # sending the user's documents AND their queries off the machine
+            # with no warning, which defeats the entire point of asking for a
+            # local model. Only fills a gap: an explicit embedder always wins.
+            _wants_embeddings = (retrieval_config is not None
+                                 or embedder_config is not None
+                                 or memory not in (None, False))
+            # retrieval_config may be a dict (knowledge=-derived or user dict) or a
+            # RetrievalConfig instance (passed explicitly); read embedder_config
+            # from either shape without assuming .get() exists.
+            _rc_embedder = (
+                retrieval_config.get('embedder_config')
+                if isinstance(retrieval_config, dict)
+                else getattr(retrieval_config, 'embedder_config', None))
+            if _wants_embeddings and not embedder_config and not _rc_embedder:
+                from ..local import (local_embedder_config as _local_embedder,
+                                     select_embedding_model as _select_embed)
+                _embed_model = _select_embed(
+                    getattr(_d, 'models', ()) if (_d := Agent._local_discovery(_target)) else (),
+                    getattr(_d, 'model_meta', ()) if _d else ())
+                if _embed_model:
+                    embedder_config = _local_embedder(
+                        _target.engine, _target.base_url, _embed_model)
+                    # Carry the real vector width. local/ is a dependency sink
+                    # and cannot import the dimension table, so the caller
+                    # supplies it: a store created at the wrong width either
+                    # rejects every write or silently corrupts the index.
+                    # A width the server *measured* (already in the config) is
+                    # authoritative and must win over the static table. The
+                    # table only fills a genuine gap, and even then never with
+                    # the generic default: a guessed width is worse than letting
+                    # the store infer one from the first vector.
+                    _cfg = embedder_config.setdefault("config", {})
+                    if not _cfg.get("embedding_dims"):
+                        try:
+                            from ..embedding.dimensions import (
+                                DEFAULT_DIMENSION, get_dimensions)
+                            _dims = get_dimensions(_embed_model)
+                            if _dims and _dims != DEFAULT_DIMENSION:
+                                _cfg["embedding_dims"] = _dims
+                        except Exception:  # noqa: BLE001 -- a missing width must not break setup
+                            pass
+                    if isinstance(retrieval_config, dict):
+                        retrieval_config.setdefault('embedder_config', embedder_config)
+                    elif retrieval_config is not None and getattr(
+                            retrieval_config, 'embedder_config', None) is None:
+                        retrieval_config.embedder_config = embedder_config
+                else:
+                    logging.warning(
+                        "llm=%r resolved a local model, but %s serves no embedding "
+                        "model, so knowledge/memory would embed against a remote "
+                        "provider -- sending your documents off this machine. "
+                        "Pull one (e.g. `ollama pull nomic-embed-text`) or set an "
+                        "explicit embedder to silence this.",
+                        llm, _target.base_url)
 
         # Panel (multi-model) descriptor: "panel:<name>" or {"provider": "panel"}.
         # Resolved lazily into a PanelLLM; composes with the normal tool loop.
@@ -2100,7 +2328,35 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
             (isinstance(llm, str) and llm.startswith("panel:"))
             or (isinstance(llm, dict) and llm.get("provider") == "panel")
         )
-        if _is_panel:
+        # An already-built model object (an ``LLM``, a subclass, or a test double
+        # such as ``model_harness.ScriptedModel``) is adopted as this agent's
+        # backend. Without this branch such an object fell through to the plain
+        # OpenAI path, where ``self.llm`` became the object itself and every turn
+        # was sent to OpenAI under a model name that was really a repr -- the
+        # opposite of what passing your own model means. Duck-typed on
+        # ``get_response`` so any conforming backend works, not just ``LLM``.
+        # Detection must match what the tool loop actually invokes: the custom
+        # path calls ``llm_instance.get_response(**llm_kwargs)`` (and the async
+        # ``get_response_async``) with PraisonAI-internal kwargs -- tools,
+        # tool_choice, seed, cancel_token, steering_drain, and more. The
+        # ``chat``/``achat`` (LLMProviderProtocol) and
+        # ``chat_completion``/``achat_completion`` (UnifiedLLMProtocol) surfaces
+        # take a different signature and are NOT wired into that loop, so a
+        # backend exposing only those would be adopted here and then raise
+        # ``AttributeError`` on the first turn. Adopt only the surface the
+        # executor can drive; a translation adapter for the other protocols
+        # would be a heavy, unused implementation rather than a fix.
+        _MODEL_BACKEND_METHODS = ("get_response", "get_response_async")
+        _is_model_instance = (
+            llm is not None
+            and not isinstance(llm, (str, dict))
+            and any(callable(getattr(llm, m, None)) for m in _MODEL_BACKEND_METHODS)
+        )
+        if _is_model_instance:
+            self._llm_instance = llm
+            self._using_custom_llm = True
+            self.llm = getattr(llm, "model", None) or type(llm).__name__
+        elif _is_panel:
             self._panel_descriptor = llm
             self._using_custom_llm = True
             self.llm = llm if isinstance(llm, str) else "panel"
@@ -2194,14 +2450,57 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
         # Otherwise, fall back to OpenAI environment/name (cached for performance)
         else:
             model_name = llm or Agent._get_default_model()
-            if auth:
+            # Pointing at a non-OpenAI endpoint without naming a model leaves the
+            # OpenAI default in place, so the endpoint is asked for a model it
+            # has never heard of -- Ollama answers 404 "model 'gpt-4o-mini' not
+            # found", which reads like an SDK bug rather than a missing line of
+            # config. Warn, don't raise: an OpenAI-compatible proxy may legitimately
+            # serve that exact name.
+            #
+            # Only fire when the resolved default really is the OpenAI default:
+            # a provider credential (e.g. OLLAMA_HOST) resolves an
+            # already-correct provider-prefixed model, so there is nothing to
+            # warn about. Read the endpoint in the order the OpenAI client uses
+            # (OPENAI_API_BASE before OPENAI_BASE_URL, see openai_client.py) so
+            # the message names the endpoint the request actually goes to.
+            if (
+                llm is None
+                and model_name == 'gpt-4o-mini'
+                and not os.getenv('OPENAI_MODEL_NAME')
+            ):
+                _endpoint = os.getenv('OPENAI_API_BASE') or os.getenv('OPENAI_BASE_URL')
+                if _endpoint and 'api.openai.com' not in _endpoint:
+                    global _LOCAL_ENDPOINT_DEFAULT_MODEL_WARNED
+                    if not _LOCAL_ENDPOINT_DEFAULT_MODEL_WARNED:
+                        with Agent._env_cache_lock:
+                            if not _LOCAL_ENDPOINT_DEFAULT_MODEL_WARNED:
+                                _LOCAL_ENDPOINT_DEFAULT_MODEL_WARNED = True
+                                logging.warning(
+                                    "No model specified, so the OpenAI default %r will be sent to %s. "
+                                    "That endpoint probably does not serve it. Set OPENAI_MODEL_NAME "
+                                    "to a model it does serve (e.g. OPENAI_MODEL_NAME=ollama/llama3.2), "
+                                    "or pass llm= explicitly.",
+                                    model_name, _endpoint,
+                                )
+            # A provider-prefixed model must be built as an LLM instance, which
+            # owns provider routing and the per-provider adapters. The
+            # `"/" in llm` branch above only inspects the explicit `llm=`
+            # argument, so a prefixed model that arrived from a credential env
+            # var (_PROVIDER_DEFAULT_MODELS) or from OPENAI_MODEL_NAME lands
+            # here instead and would otherwise fall through to the plain OpenAI
+            # client holding a model name OpenAI has never heard of. Re-check
+            # the *resolved* name so `llm="ollama/x"` and OLLAMA_HOST agree.
+            _has_provider_prefix = isinstance(model_name, str) and "/" in model_name
+            if auth or _has_provider_prefix:
                 # A subscription auth provider only takes effect inside LLM
                 # (which injects the resolved OAuth credentials), so a bare
                 # model name plus auth= must still build an LLM instance rather
                 # than falling through to the plain OpenAI client.
-                llm_params = {'model': model_name, 'auth': auth}
+                llm_params = {'model': model_name}
                 if api_key:
                     llm_params['api_key'] = api_key
+                if auth:
+                    llm_params['auth'] = auth
                 llm_params['metrics'] = metrics
                 llm_params['web_search'] = web_search
                 llm_params['web_fetch'] = web_fetch
@@ -2213,7 +2512,14 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
                 self._llm_init_params = llm_params
                 self._using_custom_llm = True
             self.llm = model_name
-        
+
+        # Thread the unified reasoning-effort control into whichever LLM-init
+        # params the branch chain above produced (Issue #4452), so it reaches the
+        # LLM request pipeline regardless of how the model was specified. Only set
+        # when provided and not already present, keeping unset a zero-cost no-op.
+        if reasoning_effort is not None and getattr(self, "_llm_init_params", None):
+            self._llm_init_params.setdefault('reasoning_effort', reasoning_effort)
+
         # Store fallback models for resilience (defensive copy to avoid external mutations)
         self.fallback_models = list(fallback_models) if fallback_models else []
         
@@ -2297,7 +2603,12 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
                         self.tools.extend(get_ast_grep_tools())
                     except ImportError:
                         pass  # No default tools available
-        
+
+        # Merge tools contributed by enabled PluginType.TOOL plugins so a plugin's
+        # get_tools() output is actually callable by this agent. Existing tools win
+        # on a name collision (reported, not silently shadowed).
+        self._merge_plugin_tools()
+
         self.max_iter = max_iter
         self.max_rpm = max_rpm
         self.max_execution_time = max_execution_time
@@ -2315,6 +2626,11 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
         self._on_budget_exceeded = _on_budget_exceeded
         # Thread-safe cost/token tracking (Gap 1a fix)
         self._cost_lock = threading.Lock()
+        # Serializes the read-modify-write of _auto_save_last_index. Auto-save
+        # now runs via asyncio.to_thread, so two concurrent async runs sharing
+        # one Agent could otherwise read the same last-saved index in separate
+        # worker threads and each persist the same turns, duplicating history.
+        self._auto_save_lock = threading.Lock()
         self._total_cost = 0.0
         self._total_tokens_in = 0
         self._total_tokens_out = 0
@@ -2334,6 +2650,18 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
         
         # Store ExecutionConfig for context compaction policy access
         self.execution = _exec_config
+
+        # ExecutionConfig(code_execution=True) actually grants the capability.
+        # Before this, the flag only set ``self.allow_code_execution`` and no
+        # code tool was ever produced, so the knob was accepted and ignored.
+        #
+        # The tool is named ``execute_code``, which is registered "critical" in
+        # approval/registry.py, so it is approval-gated under every preset but
+        # ``"full"`` — the privilege-escalation problem that got the old
+        # ``sandbox=``-injects-tools behaviour reverted does not apply here, and
+        # unlike ``sandbox=`` this is an explicit opt-in by the caller.
+        if allow_code_execution:
+            self._attach_code_execution_tools(code_execution_mode, _exec_config)
         # Async-safe chat_history with dual-lock protection
         self.__chat_history_state = AsyncSafeState([])
         
@@ -2417,6 +2745,10 @@ Your Goal: {self.goal}
         # Initialize guardrail settings
         self.guardrail = guardrail
         self.max_guardrail_retries = max_guardrail_retries
+        # Observability for in-run output-validation retries (see
+        # _apply_guardrail_with_retry / the guardrail_retry_count property).
+        self._guardrail_retry_count = 0
+        self._last_guardrail_error = None
         self._guardrail_fn = None
         self._setup_guardrail()
         
@@ -2585,7 +2917,10 @@ Your Goal: {self.goal}
                     # Reuse the caller's manager as-is (no disk I/O side-effect).
                     _mgr = self._approval_permissions
                 else:
-                    _mgr = PermissionManager(agent_name=self.name)
+                    _mgr = PermissionManager(
+                        agent_name=self.name,
+                        workspace_root=os.getcwd(),
+                    )
                     if isinstance(self._approval_permissions, dict):
                         _mgr.load_rules_from_config(self._approval_permissions)
                     elif isinstance(self._approval_permissions, (list, tuple)):
@@ -2728,6 +3063,7 @@ Your Goal: {self.goal}
         # turns on the same Agent instance don't corrupt each other's buffer.
         self._turn_tools_used = []
         self._turn_tools_lock = DualLock()
+        self._tool_executor_lock = DualLock()
 
         # Database persistence (lazy - no imports until used)
         self._db = db
@@ -2747,12 +3083,43 @@ Your Goal: {self.goal}
         # Learning configuration (top-level, peer to memory)
         # Stored for access via agent._learn_config
         self._learn_config = _learn_config
+        # Raw learn= intent, so surfaces that default-enable learning (e.g. the
+        # gateway/bot) can tell "unset" (None) apart from an explicit opt-out
+        # (learn=False) — both of which leave _learn_config None (Issue #4864).
+        self._learn_enabled = learn
 
         # Agent-centric feature instances (lazy loaded for zero performance impact)
         self._auto_memory = auto_memory
         self._policy = policy
+        # Route enabled GUARDRAIL/POLICY/SKILL plugins into their typed
+        # subsystems now that guardrail (_setup_guardrail), _skills and _policy
+        # are all set. A plugin declared PluginType.GUARDRAIL/POLICY/SKILL thus
+        # participates in the GuardrailChain / PolicyEngine / SkillManager, not
+        # just a generic lifecycle hook. No-op when no such plugin is enabled.
+        self._merge_plugin_subsystems()
         self._output_style = output_style
-        self._thinking_budget = thinking_budget
+        # Backward-compatible: `thinking_budget` property mirrors the legacy int
+        # budget when supplied via the alias (Issue #4452); the unified effort is
+        # what actually drives the request pipeline via `_llm_init_params`.
+        self._thinking_budget = (
+            _thinking_budget_alias
+            if isinstance(_thinking_budget_alias, int)
+            else None
+        )
+        # Store the resolved unified reasoning-effort as a canonical graded level
+        # (off|minimal|low|medium|high) for session persistence. A legacy int
+        # ``thinking_budget`` alias is normalised to its nearest level so the
+        # persisted/queried value is always provider-portable (Issue #4452). The
+        # LLM request pipeline still accepts the raw value too, so behaviour is
+        # unchanged when unset.
+        if reasoning_effort is not None:
+            try:
+                from ..thinking.effort import normalize_effort
+                self._reasoning_effort = normalize_effort(reasoning_effort)
+            except Exception:
+                self._reasoning_effort = reasoning_effort
+        else:
+            self._reasoning_effort = None
         
         # Context management (lazy loaded for zero overhead when disabled)
         # Smart default: auto-enable context when tools are present
@@ -2908,9 +3275,12 @@ Your Goal: {self.goal}
         result = cls.__new__(cls)
         memo[id(self)] = result
         for k, v in self.__dict__.items():
-            if k in ("_Agent__cache_lock",):
+            if k in ("_db_run_context", "_db_session_init_lock"):
+                # A clone starts outside the source agent's active DB turn.
+                continue
+            elif k in ("_Agent__cache_lock",):
                 object.__setattr__(result, k, threading.RLock())
-            elif k == "_cost_lock":
+            elif k in ("_cost_lock", "_auto_save_lock"):
                 object.__setattr__(result, k, threading.Lock())
             elif k == "_approvals_lock":
                 object.__setattr__(result, k, asyncio.Lock())
@@ -3112,8 +3482,27 @@ Your Goal: {self.goal}
                         from ..config.feature_configs import MemoryConfig
                         clone_kwargs['memory'] = MemoryConfig(auto_save=value)
         
-        # Create new Agent instance
-        return self.__class__(**{k: v for k, v in clone_kwargs.items() if v is not None})
+        # Create new Agent instance. Plugin tools are shallow-copied above so
+        # callable identity and their ownership metadata can be carried over;
+        # otherwise the constructor's name-collision guard would treat a copied
+        # plugin tool as a caller-declared tool and disabling the plugin could
+        # leave the clone with an executable stale capability.
+        clone = self.__class__(**{k: v for k, v in clone_kwargs.items() if v is not None})
+        plugin_owners = getattr(self, "_plugin_tool_owners", None)
+        if plugin_owners:
+            inherited_owners = {
+                id(tool): plugin_owners[id(tool)]
+                for tool in (clone.tools if isinstance(clone.tools, (list, tuple)) else [])
+                if id(tool) in plugin_owners
+            }
+            if inherited_owners:
+                # Keep ownership recorded while the constructor merged any
+                # plugins that became enabled after the source was created.
+                # Those entries are needed to revoke newly attached tools.
+                current_owners = dict(getattr(clone, "_plugin_tool_owners", {}) or {})
+                current_owners.update(inherited_owners)
+                clone._plugin_tool_owners = current_owners
+        return clone
 
     @property
     def _telemetry(self):
@@ -3144,9 +3533,21 @@ Your Goal: {self.goal}
         return self.__chat_history_state
     
     def _append_to_chat_history(self, message: dict):
-        """Thread-safe append to chat history using proper locking."""
+        """Thread-safe append to chat history using proper locking.
+
+        Also records the appended message into the current turn's per-turn
+        ownership tracker (when one is active) so a failing turn's rollback
+        removes only its own messages by identity and never a concurrent
+        turn's. This is the append path every real chat()/achat() turn uses,
+        so without recording here _rollback_chat_history_to would always take
+        the unsafe positional-delete branch.
+        """
+        from .memory_mixin import _active_turn_owned
         with self._history_lock.lock():
             self._history_lock.value.append(message)
+            owned = _active_turn_owned.get()
+            if owned is not None:
+                owned.append(message)
     
     def _replace_chat_history(self, new_history: List[Dict[str, Any]]):
         """Thread-safe replacement of entire chat history using proper locking."""
@@ -3198,7 +3599,50 @@ Your Goal: {self.goal}
     
     @thinking_budget.setter
     def thinking_budget(self, value: Optional[int]) -> None:
-        self._thinking_budget = value
+        # `thinking_budget` is a backward-compatible alias for the unified
+        # `reasoning_effort` control (Issue #4452). Setting it must route through
+        # the same request-pipeline sync as `reasoning_effort`, otherwise the
+        # CLI's `--thinking` (which assigns this property after construction)
+        # stays dormant — the value would be stored but never emitted.
+        self._thinking_budget = value if isinstance(value, int) else None
+        self.reasoning_effort = value
+
+    @property
+    def reasoning_effort(self) -> Optional[str]:
+        """Unified, provider-portable reasoning-effort level (Issue #4452).
+
+        One of ``off|minimal|low|medium|high``. Core translates it to the
+        target provider's native parameter (OpenAI/xAI ``reasoning_effort``,
+        Anthropic/Gemini extended-thinking budget) on the request path.
+        """
+        return getattr(self, "_reasoning_effort", None)
+
+    @reasoning_effort.setter
+    def reasoning_effort(self, value: Optional[str]) -> None:
+        # Normalise to a canonical graded level so the stored/persisted value is
+        # always provider-portable, whether set as a level or a legacy int budget.
+        if value is not None:
+            try:
+                from ..thinking.effort import normalize_effort
+                value = normalize_effort(value)
+            except Exception:
+                pass
+        self._reasoning_effort = value
+        # Keep the live LLM-init params in sync so a post-construction change
+        # still reaches the request pipeline (mirrors thinking_budget aliasing).
+        if getattr(self, "_llm_init_params", None) is not None:
+            if value is None:
+                self._llm_init_params.pop('reasoning_effort', None)
+            else:
+                self._llm_init_params['reasoning_effort'] = value
+        # If an LLM instance has already been built (lazy cache), update it too so
+        # a post-construction change still takes effect without a rebuild.
+        instance = getattr(self, "_llm_instance", None)
+        if instance is not None:
+            try:
+                instance.reasoning_effort = value
+            except Exception:
+                pass
 
     @property
     def total_cost(self) -> float:
@@ -3658,10 +4102,21 @@ Summary:"""
 
         One of ``"completed"`` (task finished), ``"max_steps"`` (the unified
         step budget from ``ExecutionConfig.max_steps`` was reached and the run was
-        truncated) or ``"error"``. Lets CLI/CI callers branch on truncation
-        instead of parsing a magic string. Reads from whichever backend
-        (OpenAI-native or LiteLLM) executed the last turn.
+        truncated), a provider block/refusal/truncation
+        (``"content_filtered" | "refused" | "length_truncated"``) derived from the
+        LLM ``finish_reason``/refusal signal, or ``"error"``. Lets CLI/CI callers
+        branch on the terminal reason instead of parsing a magic string. Reads
+        from whichever backend (OpenAI-native or LiteLLM) executed the last turn.
         """
+        # OpenAI-native path records the finish-reason classification directly on
+        # the agent (see ``_extract_llm_response_content``); prefer it so a
+        # provider block/refusal isn't masked by a backend default of "completed".
+        own = getattr(self, '_last_stop_reason', None)
+        # Prefer a specific agent-owned provider block/refusal/truncation before
+        # any backend fallback so a stale backend reason (e.g. ``max_steps``)
+        # cannot mask the OpenAI-native classification recorded for this turn.
+        if own and own != "completed":
+            return own
         # Read from the already-instantiated backends only. ``__openai_client``
         # is the raw (name-mangled) attribute, never the lazy ``_openai_client``
         # property, so this never triggers OpenAI client creation for
@@ -3671,8 +4126,10 @@ Summary:"""
             if backend is None:
                 continue
             reason = getattr(backend, '_last_stop_reason', None)
-            if reason:
+            if reason and reason != "completed":
                 return reason
+        if own:
+            return own
         return "completed"
 
     @property
@@ -3697,6 +4154,101 @@ Summary:"""
             return f"Agent {self._agent_index}"
         return "Agent"
     
+    def _attach_code_execution_tools(self, code_execution_mode: str, exec_config: Any) -> None:
+        """Give the model a code-execution tool for ``code_execution=True``.
+
+        ``code_mode`` is a real switch, not a label:
+
+        * ``"safe"``  -> subprocess isolation, no tool access from the code.
+        * ``"unsafe"`` -> same process, restricted builtins, and the
+          ``code_tools_allow`` allow-list injected as callable tool proxies.
+        * ``"isolated"`` -> subprocess isolation AND the ``code_tools_allow``
+          allow-list, with each tool call bridged back to the parent under the
+          approval gate (the safe-and-tool-capable path).
+
+        All expose one tool named ``execute_code``, which the approval registry
+        classes as "critical", so it stays gated under every preset but "full".
+        """
+        from ..tools.python_tools import build_code_execution_tools
+
+        _tool_capable = ("unsafe", "isolated")
+        code_tools = bool(getattr(exec_config, "code_tools", False))
+        allowed = list(getattr(exec_config, "code_tools_allow", None) or [])
+        if code_tools and code_execution_mode not in _tool_capable:
+            import warnings
+            warnings.warn(
+                "ExecutionConfig(code_tools=True) needs code_mode='unsafe' or "
+                "'isolated': in 'safe' mode the code runs in a separate process "
+                "and cannot reach the agent's tools, so code_tools_allow is "
+                "ignored.",
+                UserWarning,
+                stacklevel=3,
+            )
+            code_tools = False
+
+        # In tool-capable modes the allow-list must resolve against ONLY the
+        # tools this agent was granted, never the process-global registry (which
+        # can hold plugin/entry-point tools the agent was never given). Build a
+        # private registry from self.tools and pass it down so code-mode
+        # inherits the agent's exact tool boundary.
+        scoped_registry = None
+        if code_tools and code_execution_mode in _tool_capable:
+            from ..tools.registry import ToolRegistry
+            # discovery_enabled=False: an allow-listed name absent from THIS
+            # agent's tools must NOT resolve to an installed global plugin.
+            scoped_registry = ToolRegistry(discovery_enabled=False)
+            for t in (self.tools or []):
+                if callable(t) or hasattr(t, "name"):
+                    try:
+                        scoped_registry.register(t)
+                    except Exception:
+                        pass
+
+        # Gate every code-mode tool call through the SAME PolicyEngine,
+        # permission deny-rules and per-tool ``input_guardrails`` the direct
+        # tool-call loop runs. The approval framework the proxy already honours
+        # does not cover these, so without this hook a model could reach an
+        # allow-listed tool from code and bypass a guardrail that blocks the
+        # same call on the normal path.
+        #
+        # Contract (mirrors the direct path in ``_check_tool_approval_sync``):
+        #   returns ``(denial_reason, arguments)`` where ``denial_reason`` is a
+        #   string to block or ``None`` to allow, and ``arguments`` is the
+        #   possibly-guardrail-rewritten kwargs dict the tool must run with. The
+        #   proxy uses the returned args so a sanitising guardrail's rewrite is
+        #   honoured (not discarded) exactly as on the direct path. BYPASS mode
+        #   skips the permission-deny gate, matching the direct contract, so a
+        #   call permitted directly is not rejected only in code mode. Only runs
+        #   in the tool-capable modes.
+        policy_hook = None
+        if code_tools and code_execution_mode in _tool_capable:
+            def policy_hook(name, arguments):
+                if not self._is_bypass_mode():
+                    deny = self._check_permission_manager_deny(name, arguments)
+                    if isinstance(deny, dict):
+                        return deny.get("error", "denied by permission policy"), arguments
+                verdict = self._check_tool_policy_and_guardrails(name, arguments)
+                if isinstance(verdict, dict):
+                    return verdict.get("error", "denied by policy"), arguments
+                # ``verdict`` is ``(None, rewritten_args)`` when allowed; hand the
+                # possibly-rewritten args back so the proxy dispatches with them.
+                _, rewritten = verdict
+                return None, rewritten
+
+        # An unknown code_mode raises out of here rather than silently
+        # producing nothing, which is the failure this whole change is about.
+        new_tools = build_code_execution_tools(
+            code_mode=code_execution_mode,
+            allowed_tools=allowed if code_tools else [],
+            registry=scoped_registry,
+            policy_hook=policy_hook,
+        )
+
+        existing = {getattr(t, "__name__", None) for t in (self.tools or [])}
+        self.tools = list(self.tools or []) + [
+            t for t in new_tools if getattr(t, "__name__", None) not in existing
+        ]
+
     def _init_autonomy(self, autonomy: Any, verification_hooks: Optional[List[Any]] = None) -> None:
         """Initialize autonomy features (agent-centric escalation/doom-loop).
         
@@ -4081,21 +4633,7 @@ Summary:"""
         Returns:
             True if a completion signal is detected
         """
-        import re
         response_lower = response_text.lower()
-        # Negation patterns that should NOT be treated as completion
-        _NEGATION_RE = re.compile(
-            r'\b(?:not|never|no longer|hardly|barely|isn\'t|aren\'t|wasn\'t|weren\'t|hasn\'t|haven\'t|hadn\'t|won\'t|wouldn\'t|can\'t|couldn\'t|shouldn\'t|don\'t|doesn\'t|didn\'t)\b'
-            r'.{0,20}'   # up to 20 chars between negation and keyword
-        )
-        # Word-boundary patterns to avoid substring false positives
-        _COMPLETION_PATTERNS = [
-            (re.compile(r'\btask\s+completed?\b'), False),         # no negation check needed
-            (re.compile(r'\bcompleted\s+successfully\b'), False),
-            (re.compile(r'\ball\s+done\b'), False),
-            (re.compile(r'\bdone\b'), True),          # 'done' needs negation check
-            (re.compile(r'\bfinished\b'), True),      # 'finished' needs negation check
-        ]
         for pattern, needs_negation_check in _COMPLETION_PATTERNS:
             match = pattern.search(response_lower)
             if match:
@@ -4103,7 +4641,7 @@ Summary:"""
                     # Check if a negation word precedes the match within 30 chars
                     start = max(0, match.start() - 30)
                     prefix = response_lower[start:match.start()]
-                    if _NEGATION_RE.search(prefix):
+                    if _COMPLETION_NEGATION_RE.search(prefix):
                         continue  # Skip — negated completion
                     # Also check "not X yet" pattern
                     end = min(len(response_lower), match.end() + 10)
@@ -4881,14 +5419,19 @@ Summary:"""
                         f"response_len={len(response_str)}"
                     )
                 
-                # Auto-save session after each async iteration (memory integration)
-                self._auto_save_session()
+                # Auto-save session after each async iteration (memory integration).
+                # Offloaded to a worker thread so the synchronous FileLock/JSON
+                # write never stalls the shared event loop (mirrors the goal-
+                # completion-judge offload below).
+                await asyncio.to_thread(self._auto_save_session)
 
                 # ─────────────────────────────────────────────────────────────
                 # GOAL COMPLETION JUDGE (opt-in): independent acceptance-criteria
                 # gate. No-op when no goal loop is active (behaviour unchanged).
+                # Offloaded to a worker thread (blocking judge LLM call / hooks)
+                # so it never stalls the shared event loop.
                 # ─────────────────────────────────────────────────────────────
-                _goal_gate = self._goal_gate(response_str)
+                _goal_gate = await self._goal_gate_async(response_str)
                 if _goal_gate is not None:
                     _outcome, _reason = _goal_gate
                     if _outcome == "done":
@@ -5020,8 +5563,8 @@ Summary:"""
                 # Yield control to allow other async tasks to run
                 await asyncio.sleep(0)
             
-            # Final auto-save before returning
-            self._auto_save_session()
+            # Final auto-save before returning (offloaded off the event loop).
+            await asyncio.to_thread(self._auto_save_session)
             
             # Max iterations reached
             return AutonomyResult(
@@ -5437,6 +5980,8 @@ Summary:"""
             List of available tools
         """
         if not self.plan_mode:
+            if getattr(self, "_plugin_tool_owners", None):
+                return [tool for tool in self.tools if self._is_plugin_tool_active(tool)]
             return self.tools
             
         # Filter to read-only tools only
@@ -5444,6 +5989,8 @@ Summary:"""
         
         filtered_tools = []
         for tool in self.tools:
+            if not self._is_plugin_tool_active(tool):
+                continue
             tool_name = getattr(tool, '__name__', str(tool)).lower()
             
             # Check if tool is in restricted list
@@ -5711,12 +6258,12 @@ Summary:"""
             for extra in extra_files:
                 self._rules_manager.add_rule_file(extra)
             
-            # Discovery gate: if no rules were found, drop the manager so that
-            # zero-config runs incur no per-run injection cost.
+            # Keep explicit registrations so an initially empty glob can gain
+            # matches on reload. Zero-config runs still avoid injection cost.
             stats = self._rules_manager.get_stats()
             if stats["total_rules"] > 0:
                 logging.debug(f"RulesManager: Discovered {stats['total_rules']} rules")
-            else:
+            elif not extra_files:
                 self._rules_manager = None
         except ImportError:
             logging.debug("RulesManager not available")
@@ -6446,6 +6993,9 @@ Answer:"""
         # ``self._tool_call_guardrails`` but nothing ever assigned it, so the
         # whole ``validate_tool_call`` surface was dead code. Always define it.
         self._tool_call_guardrails = []
+        # ``tool_execution._apply_tool_result_guardrails`` reads this to gate a
+        # tool's raw output before it re-enters the LLM context. Always define it.
+        self._tool_result_guardrails = []
         if self.guardrail is None:
             self._guardrail_fn = None
             return
@@ -6522,6 +7072,17 @@ Answer:"""
         ):
             self._tool_call_guardrails = [_fn]
 
+        # Register the tool-result surface the same way. Output-only (string/LLM)
+        # guardrails are excluded on purpose: running an LLM validation after
+        # every tool result would be a hot-path regression, mirroring the
+        # tool-call exclusion above.
+        if (
+            _fn is not None
+            and callable(getattr(_fn, "validate_tool_result", None))
+            and not getattr(_fn, "_praison_output_only", False)
+        ):
+            self._tool_result_guardrails = [_fn]
+
     def _process_handoffs(self):
         """Process handoffs and convert them to tools that can be used by the agent."""
         # Import here to avoid circular imports
@@ -6559,12 +7120,16 @@ Answer:"""
                 if isinstance(handoff_item, Handoff):
                     # Convert Handoff object to a tool function
                     tool_func = handoff_item.to_tool_function(self)
+                    tool_func._praison_handoff_source = handoff_item
                     self.tools.append(tool_func)
                 elif hasattr(handoff_item, 'name') and hasattr(handoff_item, 'chat'):
                     # Direct agent reference - create a simple handoff
                     from .handoff import handoff
                     handoff_obj = handoff(handoff_item)
                     tool_func = handoff_obj.to_tool_function(self)
+                    # Tagged like the tools= branch above so clone_for_channel()
+                    # rebinds delegation to the clone rather than this agent.
+                    tool_func._praison_handoff_source = handoff_obj
                     self.tools.append(tool_func)
                 else:
                     logging.warning(
@@ -6573,6 +7138,42 @@ Answer:"""
                     )
             except Exception as e:
                 logging.error(f"Failed to process handoff item {handoff_item}: {e}")
+
+    @property
+    def guardrail_retry_count(self) -> int:
+        """How many times output validation has sent the model back for a retry.
+
+        Cumulative over the agent's lifetime, incremented once per rejected
+        answer that was handed back to the model (see
+        ``_apply_guardrail_with_retry``). Read it to confirm a run converged in
+        one correction rather than burning ``max_guardrail_retries``.
+        """
+        return getattr(self, "_guardrail_retry_count", 0)
+
+    @property
+    def last_guardrail_error(self):
+        """The most recent rejection message a guardrail sent back to the model."""
+        return getattr(self, "_last_guardrail_error", None)
+
+    def _guardrail_blocked_message(self, error=None):
+        """Fixed, user-facing string returned when an output guardrail blocks a run.
+
+        A blocked response must never surface the rejected (potentially unsafe)
+        model text, but it must also never be ``None`` - callers expect a
+        ``str`` and would otherwise crash on ``.strip()`` (issue #5596, FR-001).
+
+        The returned string is intentionally **fixed** and carries no diagnostic
+        detail: a guardrail's own rejection reason (especially an LLM validator's
+        free-text) can echo the blocked output, so appending it would leak the
+        very content the guardrail rejected. The reason is logged instead, where
+        it stays auditable without reaching the caller. The rejection is also
+        exposed programmatically via :attr:`last_guardrail_error`.
+        """
+        self._mark_db_run_error()
+        reason = str(error) if error else getattr(self, "_last_guardrail_error", None)
+        if reason:
+            logging.info(f"Agent {self.name}: guardrail block reason: {reason}")
+        return "I'm sorry, but I can't share that response because it did not pass the safety guardrail."
 
     def _process_guardrail(self, task_output):
         """Process the guardrail validation for a task output.
@@ -6583,17 +7184,33 @@ Answer:"""
         Returns:
             GuardrailResult: The result of the guardrail validation
         """
-        from ..guardrails import GuardrailResult
-        
+        from ..guardrails import GuardrailResult, GuardrailRetry
+
         if not self._guardrail_fn:
             return GuardrailResult(success=True, result=task_output)
-        
+
         try:
-            # Call the guardrail function
-            result = self._guardrail_fn(task_output)
-            
+            # Call the guardrail function, awaiting it if the caller supplied an
+            # async def. Calling a coroutine function synchronously would only
+            # build a coroutine object (never running its body), which then
+            # crashes GuardrailResult.from_tuple and is misreported as a
+            # validation failure.
+            if asyncio.iscoroutinefunction(self._guardrail_fn):
+                from ..utils.async_bridge import run_coroutine_from_any_context
+                result = run_coroutine_from_any_context(self._guardrail_fn(task_output))
+            else:
+                result = self._guardrail_fn(task_output)
+
             # Convert the result to a GuardrailResult
             return GuardrailResult.from_tuple(result)
+
+        except GuardrailRetry as e:
+            # Deliberate rejection with a message meant for the model. Keep the
+            # author's wording verbatim - it is fed back into the conversation
+            # by _apply_guardrail_with_retry - rather than wrapping it as an
+            # internal validation *error*.
+            logging.warning(f"Agent {self.name}: Guardrail asked for a retry: {e.feedback}")
+            return GuardrailResult(success=False, result=None, error=e.feedback)
 
         except Exception as e:
             logging.error(f"Agent {self.name}: Error in guardrail validation: {e}")
@@ -6657,48 +7274,133 @@ Answer:"""
         else:
             return False, None, guardrail_result.error
 
-    def _apply_guardrail_with_retry(self, response_text, prompt, temperature=1.0, tools=None, task_name=None, task_description=None, task_id=None, cancel_token=None):
-        """Apply guardrail validation with retry logic (sync version)."""
+    def _guardrail_retry_feedback(self, error):
+        """The correction turn handed back to the model after a rejection.
+
+        Shared by the in-conversation retry and the legacy single-prompt
+        fallback so the instruction reads the same whichever transport the
+        configured provider uses.
+        """
+        return (
+            f"Previous response failed validation due to: {error}. "
+            "Please provide an improved response."
+        )
+
+    def _extend_guardrail_conversation(self, conversation, response_text, feedback):
+        """Append the rejected answer and the validator's reason to ``conversation``.
+
+        This is what makes the correction happen *inside* the same run: the
+        model sees its own answer plus why it was refused, so it patches that
+        answer instead of re-deriving one from the bare prompt. Extends (and
+        returns) the list in place, so successive retries accumulate the way a
+        real conversation does.
+
+        The assistant turn is skipped when the caller's conversation already
+        ends with it, which is the case for callers that hand over live chat
+        history rather than the pre-call message list.
+        """
+        last = conversation[-1] if conversation else None
+        already_present = (
+            isinstance(last, dict)
+            and last.get("role") == "assistant"
+            and last.get("content") == response_text
+        )
+        if response_text and not already_present:
+            conversation.append({"role": "assistant", "content": response_text})
+        conversation.append({"role": "user", "content": feedback})
+        return conversation
+
+    def _record_guardrail_retry(self, *, attempt, error, delay):
+        """Count and announce one guardrail retry.
+
+        ``guardrail_retry_count`` makes the retries observable to callers and
+        tests; the RETRY stream event puts them on the same channel as
+        transient-failure retries, so a CLI/UI shows "retrying" rather than
+        appearing to hang.
+        """
+        self._guardrail_retry_count = getattr(self, "_guardrail_retry_count", 0) + 1
+        self._last_guardrail_error = error
+        emit = getattr(self, "_emit_retry_stream_event", None)
+        if emit is not None:
+            emit(
+                attempt=attempt,
+                max_attempts=self.max_guardrail_retries,
+                delay=delay,
+                reason=f"guardrail validation failed: {error}",
+            )
+
+    def _guardrail_retry_delay(self, retry_count):
+        """Backoff before the next guardrail retry (agent execution policy)."""
+        execution_config = getattr(self, '_execution_config', None)
+        if execution_config is not None:
+            return BackoffPolicy.delay(
+                retry_count,
+                execution_config.retry_initial_delay,
+                execution_config.retry_backoff_factor,
+                execution_config.retry_jitter
+            )
+        # Fall back to simple backoff if no execution config
+        return 1.0 * (2.0 ** (retry_count - 1))
+
+    def _apply_guardrail_with_retry(self, response_text, prompt, temperature=1.0, tools=None, task_name=None, task_description=None, task_id=None, cancel_token=None, messages=None):
+        """Apply guardrail validation with retry logic (sync version).
+
+        Args:
+            response_text: The answer to validate.
+            prompt: The originating prompt, used only by the fallback below.
+            messages: The conversation that produced ``response_text`` (as sent
+                to the model, without its reply). When supplied, a rejection is
+                appended to *that* conversation - rejected answer plus the
+                validator's reason - so the model corrects itself in the same
+                run with its context intact. When omitted (providers whose
+                message list the caller does not hold), the retry falls back to
+                re-asking the original prompt with the reason appended.
+
+        Bounded by ``max_guardrail_retries``; a validator that never passes
+        raises rather than looping.
+        """
         retry_count = 0
         current_response = response_text
-        
+        # Own copy: _chat_completion rewrites its messages list in place.
+        conversation = list(messages) if messages else None
+
         while retry_count <= self.max_guardrail_retries:
             success, result, error = self._validate_with_guardrail(current_response)
-            
+
             if success:
                 logging.info(f"Agent {self.name}: Guardrail validation passed")
                 return result
-            
+
             # Guardrail failed
             if retry_count >= self.max_guardrail_retries:
                 raise Exception(
                     f"Agent {self.name} response failed guardrail validation after {self.max_guardrail_retries} retries. "
                     f"Last error: {error}"
                 )
-            
+
             retry_count += 1
             logging.warning(f"Agent {self.name}: Guardrail validation failed (retry {retry_count}/{self.max_guardrail_retries}): {error}")
-            
+
             # Add exponential backoff delay to avoid hammering the LLM
-            execution_config = getattr(self, '_execution_config', None)
-            if execution_config is not None:
-                total_delay = BackoffPolicy.delay(
-                    retry_count,
-                    execution_config.retry_initial_delay,
-                    execution_config.retry_backoff_factor,
-                    execution_config.retry_jitter
-                )
-            else:
-                # Fall back to simple backoff if no execution config
-                total_delay = 1.0 * (2.0 ** (retry_count - 1))
-            
+            total_delay = self._guardrail_retry_delay(retry_count)
+            self._record_guardrail_retry(attempt=retry_count, error=error, delay=total_delay)
+
             logging.info(f"Agent {self.name}: Waiting {total_delay:.2f}s before guardrail retry")
             time.sleep(total_delay)
-            
+
             # Regenerate response for retry
             try:
-                retry_prompt = f"{prompt}\n\nNote: Previous response failed validation due to: {error}. Please provide an improved response."
-                response = self._chat_completion([{"role": "user", "content": retry_prompt}], temperature, tools, task_name=task_name, task_description=task_description, task_id=task_id, cancel_token=cancel_token)
+                feedback = self._guardrail_retry_feedback(error)
+                if conversation is not None:
+                    retry_messages = self._extend_guardrail_conversation(
+                        conversation, current_response, feedback
+                    )
+                else:
+                    retry_messages = [{"role": "user", "content": f"{prompt}\n\nNote: {feedback}"}]
+                # stream=False: the retry reads a complete message and nothing
+                # consumes deltas, so streaming here only costs a failed
+                # sync-adapter attempt and an ERROR log before falling back.
+                response = self._chat_completion(list(retry_messages), temperature, tools, stream=False, task_name=task_name, task_description=task_description, task_id=task_id, cancel_token=cancel_token)
                 if response and response.choices:
                     content = response.choices[0].message.content
                     current_response = content.strip() if content else ""
@@ -6707,51 +7409,73 @@ Answer:"""
             except Exception as e:
                 logging.error(f"Agent {self.name}: Error during guardrail retry: {e}")
                 raise Exception(f"Agent {self.name} guardrail retry failed: {e}")
-        
+
         return current_response
 
-    async def _aapply_guardrail_with_retry(self, response_text, prompt, temperature=1.0, tools=None, task_name=None, task_description=None, task_id=None):
-        """Apply guardrail validation with retry logic (async version)."""
+    async def _aapply_guardrail_with_retry(self, response_text, prompt, temperature=1.0, tools=None, task_name=None, task_description=None, task_id=None, messages=None):
+        """Apply guardrail validation with retry logic (async version).
+
+        See ``_apply_guardrail_with_retry`` for the ``messages`` contract.
+        """
         retry_count = 0
         current_response = response_text
-        
+        # Own copy: the completion path rewrites its messages list in place.
+        conversation = list(messages) if messages else None
+
         while retry_count <= self.max_guardrail_retries:
-            success, result, error = self._validate_with_guardrail(current_response)
-            
+            # A string/LLMGuardrail guardrail fires a *blocking* LLM call inside
+            # _validate_with_guardrail. Offload it to a thread so it does not
+            # stall the event loop (and every other concurrently-running task
+            # under asyncio.gather), mirroring async_memory_mixin's
+            # _run_memory_in_thread executor-offload pattern.
+            loop = asyncio.get_event_loop()
+            # Preserve contextvars (trace emission, session context) across the
+            # executor thread so a custom guardrail sees the same contextual
+            # state as the synchronous path, matching every other
+            # run_in_executor call site in the SDK.
+            from ..trace.context_events import copy_context_to_callable
+            success, result, error = await loop.run_in_executor(
+                None,
+                copy_context_to_callable(
+                    lambda: self._validate_with_guardrail(current_response)
+                ),
+            )
+
             if success:
                 logging.info(f"Agent {self.name}: Guardrail validation passed")
                 return result
-            
+
             # Guardrail failed
             if retry_count >= self.max_guardrail_retries:
                 raise Exception(
                     f"Agent {self.name} response failed guardrail validation after {self.max_guardrail_retries} retries. "
                     f"Last error: {error}"
                 )
-            
+
             retry_count += 1
             logging.warning(f"Agent {self.name}: Guardrail validation failed (retry {retry_count}/{self.max_guardrail_retries}): {error}")
-            
+
             # Add exponential backoff delay to avoid hammering the LLM
-            execution_config = getattr(self, '_execution_config', None)
-            if execution_config is not None:
-                total_delay = BackoffPolicy.delay(
-                    retry_count,
-                    execution_config.retry_initial_delay,
-                    execution_config.retry_backoff_factor,
-                    execution_config.retry_jitter
-                )
-            else:
-                # Fall back to simple backoff if no execution config
-                total_delay = 1.0 * (2.0 ** (retry_count - 1))
-            
+            total_delay = self._guardrail_retry_delay(retry_count)
+            self._record_guardrail_retry(attempt=retry_count, error=error, delay=total_delay)
+
             logging.info(f"Agent {self.name}: Waiting {total_delay:.2f}s before guardrail retry")
             await asyncio.sleep(total_delay)
-            
+
             # Regenerate response for retry (async version)
             try:
-                retry_prompt = f"{prompt}\n\nNote: Previous response failed validation due to: {error}. Please provide an improved response."
-                response = await self._execute_unified_achat_completion([{"role": "user", "content": retry_prompt}], temperature, tools, task_name=task_name, task_description=task_description, task_id=task_id)
+                feedback = self._guardrail_retry_feedback(error)
+                if conversation is not None:
+                    retry_messages = self._extend_guardrail_conversation(
+                        conversation, current_response, feedback
+                    )
+                else:
+                    retry_messages = [{"role": "user", "content": f"{prompt}\n\nNote: {feedback}"}]
+                # stream=False: the retry consumes a complete message, and the
+                # helper's own default is stream=True regardless of the agent's
+                # setting, which would make the retry stream when nothing reads
+                # the deltas.
+                response = await self._execute_unified_achat_completion(list(retry_messages), temperature, tools, stream=False, task_name=task_name, task_description=task_description, task_id=task_id)
                 if response and hasattr(response, 'choices') and response.choices:
                     content = response.choices[0].message.content
                     current_response = content.strip() if content else ""
@@ -6762,9 +7486,9 @@ Answer:"""
             except Exception as e:
                 logging.error(f"Agent {self.name}: Error during guardrail retry: {e}")
                 raise Exception(f"Agent {self.name} guardrail retry failed: {e}")
-        
+
         return current_response
-    
+
     def _get_tools_cache_key(self, tools):
         """Generate a cache key for tools list."""
         if tools is None:
@@ -6773,10 +7497,25 @@ Answer:"""
             return "empty"
         # Create a simple hash based on tool names
         tool_names = []
+        try:
+            from ..tools.hosted import is_hosted_tool
+        except ImportError:
+            is_hosted_tool = lambda _tool: False
+
         for tool in tools:
             if callable(tool) and hasattr(tool, '__name__'):
                 tool_names.append(tool.__name__)
-            elif isinstance(tool, dict) and 'function' in tool and 'name' in tool['function']:
+            elif isinstance(tool, dict) and is_hosted_tool(tool):
+                try:
+                    hosted_key = json.dumps(tool, sort_keys=True)
+                except (TypeError, ValueError):
+                    hosted_key = str(id(tool))
+                tool_names.append(f"hosted:{hosted_key}")
+            elif (
+                isinstance(tool, dict)
+                and isinstance(tool.get('function'), dict)
+                and tool['function'].get('name')
+            ):
                 tool_names.append(tool['function']['name'])
             elif isinstance(tool, str):
                 tool_names.append(tool)
@@ -7372,21 +8111,68 @@ Answer:"""
         except Exception as e:
             logger.warning(f"Task cleanup failed: {e}")
 
-        # ThreadPoolExecutor cleanup
+        # ThreadPoolExecutor cleanup. Detach the executor under the same lock
+        # that guards timeout retirement/replacement (see tool_execution.py) so
+        # cleanup and a concurrent timeout can never act on different executor
+        # generations. Shut down outside the critical section to avoid holding
+        # the lock across a blocking call.
         try:
-            if hasattr(self, '_tool_executor') and self._tool_executor:
+            executor = None
+            lock = getattr(self, '_tool_executor_lock', None)
+            if lock is not None:
+                with lock.sync():
+                    executor = getattr(self, '_tool_executor', None)
+                    self._tool_executor = None
+            elif hasattr(self, '_tool_executor'):
+                executor = self._tool_executor
+                self._tool_executor = None
+            if executor is not None:
                 # Use cancel_futures only if supported (Python 3.9+)
                 import sys
                 if sys.version_info >= (3, 9):
-                    self._tool_executor.shutdown(wait=False, cancel_futures=True)
+                    executor.shutdown(wait=False, cancel_futures=True)
                 else:
-                    self._tool_executor.shutdown(wait=False)
-                delattr(self, '_tool_executor')
+                    executor.shutdown(wait=False)
         except Exception as e:
             logger.warning(f"ThreadPoolExecutor cleanup failed: {e}")
 
+        # Approval scope cleanup — evict this agent's process-global approval
+        # grants (skill auto-approvals + "this session" decisions) keyed by the
+        # per-instance _approval_scope_id, which never repeats and is otherwise
+        # never removed. Prevents unbounded growth in per-request/session agents.
+        self._release_approval_scope()
+
         # Always set closed flag
         self._closed = True
+
+    def _release_approval_scope(self, *, from_finalizer: bool = False) -> None:
+        """Drop this agent's approval-registry grants (best-effort).
+
+        From ``__del__`` only the process-global grants are released, without
+        blocking on the registry lock: a GC finalizer must neither write a
+        ContextVar nor wait on a lock (see ``ApprovalRegistry.release_scope``).
+        """
+        scope_id = getattr(self, '_approval_scope_id', None)
+        if not scope_id:
+            return
+        try:
+            if from_finalizer:
+                # No locks and no imports here: get_approval_registry() takes a
+                # non-reentrant module lock that GC may have interrupted on this
+                # very thread. Read the singleton directly; if no registry was
+                # ever built, this agent recorded no grants.
+                import sys as _sys
+                _approval = _sys.modules.get("praisonaiagents.approval")
+                registry = getattr(_approval, "_registry", None)
+                if registry is None:
+                    return
+            else:
+                from ..approval import get_approval_registry
+                registry = get_approval_registry()
+            registry.release_scope(scope_id, from_finalizer=from_finalizer)
+        except Exception as e:
+            if not from_finalizer:
+                logger.warning(f"Approval scope cleanup failed: {e}")
     
     async def aclose(self) -> None:
         """Async version of close() for async context managers."""
@@ -7398,6 +8184,41 @@ Answer:"""
                 elif hasattr(self.memory, 'close_connections'):
                     self.memory.close_connections()
             
+            # LLM client cleanup - release live client pools asynchronously.
+            # Mirror close()'s targets but never touch the ``llm_instance``
+            # property (it would lazily *create* a client just to close it);
+            # only tear down an already-materialised ``_llm_instance``.
+            try:
+                llm_instance = getattr(self, '_llm_instance', None)
+                if llm_instance is not None:
+                    aclose = getattr(llm_instance, 'aclose', None)
+                    if aclose is not None:
+                        try:
+                            if asyncio.iscoroutinefunction(aclose):
+                                await aclose()
+                            else:
+                                aclose()
+                        except Exception:
+                            close = getattr(llm_instance, 'close', None)
+                            if callable(close):
+                                close()
+                    else:
+                        close = getattr(llm_instance, 'close', None)
+                        if callable(close):
+                            close()
+
+                openai_client = getattr(self, '_Agent__openai_client', None)
+                if openai_client is not None and hasattr(openai_client, 'close'):
+                    openai_client.close()
+
+                llm = getattr(self, 'llm', None)
+                if llm and not isinstance(llm, str):
+                    llm_client = getattr(llm, '_client', None)
+                    if llm_client and hasattr(llm_client, 'close'):
+                        llm_client.close()
+            except Exception as e:
+                logger.warning(f"LLM client cleanup failed: {e}")
+
             # Close MCP clients passed via tools=[MCP(...)]
             # (mirrors remove_mcp_server()'s best-effort shutdown)
             if isinstance(self.tools, list):
@@ -7432,23 +8253,39 @@ Answer:"""
                     except asyncio.CancelledError:
                         pass
 
-            # ThreadPoolExecutor cleanup (async-safe)
-            if hasattr(self, '_tool_executor') and self._tool_executor:
+            # ThreadPoolExecutor cleanup (async-safe). Detach the executor under
+            # the lock that guards timeout retirement/replacement so cleanup and
+            # a concurrent timeout can never act on different executor
+            # generations. Capture the reference before scheduling the shutdown
+            # so the deferred call cannot resolve a replacement pool created by
+            # another call.
+            executor = None
+            lock = getattr(self, '_tool_executor_lock', None)
+            if lock is not None:
+                async with lock.async_lock():
+                    executor = getattr(self, '_tool_executor', None)
+                    self._tool_executor = None
+            elif hasattr(self, '_tool_executor'):
+                executor = self._tool_executor
+                self._tool_executor = None
+            if executor is not None:
                 import sys
                 loop = asyncio.get_running_loop()
                 # Use run_in_executor to avoid blocking the event loop
                 if sys.version_info >= (3, 9):
                     await loop.run_in_executor(
-                        None, 
-                        lambda: self._tool_executor.shutdown(wait=False, cancel_futures=True)
+                        None,
+                        lambda: executor.shutdown(wait=False, cancel_futures=True)
                     )
                 else:
                     await loop.run_in_executor(
-                        None, 
-                        lambda: self._tool_executor.shutdown(wait=False)
+                        None,
+                        lambda: executor.shutdown(wait=False)
                     )
-                delattr(self, '_tool_executor')
-            
+
+            # Approval scope cleanup (see close()).
+            self._release_approval_scope()
+
             self._closed = True
             
         except Exception as e:
@@ -7509,6 +8346,12 @@ Answer:"""
                         logging.debug(
                             f"Failed to cleanup artifacts for agent {self.name}: {e}"
                         )
+
+                # Evict this agent's process-global approval grants so a
+                # per-request/session agent that is only ever GC'd (never
+                # close()'d) does not leak registry entries forever. Never the
+                # per-context cache: this may run inside the garbage collector.
+                self._release_approval_scope(from_finalizer=True)
             except Exception as exc:  # noqa: BLE001 - finalizers must not raise
                 import contextlib
                 with contextlib.suppress(Exception):

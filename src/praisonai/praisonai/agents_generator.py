@@ -12,21 +12,20 @@ import difflib
 import importlib
 import importlib.util
 from pathlib import Path
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, TYPE_CHECKING
 
 from .version import __version__
 
-# Import new architecture components
-from .framework_adapters.base import FrameworkAdapter
-from .framework_adapters.registry import FrameworkAdapterRegistry, get_default_registry
+# New architecture components are imported lazily to preserve the wrapper's
+# lazy-import contract: eagerly importing them here would pull the heavy
+# ``praisonaiagents.frameworks.*`` tree on every CLI command and ``praisonai.run``
+# call. Runtime access goes through ``_get_default_adapter_registry()`` below;
+# these type-only imports carry no runtime cost.
+if TYPE_CHECKING:
+    from .framework_adapters.base import FrameworkAdapter
+    from .framework_adapters.registry import FrameworkAdapterRegistry
 
 logger = logging.getLogger("praisonai.agents_generator")
-
-
-def _rich_print(*args, **kwargs):
-    """Lazy alias for rich.print — pays the import cost only on first use."""
-    from rich import print as _rp
-    return _rp(*args, **kwargs)
 
 
 def _yaml_safe_load(stream):
@@ -40,13 +39,19 @@ def _strict_validation_enabled() -> bool:
     return os.getenv("PRAISONAI_VALIDATE_STRICT", "false").lower() == "true"
 
 
-def _list_to_dict(entries: list, prefix: str, kind: str) -> dict:
+def _list_to_dict(entries: list, prefix: str, kind: str, strict: bool | None = None) -> dict:
     """Convert a list of named entries to a dict, preserving duplicates.
 
     Duplicate ``name`` keys would otherwise silently clobber each other. Instead
-    we raise under ``PRAISONAI_VALIDATE_STRICT`` or warn loudly and keep both by
-    suffixing the colliding key, so a multi-agent YAML never quietly shrinks.
+    we raise under strict validation or warn loudly and keep both by suffixing
+    the colliding key, so a multi-agent YAML never quietly shrinks.
+
+    ``strict`` is the per-run resolved strictness (arg / cli_config first). When
+    ``None`` (module-level callers with no instance) we fall back to the
+    process-global env var so behaviour is unchanged.
     """
+    if strict is None:
+        strict = _strict_validation_enabled()
     normalized: dict = {}
     duplicates: list = []
     for i, entry in enumerate(entries):
@@ -59,20 +64,28 @@ def _list_to_dict(entries: list, prefix: str, kind: str) -> dict:
         normalized[key] = entry
     if duplicates:
         msg = f"Duplicate {kind} name(s) in YAML: {sorted(set(duplicates))}"
-        if _strict_validation_enabled():
+        if strict:
             raise ValueError(msg)
         logger.warning("%s — kept both by suffixing keys; rename to silence.", msg)
     return normalized
 
 
-def _normalize_yaml_config(config: dict) -> dict:
-    """Normalise list-format agents/tasks YAML to dict format expected by merge/run."""
+def _normalize_yaml_config(config: dict, strict: bool | None = None) -> dict:
+    """Normalise list-format agents/tasks YAML to dict format expected by merge/run.
+
+    ``strict`` carries the per-run strictness so normalization and downstream
+    ``ConfigValidator`` agree within a single run. When ``None`` we fall back to
+    the process-global env var (module-level callers / backward compatibility).
+    """
     if not isinstance(config, dict):
         return config
 
+    if strict is None:
+        strict = _strict_validation_enabled()
+
     agents = config.get("agents")
     if isinstance(agents, list):
-        config["agents"] = _list_to_dict(agents, "agent", "agent")
+        config["agents"] = _list_to_dict(agents, "agent", "agent", strict=strict)
 
     for bucket_key in ("agents", "roles"):
         bucket = config.get(bucket_key)
@@ -83,12 +96,16 @@ def _normalize_yaml_config(config: dict) -> dict:
 
     roles = config.get("roles")
     if isinstance(roles, list):
-        config["roles"] = _list_to_dict(roles, "role", "role")
+        config["roles"] = _list_to_dict(roles, "role", "role", strict=strict)
 
     tasks = config.get("tasks")
     if isinstance(tasks, list):
-        bucket_from_roles = "roles" in config
-        bucket = config.get("roles") or config.get("agents") or {}
+        # An empty ``roles: {}`` must behave like a missing one, otherwise the
+        # grafted bucket (below) is never merged back and the run silently ends
+        # with zero agents.
+        existing_roles = config.get("roles") if isinstance(config.get("roles"), dict) else None
+        bucket_from_roles = bool(existing_roles)
+        bucket = existing_roles or config.get("agents") or {}
         if not isinstance(bucket, dict):
             bucket = {}
         for i, task in enumerate(tasks):
@@ -100,7 +117,7 @@ def _normalize_yaml_config(config: dict) -> dict:
                     f"Task {task.get('name', f'task_{i}')!r} references "
                     f"unknown agent {agent_key!r}; skipping."
                 )
-                if _strict_validation_enabled():
+                if strict:
                     raise ValueError(msg)
                 logger.warning(msg)
                 continue
@@ -110,15 +127,17 @@ def _normalize_yaml_config(config: dict) -> dict:
                 dup_msg = (
                     f"Duplicate task name {task_name!r} for agent {agent_key!r} in YAML"
                 )
-                if _strict_validation_enabled():
+                if strict:
                     raise ValueError(dup_msg)
                 logger.warning("%s — kept both by suffixing keys; rename to silence.", dup_msg)
                 task_name = f"{task_name}__dup_{i}"
             entry[task_name] = {
                 k: v for k, v in task.items() if k != "agent"
             }
+        # Always merge the grafted bucket back into ``roles`` so an initially
+        # empty ``roles: {}`` never leaves the run with zero agents.
         if not bucket_from_roles and bucket:
-            config["roles"] = {k: v for k, v in bucket.items()}
+            config["roles"] = {**(existing_roles or {}), **bucket}
         config.pop("tasks", None)
 
     return config
@@ -354,7 +373,7 @@ def _make_timeout_proxy(inner, wrapped_run=None, wrapped__run=None):
     return proxy
 
 
-def _wrap_with_timeout(tool, timeout_seconds: float, executor_factory, on_leaked=None, owner_key=None):
+def _wrap_with_timeout(tool, timeout_seconds: float, executor_factory, on_leaked=None, owner_key=None, native_delegates_to_core=False):
     """Enforce a per-call timeout on a tool, sync or async.
 
     For async tools the underlying task is cancelled on timeout. For sync tools
@@ -368,14 +387,38 @@ def _wrap_with_timeout(tool, timeout_seconds: float, executor_factory, on_leaked
     On timeout the wrapper raises :class:`ToolTimeoutError` rather than returning
     a JSON string, so a tool's declared return-type contract is never silently
     downgraded; the framework adapter decides how to surface the timeout.
+
+    ``native_delegates_to_core``: when True, a *plain native callable* (not a
+    framework tool object) is returned unwrapped so core's own per-tool timeout
+    enforcement (``praisonaiagents`` ``agent/tool_execution.py`` /
+    ``tools/call_executor.py``, configured via the agent's ``tool_config``
+    timeout) owns it — avoiding a second, duplicated abandon-on-timeout thread
+    pool for tools that already flow through core (#5650). Framework tool
+    objects (CrewAI/AutoGen/LangChain ``BaseTool``) never reach core's executor,
+    so they are *always* wrapped here to preserve their ``args_schema``.
     """
     if timeout_seconds is None or timeout_seconds <= 0:
+        return tool
+
+    # praisonai-native path: a plain callable already flows through core's tool
+    # executor, which enforces the resolved per-tool timeout. Returning it
+    # unwrapped lets core own the abandon-on-expiry semantics instead of the
+    # wrapper standing up a second thread pool with the same behaviour. Only
+    # framework tool objects (which bypass core) still need wrapper wrapping, so
+    # they fall through to the logic below.
+    if (
+        native_delegates_to_core
+        and callable(tool)
+        and not isinstance(tool, type)
+        and not _looks_like_framework_tool(tool)
+    ):
         return tool
 
     import asyncio
     import concurrent.futures
     import functools
     import inspect
+    import time
 
     # Identity of the wrapper's owner so a shared framework-tool object wrapped
     # by one generator is transparently re-wrapped (not skipped) when a
@@ -409,31 +452,81 @@ def _wrap_with_timeout(tool, timeout_seconds: float, executor_factory, on_leaked
 
         @functools.wraps(fn)
         def _sync_wrapped(*args, **kwargs):
-            executor = executor_factory()
-            future = executor.submit(fn, *args, **kwargs)
-            try:
-                return future.result(timeout=timeout_seconds)
-            except concurrent.futures.TimeoutError:
-                # Best-effort cancel; only effective if the future has not started.
-                # A started sync call cannot be interrupted, so warn operators that
-                # the worker may keep running (and its side effects may still occur).
-                cancelled = future.cancel()
-                if not cancelled and on_leaked is not None:
-                    # The worker is stuck and OS-owned; let the generator recycle
-                    # the pool so new submissions are not permanently queued behind
-                    # leaked threads.
-                    on_leaked()
-                logger.warning(
-                    "Tool %r exceeded %.1fs (cancel=%s); worker may continue "
-                    "executing in the background.",
-                    getattr(fn, "__name__", repr(fn)),
-                    timeout_seconds, cancelled,
-                )
-                raise ToolTimeoutError(
-                    tool_name=getattr(fn, "__name__", repr(fn)),
-                    timeout_seconds=timeout_seconds,
-                    background_work_may_continue=not cancelled,
-                )
+            tool_name = getattr(fn, "__name__", repr(fn))
+            # A concurrent recycle (or close()) can shut the captured pool down
+            # between capture and submit. Retry once against a freshly-minted
+            # pool; a second failure is genuinely fatal. Surfacing the failure
+            # as ToolTimeoutError keeps the module contract (see the docstring
+            # above) intact instead of leaking RuntimeError/CancelledError.
+            # A single monotonic deadline spans both attempts so a retry never
+            # extends the user-declared wall-clock budget.
+            deadline = time.monotonic() + timeout_seconds
+            for attempt in (0, 1):
+                if deadline - time.monotonic() <= 0:
+                    raise ToolTimeoutError(
+                        tool_name=tool_name,
+                        timeout_seconds=timeout_seconds,
+                        background_work_may_continue=False,
+                    )
+                try:
+                    executor = executor_factory()
+                    future = executor.submit(fn, *args, **kwargs)
+                except RuntimeError:
+                    # Either "cannot schedule new futures after shutdown" (the
+                    # captured pool was recycled between capture and submit) or
+                    # the generator was closed and refuses to mint a new pool
+                    # (executor_factory() raises). Both are recoverable on the
+                    # first attempt via a fresh pool; a second failure is fatal.
+                    # Keep the factory call inside this try so a close() landing
+                    # between the two attempts still surfaces as ToolTimeoutError
+                    # rather than leaking RuntimeError to the caller.
+                    if attempt == 0:
+                        continue
+                    raise ToolTimeoutError(
+                        tool_name=tool_name,
+                        timeout_seconds=timeout_seconds,
+                        background_work_may_continue=False,
+                    )
+                # Recompute right before waiting so time spent obtaining or
+                # recycling the pool is charged to the budget; an expired budget
+                # (timeout=0) takes the normal cancel/report path below.
+                try:
+                    return future.result(timeout=max(0.0, deadline - time.monotonic()))
+                except concurrent.futures.TimeoutError:
+                    # Best-effort cancel; only effective if the future has not started.
+                    # A started sync call cannot be interrupted, so warn operators that
+                    # the worker may keep running (and its side effects may still occur).
+                    cancelled = future.cancel()
+                    if not cancelled and on_leaked is not None:
+                        # The worker is stuck and OS-owned; let the generator recycle
+                        # the pool so new submissions are not permanently queued behind
+                        # leaked threads.
+                        on_leaked()
+                    logger.warning(
+                        "Tool %r exceeded %.1fs (cancel=%s); worker may continue "
+                        "executing in the background.",
+                        tool_name,
+                        timeout_seconds, cancelled,
+                    )
+                    raise ToolTimeoutError(
+                        tool_name=tool_name,
+                        timeout_seconds=timeout_seconds,
+                        background_work_may_continue=not cancelled,
+                    )
+                except concurrent.futures.CancelledError:
+                    # A concurrent pool recycle (shutdown(cancel_futures=True))
+                    # cancelled our still-queued future before it ran. The tool
+                    # never executed, so retry once against a freshly-minted pool
+                    # rather than losing a required result. If the retry is also
+                    # cancelled, surface as a timeout so the tool's declared
+                    # return-type contract is not silently downgraded.
+                    if attempt == 0:
+                        continue
+                    raise ToolTimeoutError(
+                        tool_name=tool_name,
+                        timeout_seconds=timeout_seconds,
+                        background_work_may_continue=False,
+                    )
         return _sync_wrapped
 
     # Framework tool object (CrewAI/LangChain BaseTool, praisonai @tool). These
@@ -514,7 +607,7 @@ def _resolve_yaml_cli_backend(cli_backend_config, logger):
 
 
 class AgentsGenerator:
-    def __init__(self, agent_file, framework, config_list, log_level=None, agent_callback=None, task_callback=None, agent_yaml=None, tools=None, cli_config=None, adapter_registry=None, tool_timeout_executor=None, tool_resolver=None, adapter=None):
+    def __init__(self, agent_file, framework, config_list, log_level=None, agent_callback=None, task_callback=None, agent_yaml=None, tools=None, cli_config=None, adapter_registry=None, tool_timeout_executor=None, tool_resolver=None, adapter=None, strict_validation=None, tool_timeout_workers=None):
         """
         Initialize the AgentsGenerator object.
 
@@ -530,6 +623,8 @@ class AgentsGenerator:
             cli_config (dict, optional): CLI configuration to override YAML settings. Defaults to None.
             adapter_registry (FrameworkAdapterRegistry, optional): Registry for framework adapters. Defaults to process default.
             tool_resolver (ToolResolver, optional): Canonical tool resolver. Defaults to the shared context-local resolver so discovery runs once per run.
+            strict_validation (bool, optional): Per-run override for strict YAML validation. Precedence: this arg > cli_config['strict_validation'] > PRAISONAI_VALIDATE_STRICT env var. Lets multi-tenant hosts scope strictness per request without mutating os.environ.
+            tool_timeout_workers (int, optional): Per-run override for the sync-tool timeout pool size. Precedence: this arg > cli_config['tool_timeout_workers'] > PRAISONAI_TOOL_TIMEOUT_WORKERS env var. Lets multi-tenant hosts scope the pool per request.
 
         Attributes:
             agent_file (str): The path to the agent file.
@@ -540,6 +635,15 @@ class AgentsGenerator:
             task_callback (callable, optional): A callback function to be executed after each tool run.
             tools (dict): A dictionary containing the tools to be used for the agents.
         """
+        # Wire the built-in readers/retrievers/rerankers into the core-SDK
+        # registries so YAML `retriever:` / `reader:` / `reranker:` declarations
+        # resolve identically on every launch path (CLI, serve, eval, Python).
+        # Single-sourced here so surfaces that construct AgentsGenerator directly
+        # (praisonai <file.yaml>, serve, eval) get the same wiring as run()/arun().
+        # Idempotent + thread-safe + register-only-if-absent; safe to call again.
+        from .adapters import register_default_adapters
+        register_default_adapters()
+
         self.agent_file = agent_file
         self.framework = framework
         self.config_list = config_list
@@ -547,8 +651,24 @@ class AgentsGenerator:
         self.agent_callback = agent_callback
         self.task_callback = task_callback
         self.agent_yaml = agent_yaml
-        self.tools = tools or []  # Store tool class names as a list
+        self.tools = tools or []  # Tool classes, callables or framework tool objects
         self.cli_config = cli_config or {}  # Store CLI configuration overrides
+
+        # Per-run behaviour toggles. Precedence: explicit arg > cli_config > env
+        # var fallback. This lets multi-tenant `praisonai serve` hosts scope
+        # strictness and pool size per request via the existing DI seams instead
+        # of relying on process-global os.environ (which cannot isolate tenants).
+        self._strict_validation = (
+            strict_validation
+            if strict_validation is not None
+            else self.cli_config.get("strict_validation")
+        )
+        self._tool_timeout_workers = (
+            tool_timeout_workers
+            if tool_timeout_workers is not None
+            else self.cli_config.get("tool_timeout_workers")
+        )
+
         # Use namespaced logger - no hot-path basicConfig calls
         from ._logging import get_logger
         self.logger = get_logger("agents_generator")
@@ -588,10 +708,12 @@ class AgentsGenerator:
         self._tool_timeout_executor = tool_timeout_executor
         self._owns_tool_timeout_executor = tool_timeout_executor is None
         self._tool_timeout_executor_lock = threading.Lock()
+        # Set by close() to permanently refuse resurrecting an owned pool.
+        self._closed = False
         # Track workers permanently held by stuck sync tools. Once half the pool
         # is leaked we recycle it so new tool calls aren't starved forever.
         self._leaked_workers = 0
-        self._max_leaked_workers = max(1, _resolve_tool_timeout_workers() // 2)
+        self._max_leaked_workers = max(1, self._resolve_tool_timeout_workers() // 2)
         # Stable per-generator identity for timeout-wrapper ownership. A bound
         # method (self._get_tool_timeout_executor) yields a fresh object with a
         # different id() on every access, so it cannot be used as a reliable
@@ -601,6 +723,37 @@ class AgentsGenerator:
         # Defer framework adapter creation until YAML is loaded
         # This fixes the issue where empty framework string fails before YAML framework is read
         self.framework_adapter = None
+
+    def _is_strict(self) -> bool:
+        """Whether strict validation is enabled for this run.
+
+        Per-run precedence: explicit arg / cli_config first, then the
+        process-global env var as fallback. Multi-tenant hosts can therefore
+        demand strict validation for one tenant without forcing it on another.
+        """
+        override = getattr(self, "_strict_validation", None)
+        if override is not None:
+            return bool(override)
+        return _strict_validation_enabled()
+
+    def _resolve_tool_timeout_workers(self) -> int:
+        """Resolve this run's sync-tool timeout pool size.
+
+        Per-run precedence: explicit arg / cli_config first, then the
+        process-global env var as fallback. A per-run value lets a large tenant
+        get a bigger pool without inflating it for every other tenant sharing
+        the process.
+        """
+        override = getattr(self, "_tool_timeout_workers", None)
+        if override is not None:
+            try:
+                return max(1, int(override))
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Invalid tool_timeout_workers=%r; falling back to env/default.",
+                    override,
+                )
+        return _resolve_tool_timeout_workers()
 
     def _get_tool_timeout_executor(self):
         """Lazily create this generator's bounded sync-tool-timeout thread pool.
@@ -615,6 +768,20 @@ class AgentsGenerator:
         import concurrent.futures
 
         with self._tool_timeout_executor_lock:
+            # Refuse to resurrect the pool after close(). Without this a tool
+            # object still reachable past the `with ... as gen:` block (via a
+            # framework lifecycle hook, shared registry, or retained callback)
+            # would find _tool_timeout_executor is None, build a fresh unowned
+            # pool, and leak its daemon threads per request in a long-lived
+            # server worker. Mirrors AsyncBridge._closed (_async_bridge.py:118).
+            if getattr(self, "_closed", False):
+                raise RuntimeError(
+                    "AgentsGenerator is closed; refusing to construct a new "
+                    "tool-timeout executor. This tool was invoked after "
+                    "close(); hold a live generator (e.g. keep the "
+                    "`with ... as gen:` block open) for the lifetime of any "
+                    "tool it wraps."
+                )
             recycle = (
                 self._owns_tool_timeout_executor
                 and self._tool_timeout_executor is not None
@@ -628,7 +795,7 @@ class AgentsGenerator:
                 # Resolve once so the pool size and the leak threshold that
                 # governs its recycling always agree, even if the env var was
                 # changed between construction and (re)creation.
-                workers = _resolve_tool_timeout_workers()
+                workers = self._resolve_tool_timeout_workers()
                 self._tool_timeout_executor = concurrent.futures.ThreadPoolExecutor(
                     max_workers=workers,
                     thread_name_prefix=f"praisonai-tool-timeout-{id(self):x}",
@@ -644,22 +811,60 @@ class AgentsGenerator:
         with self._tool_timeout_executor_lock:
             self._leaked_workers += 1
 
-    def _wrap_tool_with_timeout(self, tool, timeout_seconds):
-        """Wrap a tool with this generator's instance-owned timeout executor."""
+    def _wrap_tool_with_timeout(self, tool, timeout_seconds, native_delegates_to_core=None):
+        """Wrap a tool with this generator's instance-owned timeout executor.
+
+        On the praisonai-native framework the resolved per-tool timeout is
+        enforced by core (``praisonaiagents`` ``agent/tool_execution.py``, wired
+        via the agent's ``tool_config`` timeout), so a *native* callable is left
+        unwrapped here instead of being bound to a second wrapper-owned thread
+        pool with the same abandon-on-expiry semantics (#5650). Framework tool
+        objects (CrewAI/AutoGen/LangChain ``BaseTool``) bypass core, so they are
+        still wrapped.
+
+        ``native_delegates_to_core``: callers that already know the resolved
+        framework (the per-run wrap/resolver closures) pass it explicitly;
+        otherwise it is inferred from ``self.framework`` (resolved to the chosen
+        adapter name by the time an adapter invokes a wrap closure at run time).
+        """
+        if native_delegates_to_core is None:
+            native_delegates_to_core = self._delegates_tool_timeout_to_core(
+                getattr(self, "framework", None)
+            )
         return _wrap_with_timeout(
             tool,
             timeout_seconds,
             self._get_tool_timeout_executor,
             on_leaked=self._note_leaked_worker,
             owner_key=self._timeout_owner_key,
+            native_delegates_to_core=native_delegates_to_core,
         )
+
+    def _delegates_tool_timeout_to_core(self, framework) -> bool:
+        """Whether ``framework``'s adapter declares ``SUPPORTS_CORE_TOOL_TIMEOUT``."""
+        if not framework:
+            return False
+        from .framework_adapters.registry import adapter_capability
+
+        return adapter_capability(
+            str(framework),
+            "SUPPORTS_CORE_TOOL_TIMEOUT",
+            registry=getattr(self, "_adapter_registry", None),
+        ) is True
 
     def close(self):
         """Release the owned tool-timeout executor; safe to call repeatedly."""
         with self._tool_timeout_executor_lock:
             if self._owns_tool_timeout_executor and self._tool_timeout_executor is not None:
                 self._tool_timeout_executor.shutdown(wait=False, cancel_futures=True)
-                self._tool_timeout_executor = None
+            self._tool_timeout_executor = None
+            # Poison ownership and mark closed so a tool invoked after close()
+            # cannot silently resurrect an unowned pool (see
+            # _get_tool_timeout_executor). The `with ... as gen:` block that
+            # would have called close() has already exited, so nothing would
+            # ever tear a resurrected pool down.
+            self._owns_tool_timeout_executor = False
+            self._closed = True
 
     def __enter__(self):
         return self
@@ -668,7 +873,7 @@ class AgentsGenerator:
         self.close()
         return False
 
-    def _get_framework_adapter(self, framework: str) -> FrameworkAdapter:
+    def _get_framework_adapter(self, framework: str) -> "FrameworkAdapter":
         """
         Get the appropriate framework adapter for the given framework.
         
@@ -730,8 +935,21 @@ class AgentsGenerator:
                 break
 
         # Handle agent-level overrides using unified approach
-        agent_level_fields = ['tool_timeout', 'tool_retry_policy', 'planning_tools', 'autonomy', 'planning', 'web', 'web_fetch']
-        agent_overrides = {k: v for k, v in cli_config.items() if k in agent_level_fields}
+        agent_level_fields = ['tool_timeout', 'tool_retry_policy', 'planning_tools', 'autonomy', 'planning', 'web', 'web_fetch', 'max_tokens']
+        agent_overrides = {}
+        for key in agent_level_fields:
+            if key not in cli_config:
+                continue
+            # The legacy parser fills in a default when the user did not pass
+            # --max-tokens. Do not let that default overwrite a per-agent or
+            # nested YAML budget; only a value the parser marked as explicitly
+            # supplied on the command line is a real CLI override.
+            if (
+                key == 'max_tokens'
+                and not cli_config.get('_max_tokens_explicit')
+            ):
+                continue
+            agent_overrides[key] = cli_config[key]
 
         if "tool_retry_policy" in agent_overrides:
             policy = agent_overrides["tool_retry_policy"]
@@ -791,6 +1009,8 @@ class AgentsGenerator:
             spec = ApprovalSpec.from_cli(MockArgs(cli_config))
             if spec.enabled:
                 agent_overrides['approval'] = spec.to_dict()
+                if cli_config.get('permissions_config'):
+                    agent_overrides['approval']['permissions'] = dict(cli_config['permissions_config'])
             
         # Handle guardrail separately
         if 'guardrail' in cli_config:
@@ -820,9 +1040,25 @@ class AgentsGenerator:
         selection, and adapter resolution. Used by BOTH sync and async.
         """
         # Canonical format conversion: 'agents' -> 'roles', 'instructions' -> 'backstory'
-        if 'agents' in config and 'roles' not in config:
-            config['roles'] = {}
+        # Treat an empty ``roles: {}`` the same as a missing one so populated
+        # ``agents:`` is still promoted instead of running with zero agents.
+        #
+        # Promotion is *authoritative*: the shorthand ``agents:`` bucket is
+        # removed after merging into ``roles:`` so downstream validators and the
+        # executor read a single source of truth. Leaving ``agents:`` in place
+        # let validators see a merged ``{**roles, **agents}`` view the executor
+        # (which reads only ``roles:``) never runs — causing double-fired
+        # warnings, false-positive validation rejections, and silently dropped
+        # ``tool_timeout``/handoff knobs for agents that never became roles.
+        if 'agents' in config and isinstance(config['agents'], dict):
+            config.setdefault('roles', {})
+            if not isinstance(config['roles'], dict):
+                config['roles'] = {}
             for agent_name, agent_config in config['agents'].items():
+                # An entry already present under ``roles:`` is canonical and
+                # wins; only agents-only entries are promoted.
+                if agent_name in config['roles']:
+                    continue
                 role_config = dict(agent_config) if agent_config else {}
                 # Convert 'instructions' to 'backstory' if present
                 if 'instructions' in role_config and 'backstory' not in role_config:
@@ -835,6 +1071,8 @@ class AgentsGenerator:
                 if 'backstory' not in role_config:
                     role_config['backstory'] = f'You are a {role_config["role"]}'
                 config['roles'][agent_name] = role_config
+            # Drop the shorthand bucket so validators and the executor agree.
+            del config['agents']
 
         # Get workflow input: 'input' is canonical, 'topic' is alias for backward compatibility
         topic = config.get('input', config.get('topic', ''))
@@ -843,10 +1081,13 @@ class AgentsGenerator:
         self._validate_agents_config(config)
         
         # Build tools dictionary using shared logic
-        tools_dict = self._build_tools_dict(config)
+        tools_dict, run_ctx = self._build_tools_and_run_ctx(config)
         
-        # Select framework and resolve adapter variant
-        framework_name = self.framework or config.get('framework', 'praisonai')
+        # Select framework and resolve adapter variant. Registry is the single
+        # source of truth for the default, so no literal framework name here.
+        framework_name = self._adapter_registry.resolve_or_default(
+            self.framework or config.get('framework')
+        )
         adapter = self._select_framework(framework_name, config)
         
         # Validate framework availability through the injected registry so a
@@ -873,6 +1114,10 @@ class AgentsGenerator:
             'config': config,
             'topic': topic,
             'tools_dict': tools_dict,
+            # Per-run closures travel with this call's prep (not via ``self``) so
+            # concurrent runs on one generator never pick up each other's
+            # tool-timeout wrap/resolvers.
+            'run_ctx': run_ctx,
         }
 
     def _run_adapter_setup(self, adapter):
@@ -886,24 +1131,123 @@ class AgentsGenerator:
     
     def _build_tools_dict(self, config):
         """Shared tool resolution logic for sync and async paths."""
+        tools_dict, self._run_ctx = self._build_tools_and_run_ctx(config)
+        return tools_dict
+
+    def _build_tools_and_run_ctx(self, config):
+        """Resolve tools and return ``(tools_dict, run_ctx)`` for one run."""
         tools_dict = self.tool_resolver.resolve_all_from_yaml(config)
-        for tool_class in self.tools:
-            if isinstance(tool_class, type):
+        for tool in self.tools:
+            if isinstance(tool, type):
                 try:
-                    tools_dict[tool_class.__name__] = tool_class()
+                    tools_dict[tool.__name__] = tool()
                 except (TypeError, ValueError, RuntimeError) as e:
-                    self.logger.warning(f"Failed to instantiate tool class {tool_class.__name__}: {e}")
+                    self.logger.warning(f"Failed to instantiate tool class {tool.__name__}: {e}")
+            elif callable(tool) or _looks_like_framework_tool(tool):
+                # Plain callables / @tool functions and framework tool instances
+                # (CrewAI/LangChain BaseTool) are registered as-is by name.
+                name = getattr(tool, "name", None) or getattr(tool, "__name__", None)
+                if not isinstance(name, str) or not name:
+                    name = type(tool).__name__
+                tools_dict[name] = tool
+            else:
+                self.logger.warning(f"Ignoring non-tool entry in tools: {tool!r}")
 
         # Enforce tool_timeout from CLI/YAML at the wrapper layer so the field is
         # not silently dropped. The timeout stack (_wrap_tool_with_timeout) is
         # framework-agnostic and works for both the native and external adapters.
-        effective = self._resolve_effective_tool_timeout(config)
-        if effective and effective > 0:
-            tools_dict = {
-                name: self._wrap_tool_with_timeout(tool, effective)
-                for name, tool in tools_dict.items()
-            }
-        return tools_dict
+        # Determine whether a single uniform timeout applies to every agent, or
+        # whether agents declared *heterogeneous* per-agent budgets. A uniform
+        # value can still be wrapped once onto the shared dict (cheapest path);
+        # heterogeneous values must be wrapped per-agent so a documented
+        # per-agent ``tool_timeout`` is honoured instead of being silently
+        # downgraded to the tightest value for the whole run.
+        # The uniform and per-agent paths are mutually exclusive. Always resolve
+        # BOTH internal keys on every call (setting the inactive one to None) so
+        # that when the *same* generator instance is reused with a different
+        # timeout layout, a stale closure from a previous run can never leak into
+        # the adapters and apply the wrong budget to the current run.
+        # Resolve the chosen framework now (the same registry resolution the
+        # run prep uses) so native-vs-framework tool handling is decided BEFORE
+        # the uniform wrap is applied eagerly below — ``self.framework`` is not
+        # yet updated to the resolved adapter name at this point in the run.
+        _requested_framework = getattr(self, "framework", None) or config.get('framework')
+        registry = getattr(self, "_adapter_registry", None)
+        try:
+            resolved_framework = (
+                registry.resolve_or_default(_requested_framework)
+                if registry is not None else _requested_framework
+            )
+        except Exception:
+            resolved_framework = _requested_framework
+        native = self._delegates_tool_timeout_to_core(resolved_framework)
+
+        uniform = self._resolve_uniform_tool_timeout(config)
+        wrap = None
+        resolver = None
+        if uniform and uniform > 0:
+            # On the native framework a *plain callable* is left unwrapped so
+            # core enforces the budget (#5650) — the raw value is exposed below
+            # so the native adapter configures each agent's tool_config timeout.
+            # Framework tool *objects* are still wrapped here regardless, so
+            # their args_schema survives for the LLM. ``native`` is passed
+            # explicitly because ``self.framework`` is not yet resolved here.
+            wrap = (
+                lambda t, _sec=uniform, _n=native:
+                self._wrap_tool_with_timeout(t, _sec, native_delegates_to_core=_n)
+            )
+            tools_dict = {name: wrap(tool) for name, tool in tools_dict.items()}
+        else:
+            # No single uniform timeout. If any agent declared a per-agent
+            # tool_timeout, expose a resolver so adapters wrap each agent's tools
+            # with that agent's own budget (tools stay shared; only the guard
+            # closure differs). Falls back to no wrap for agents without one.
+            resolver = self.make_agent_tool_wrap_resolver(config)
+
+        # Expose the per-run wrap so adapters that inject *more* tools after this
+        # point (e.g. PraisonAIAdapter's ACP/LSP centric tools) apply the same
+        # timeout guard instead of silently bypassing it; expose the per-agent
+        # resolver for heterogeneous budgets. These are private per-run closures
+        # (bound to this generator's timeout executor), NOT user configuration —
+        # keep them off the user-facing ``self.cli_config`` dict so a caller who
+        # passed a shared cli_config template never gets it back stamped with
+        # instance-bound lambdas (cross-run / cross-tenant leak). They are merged
+        # into the cli_config kwarg only at dispatch (see _dispatch_cli_config)
+        # so adapters still read them via the same keys. Both are written every
+        # time so the inactive path is cleared rather than left holding a prior
+        # closure.
+        # On the native framework, plain callables are no longer wrapped by the
+        # wrapper's own executor (above) — core enforces the timeout instead
+        # (#5650). Expose the resolved per-agent timeout (float seconds) so the
+        # native adapter can configure each core Agent's ``tool_config`` timeout.
+        # ``None`` for non-native frameworks, which keep wrapper-side wrapping.
+        native_tool_timeout_resolver = None
+        if native:
+            native_tool_timeout_resolver = (
+                lambda agent_key, _cfg=config: self.resolve_agent_tool_timeout(agent_key, _cfg)
+            )
+
+        run_ctx = {
+            "_tool_timeout_wrap": wrap,
+            "_agent_tool_wrap_resolver": resolver,
+            "_native_tool_timeout_resolver": native_tool_timeout_resolver,
+        }
+        return tools_dict, run_ctx
+
+    def _dispatch_cli_config(self, run_ctx=None):
+        """Merge the private per-run context onto the user cli_config for adapters.
+
+        Adapters read ``_tool_timeout_wrap`` / ``_agent_tool_wrap_resolver`` off
+        their ``cli_config`` kwarg. Build a fresh merged dict at dispatch so the
+        closures reach the adapter without persisting onto the caller-owned
+        ``self.cli_config`` (which stays "user overrides only").
+        """
+        base = self.cli_config or {}
+        if run_ctx is None:
+            run_ctx = getattr(self, "_run_ctx", None)
+        if not run_ctx:
+            return base
+        return {**base, **run_ctx}
 
     def _resolve_effective_tool_timeout(self, config):
         """Resolve the effective per-tool timeout in seconds.
@@ -942,6 +1286,84 @@ class AgentsGenerator:
                     name, v, tightest,
                 )
         return tightest
+
+    @staticmethod
+    def _declared_agent_timeout(entity):
+        """Return a positive numeric ``tool_timeout`` declared on an entity, else None."""
+        v = entity.get("tool_timeout") if isinstance(entity, dict) else None
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            return float(v)
+        return None
+
+    def _resolve_uniform_tool_timeout(self, config):
+        """Return a single timeout to wrap every tool with, or ``None``.
+
+        A uniform value exists when the CLI sets ``tool_timeout`` (applies to all
+        agents), or when *every* agent/role declares ``tool_timeout`` and they
+        all declare the *same* value. If any agent omits ``tool_timeout``, or
+        declared values differ, returns ``None`` so the shared dict stays
+        unwrapped and the per-agent resolver becomes the sole guard — this
+        avoids both the old "tightest wins for everyone" downgrade and forcing a
+        lone declared budget onto agents that never asked for one (greptile P1).
+        """
+        cli_timeout = (self.cli_config or {}).get("tool_timeout")
+        if isinstance(cli_timeout, (int, float)) and not isinstance(cli_timeout, bool):
+            return float(cli_timeout)
+
+        entities = {**(config.get("roles") or {}), **(config.get("agents") or {})}
+        if not entities:
+            return None
+
+        values = set()
+        for entity in entities.values():
+            t = self._declared_agent_timeout(entity)
+            if t is None:
+                # An agent without a declared budget must not inherit another
+                # agent's timeout via the shared-dict wrap. Defer entirely to the
+                # per-agent resolver.
+                return None
+            values.add(t)
+        if len(values) == 1:
+            return next(iter(values))
+        return None
+
+    def resolve_agent_tool_timeout(self, agent_key, config):
+        """Per-agent effective timeout: agent value > CLI value > ``None``.
+
+        Never downgrades across agents — each agent gets its own declared budget
+        (or the CLI default, or nothing).
+        """
+        entities = {**(config.get("roles") or {}), **(config.get("agents") or {})}
+        val = self._declared_agent_timeout(entities.get(agent_key) or {})
+        if val is not None:
+            return val
+        cli_timeout = (self.cli_config or {}).get("tool_timeout")
+        if isinstance(cli_timeout, (int, float)) and not isinstance(cli_timeout, bool):
+            return float(cli_timeout)
+        return None
+
+    def make_agent_tool_wrap_resolver(self, config):
+        """Return ``resolver(agent_key) -> wrap|None`` for heterogeneous budgets.
+
+        Returns ``None`` when no agent declares a per-agent ``tool_timeout`` (so
+        adapters skip per-agent wrapping entirely). The returned ``wrap`` closes
+        over that agent's timeout; tool objects stay shared, only the guard
+        closure differs per agent.
+        """
+        entities = {**(config.get("roles") or {}), **(config.get("agents") or {})}
+        declared_any = any(
+            self._declared_agent_timeout(e) is not None for e in entities.values()
+        )
+        if not declared_any:
+            return None
+
+        def resolver(agent_key):
+            t = self.resolve_agent_tool_timeout(agent_key, config)
+            if not t or t <= 0:
+                return None
+            return lambda tool, _sec=t: self._wrap_tool_with_timeout(tool, _sec)
+
+        return resolver
 
     # Mirror the legacy CLI's --tool-timeout argparse default so the workflow
     # validation can tell an implicit default apart from a user request.
@@ -1139,9 +1561,9 @@ class AgentsGenerator:
         # Use existing tool resolver if available
         validator = ConfigValidator(tool_resolver=self.tool_resolver)
         
-        # Check for strict mode from environment or config
-        import os
-        strict_mode = os.getenv('PRAISONAI_VALIDATE_STRICT', 'false').lower() == 'true'
+        # Check for strict mode: per-run override (arg / cli_config) first, then
+        # the process-global env var as fallback. See _is_strict().
+        strict_mode = self._is_strict()
         
         # Validate configuration
         result = validator.validate_config(config, strict=strict_mode)
@@ -1181,7 +1603,10 @@ class AgentsGenerator:
             with open(self.agent_file, 'r') as f:
                 config = _yaml_safe_load(f)
 
-        config = _normalize_yaml_config(config or {})
+        # Pass the per-run strictness so YAML normalization and the downstream
+        # ConfigValidator agree within one run (multi-tenant isolation). See
+        # _is_strict(); module-level callers still fall back to the env var.
+        config = _normalize_yaml_config(config or {}, strict=self._is_strict())
 
         # Apply CLI config overrides to both paths (agent_yaml and agent_file)
         if self.cli_config:
@@ -1249,6 +1674,50 @@ class AgentsGenerator:
                 "stream-json bridge."
             )
 
+    def build_agents(self):
+        """Build the agent objects from the YAML spec *without running them*.
+
+        This is the "build only" counterpart to
+        :meth:`generate_crew_and_kickoff` and exists for callers that need the
+        constructed :class:`~praisonaiagents.Agent` instances rather than a run
+        result -- e.g. the ``praisonai eval`` evaluators, which drive an agent
+        themselves. It reuses the same :meth:`_prepare_for_run` normalisation so
+        the agents are identical to what a real run would build.
+
+        Returns:
+            list: The constructed agent instances (empty list if none defined).
+        """
+        config = self._load_config()
+        prep = self._prepare_for_run(config)
+        adapter = prep['adapter']
+        builder = getattr(adapter, "_build_agents_and_tasks", None)
+        if not callable(builder):
+            raise NotImplementedError(
+                f"Framework {adapter.name!r} does not support building agents "
+                "without running them; use generate_crew_and_kickoff()."
+            )
+        model_name = adapter._pick_model(self.config_list)
+        # Thread the per-agent tool_timeout wrap resolver (carried in prep by
+        # _prepare_for_run) exactly as the real run paths do, so agents built for
+        # evaluation carry the same heterogeneous per-agent timeout guards a
+        # normal run would apply — not a different (unguarded) tool policy.
+        run_ctx = prep.get('run_ctx') or {}
+        agents, _tasks = builder(
+            prep['config'],
+            prep['topic'],
+            prep['tools_dict'],
+            getattr(self, 'agent_callback', None),
+            getattr(self, 'task_callback', None),
+            model_name,
+            agent_tool_wrap_resolver=run_ctx.get("_agent_tool_wrap_resolver"),
+            cli_config=self._dispatch_cli_config(run_ctx),
+        )
+        # _build_agents_and_tasks returns a name->agent mapping; callers expect
+        # a flat list in definition order.
+        if isinstance(agents, dict):
+            return list(agents.values())
+        return list(agents) if agents else []
+
     def generate_crew_and_kickoff(self):
         """
         Generates a crew of agents and initiates tasks based on the provided configuration.
@@ -1271,11 +1740,20 @@ class AgentsGenerator:
         if self._is_workflow_yaml(config):
             # Bracket the workflow run in the same observability session the
             # sequential/hierarchical path uses so AgentOps init/finalize fires
-            # for workflow YAMLs too. Workflow YAMLs are native-only, so tag
-            # them 'praisonai'.
+            # for workflow YAMLs too. Tag with the config-resolved framework
+            # (registry default when omitted) rather than a hardcoded name.
             self._validate_workflow_cli_capabilities()
-            with observability_session("praisonai"):
-                return self._run_yaml_workflow(config)
+            workflow_label = self._adapter_registry.resolve_or_default(
+                self.framework or config.get('framework')
+            ).lower()
+            # Isolate this sync workflow run's sync->async work onto its own
+            # loop+thread, matching the sequential/hierarchical and async
+            # workflow paths, so a stuck coroutine in one agent/tenant does not
+            # park the shared default bridge for the rest.
+            from ._async_bridge import scoped_bridge
+            with observability_session(workflow_label):
+                with scoped_bridge():
+                    return self._run_yaml_workflow(config)
 
         # Use shared preparation logic
         prep = self._prepare_for_run(config)
@@ -1284,19 +1762,26 @@ class AgentsGenerator:
         self.logger.info(f"Using framework: {prep['adapter'].name}")
         # Own the observability lifecycle here so init and finalize are always
         # paired for every adapter (the CM finalizes on success and error alike).
+        from ._async_bridge import scoped_bridge
         with observability_session(prep['adapter'].name):
             # Run setup INSIDE the session so setup events and any setup/import
             # failure are recorded and finalized, not dropped outside observability.
             self._run_adapter_setup(prep['adapter'])
-            return prep['adapter'].run(
-                prep['config'],
-                self.config_list,
-                prep['topic'],
-                tools_dict=prep['tools_dict'],
-                agent_callback=getattr(self, 'agent_callback', None),
-                task_callback=getattr(self, 'task_callback', None),
-                cli_config=getattr(self, 'cli_config', None),
-            )
+            # Isolate this sync run's sync→async work (adapter internals call
+            # run_sync) onto its own loop+thread so a stuck coroutine in one
+            # agent/tenant does not park the shared default loop for the rest.
+            # Async callers use agenerate_crew_and_kickoff (awaits arun directly)
+            # and are intentionally not wrapped here.
+            with scoped_bridge():
+                return prep['adapter'].run(
+                    prep['config'],
+                    self.config_list,
+                    prep['topic'],
+                    tools_dict=prep['tools_dict'],
+                    agent_callback=getattr(self, 'agent_callback', None),
+                    task_callback=getattr(self, 'task_callback', None),
+                    cli_config=self._dispatch_cli_config(prep.get('run_ctx')),
+                )
 
     async def _aload_config(self):
         """Async-safe config loading (blocking file I/O off the event loop)."""
@@ -1317,14 +1802,26 @@ class AgentsGenerator:
         config = await self._aload_config()
         import asyncio
         from .observability.hooks import observability_session
+        from ._async_bridge import async_scoped_bridge
         if self._is_workflow_yaml(config):
             # Bracket the async workflow run in the same observability session
             # the sequential/hierarchical path uses so AgentOps init/finalize
-            # fires for workflow YAMLs too. Workflow YAMLs are native-only, so
-            # tag them 'praisonai'.
+            # fires for workflow YAMLs too. Tag with the config-resolved
+            # framework (registry default when omitted) rather than a hardcoded
+            # name.
             self._validate_workflow_cli_capabilities()
-            with observability_session("praisonai"):
-                return await self._arun_yaml_workflow(config)
+            workflow_label = self._adapter_registry.resolve_or_default(
+                self.framework or config.get('framework')
+            ).lower()
+            # Isolate sync→async fan-out (tools, delivery router, blueprint
+            # dispatch) onto this run's own loop+thread, matching the sync path
+            # so a stuck coroutine in one tenant does not park the shared default
+            # bridge for the rest. ``async_scoped_bridge`` tears the per-run
+            # bridge down off-loop so scope exit never parks the event loop for
+            # other tenants.
+            with observability_session(workflow_label):
+                async with async_scoped_bridge():
+                    return await self._arun_yaml_workflow(config)
 
         # Use shared preparation logic (off the event loop to avoid blocking imports)
         prep = await self._aprepare_for_run(config)
@@ -1333,20 +1830,27 @@ class AgentsGenerator:
         self.logger.info(f"Using framework: {prep['adapter'].name}")
         # Own the observability lifecycle here so init and finalize are always
         # paired for every adapter (the CM finalizes on success and error alike).
+        # Isolate this run's sync→async work (adapter internals, tools, delivery
+        # router and blueprint dispatch call run_sync) onto its own loop+thread,
+        # matching generate_crew_and_kickoff, so a stuck coroutine in one
+        # agent/tenant does not park the shared default loop for the rest.
+        # ``async_scoped_bridge`` tears the per-run bridge down off-loop so scope
+        # exit never parks the event loop for other tenants.
         with observability_session(prep['adapter'].name):
-            # Run setup INSIDE the session (off the event loop, as it may block)
-            # so setup events and any setup/import failure are recorded and
-            # finalized, not dropped outside observability.
-            await asyncio.to_thread(self._run_adapter_setup, prep['adapter'])
-            return await prep['adapter'].arun(
-                prep['config'],
-                self.config_list,
-                prep['topic'],
-                tools_dict=prep['tools_dict'],
-                agent_callback=getattr(self, 'agent_callback', None),
-                task_callback=getattr(self, 'task_callback', None),
-                cli_config=getattr(self, 'cli_config', None),
-            )
+            async with async_scoped_bridge():
+                # Run setup INSIDE the session (off the event loop, as it may
+                # block) so setup events and any setup/import failure are
+                # recorded and finalized, not dropped outside observability.
+                await asyncio.to_thread(self._run_adapter_setup, prep['adapter'])
+                return await prep['adapter'].arun(
+                    prep['config'],
+                    self.config_list,
+                    prep['topic'],
+                    tools_dict=prep['tools_dict'],
+                    agent_callback=getattr(self, 'agent_callback', None),
+                    task_callback=getattr(self, 'task_callback', None),
+                    cli_config=self._dispatch_cli_config(prep.get('run_ctx')),
+                )
 
 
     def _build_yaml_workflow(self, config):
@@ -1381,23 +1885,35 @@ class AgentsGenerator:
         )
         # Validate the YAML-declared framework first so a non-native workflow
         # YAML (e.g. framework: crewai) can't slip through just because the
-        # generator instance still holds the default 'praisonai'.
-        workflow_framework = framework_from_config(config)
+        # generator instance still holds the default 'praisonai'. Resolve
+        # through the injected registry (not the process default) so the
+        # build-time framework agrees with the observability label and a
+        # tenant-scoped adapter is honoured. Fall back to the process default
+        # when the instance was built without an injected registry.
+        registry = getattr(self, "_adapter_registry", None) or _get_default_adapter_registry()
+        workflow_framework = framework_from_config(
+            config, registry=registry
+        )
         validate_workflow_framework(
             workflow_framework,
             source="agents.yaml workflow section",
+            registry=registry,
         )
         if self.framework:
             validate_workflow_framework(
                 self.framework,
                 source="AgentsGenerator framework",
+                registry=registry,
             )
 
         # Parity with the sequential/hierarchical path: reject an incompatible
         # cli_backend in a workflow YAML at build time instead of accepting it
         # silently. Workflow YAMLs are native-only, so validate against
         # 'praisonai'.
-        self._validate_cli_backend_compatibility(config, workflow_framework or 'praisonai')
+        self._validate_cli_backend_compatibility(
+            config,
+            registry.resolve_or_default(workflow_framework),
+        )
 
         # The framework-level check above passes for 'praisonai' because the
         # sequential/hierarchical adapter does support cli_backend — but
@@ -1518,7 +2034,14 @@ class AgentsGenerator:
         workflow, input_data = self._build_yaml_workflow(config)
 
         self.logger.debug(f"Running workflow: {workflow.name}")
-        result = workflow.start(input_data)
+        # Isolate this sync run's sync→async work onto its own loop+thread,
+        # mirroring generate_crew_and_kickoff. workflow.start(...) drives async
+        # internals through run_sync on the process-wide shared bridge; without
+        # scoped_bridge() a stuck workflow-tool coroutine would park the shared
+        # default loop for every other tenant's run_sync submission.
+        from ._async_bridge import scoped_bridge
+        with scoped_bridge():
+            result = workflow.start(input_data)
 
         return self._finalise_workflow_result(result)
 

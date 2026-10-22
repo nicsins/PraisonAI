@@ -2,7 +2,7 @@
 Unit tests for AutoGenerator and WorkflowAutoGenerator classes.
 
 Tests cover:
-- Default model value (gpt-4o-mini)
+- Default model value (capability-ranked OpenAI default when only OPENAI_API_KEY is set)
 - Tools preservation (not replaced with [''])
 - LiteLLM fallback to OpenAI
 - Lazy loading of client
@@ -26,16 +26,33 @@ except ImportError as e:
 
 from pydantic import BaseModel
 
+# Capture the module AutoGenerator actually lives in: other suites purge
+# ``praisonai.*`` from sys.modules, after which string-based
+# ``patch('praisonai.auto.X')`` targets a fresh copy and misses these globals.
+_auto_mod = sys.modules[AutoGenerator.__module__]
+
+
 class DummyModel(BaseModel):
     pass
+
+# Sentinel returned by a mocked capability ranking, so tests assert the
+# zero-config default comes from ModelCatalogue.best_available().
+_RANKED_OPENAI = "gpt-ranked-test"
+
+
+def _patch_best_available():
+    return patch(
+        "praisonai_code.llm.catalogue.ModelCatalogue.best_available",
+        lambda self, provider: _RANKED_OPENAI if provider == "openai" else None,
+    )
 
 class TestAutoGeneratorDefaultModel:
     """Test suite for default model configuration."""
     
     def test_default_model_is_gpt4o_mini(self):
-        """Test that default model is gpt-4o-mini, not gpt-5-nano."""
+        """Zero-config OpenAI default is capability-ranked (not gpt-4o-mini)."""
         # Clear environment variables to test defaults
-        with patch.dict(os.environ, {}, clear=True):
+        with patch.dict(os.environ, {}, clear=True), _patch_best_available():
             # Set required API key
             os.environ['OPENAI_API_KEY'] = 'test-key'
             
@@ -44,8 +61,7 @@ class TestAutoGeneratorDefaultModel:
                 framework="praisonai"
             )
             
-            # Check that default model is gpt-4o-mini
-            assert generator.config_list[0]['model'] == 'gpt-4o-mini'
+            assert generator.config_list[0]['model'] == _RANKED_OPENAI
     
     def test_model_from_environment_variable(self):
         """Test that MODEL_NAME environment variable is respected."""
@@ -66,6 +82,45 @@ class TestAutoGeneratorDefaultModel:
             )
             
             assert generator.config_list[0]['model'] == 'gpt-4'
+
+
+class TestAutoGeneratorTaskScopedAllowList:
+    """The prompt allow-list is enforced on the model's output (#5904)."""
+
+    def _generator(self):
+        with patch.dict(os.environ, {'OPENAI_API_KEY': 'test-key'}):
+            return AutoGenerator(topic="Summarise a local file", framework="praisonai")
+
+    def test_out_of_scope_tool_is_dropped(self):
+        generator = self._generator()
+        generator._allowed_tools = ["read_file"]
+        with patch.object(generator, "_dangerous_tool_names", return_value=set()):
+            out = generator._enforce_tool_allowlist(
+                {"tools": ["read_file", "scrape_page"]}
+            )
+        assert out["tools"] == ["read_file"]
+
+    def test_no_prompt_allow_list_keeps_tools(self):
+        generator = self._generator()
+        with patch.object(generator, "_dangerous_tool_names", return_value=set()):
+            out = generator._enforce_tool_allowlist(
+                {"tools": ["read_file", "scrape_page"]}
+            )
+        assert out["tools"] == ["read_file", "scrape_page"]
+
+    def test_prompt_fallback_list_is_the_enforced_list(self):
+        # With no recommended tools the prompt falls back to read_file/write_file;
+        # the saved YAML must be filtered by that same list, not left open.
+        generator = self._generator()
+        with patch.object(generator, "_available_tools", return_value=[]), \
+             patch.object(generator, "_discover_tools_for_topic", return_value=[]):
+            prompt = generator.get_user_content()
+        assert "read_file, write_file" in prompt
+        with patch.object(generator, "_dangerous_tool_names", return_value=set()):
+            out = generator._enforce_tool_allowlist(
+                {"tools": ["read_file", "write_file", "scrape_page"]}
+            )
+        assert out["tools"] == ["read_file", "write_file"]
 
 
 class TestAutoGeneratorToolsPreservation:
@@ -203,8 +258,8 @@ class TestAutoGeneratorLiteLLMFallback:
     """Test suite for LiteLLM fallback to OpenAI."""
 
     def test_uses_litellm_when_available(self):
-        with patch('praisonai.auto.is_available', side_effect=lambda x: x == "litellm"):
-            with patch('praisonai.auto._get_litellm') as mock_litellm:
+        with patch.object(_auto_mod, 'is_available', side_effect=lambda x: x == "litellm"):
+            with patch.object(_auto_mod, '_get_litellm') as mock_litellm:
 
                 mock_response = Mock()
                 mock_response.choices = [
@@ -224,6 +279,87 @@ class TestAutoGeneratorLiteLLMFallback:
                 )
 
                 mock_litellm.return_value.completion.assert_called_once()
+
+    def test_litellm_retries_transient_errors(self):
+        class RateLimitError(Exception):
+            status_code = 429
+
+        mock_response = Mock()
+        mock_response.choices = [Mock(message=Mock(content="{}"))]
+
+        with patch.object(_auto_mod, 'is_available', side_effect=lambda x: x == "litellm"), \
+                patch.object(_auto_mod, '_get_litellm') as mock_litellm, \
+                patch.object(_auto_mod.asyncio, 'sleep') as mock_sleep:
+            mock_sleep.return_value = None
+            mock_litellm.return_value.completion.side_effect = [
+                RateLimitError("429"), mock_response,
+            ]
+            generator = AutoGenerator(topic="Test topic", framework="praisonai")
+            generator._structured_completion(response_model=DummyModel, messages=[])
+
+            assert mock_litellm.return_value.completion.call_count == 2
+            mock_sleep.assert_called_once_with(1.0)
+
+    def test_litellm_does_not_retry_terminal_errors(self):
+        class AuthenticationError(Exception):
+            status_code = 401
+
+        with patch.object(_auto_mod, 'is_available', side_effect=lambda x: x == "litellm"), \
+                patch.object(_auto_mod, '_get_litellm') as mock_litellm:
+            mock_litellm.return_value.completion.side_effect = AuthenticationError("401")
+            generator = AutoGenerator(topic="Test topic", framework="praisonai")
+            with pytest.raises(AuthenticationError):
+                generator._structured_completion(response_model=DummyModel, messages=[])
+
+            mock_litellm.return_value.completion.assert_called_once()
+
+    def test_litellm_retry_exhaustion_falls_back_to_openai(self):
+        class ServiceUnavailableError(Exception):
+            status_code = 503
+
+        with patch.object(_auto_mod, 'is_available', side_effect=lambda x: x in ("litellm", "openai")), \
+                patch.object(_auto_mod, '_get_litellm') as mock_litellm, \
+                patch.object(_auto_mod.asyncio, 'sleep') as mock_sleep, \
+                patch.object(AutoGenerator, '_get_core_client') as mock_client:
+            mock_sleep.return_value = None
+            mock_litellm.return_value.completion.side_effect = ServiceUnavailableError("503")
+            mock_client.return_value.parse_structured_output.return_value = DummyModel()
+            generator = AutoGenerator(topic="Test topic", framework="praisonai")
+            generator._structured_completion(response_model=DummyModel, messages=[])
+
+            assert mock_litellm.return_value.completion.call_count == 3
+            assert [c.args[0] for c in mock_sleep.call_args_list] == [1.0, 2.0]
+            mock_client.return_value.parse_structured_output.assert_called_once()
+
+    def test_litellm_retry_exhaustion_raises_without_openai(self):
+        class ServiceUnavailableError(Exception):
+            status_code = 503
+
+        with patch.object(_auto_mod, 'is_available', side_effect=lambda x: x == "litellm"), \
+                patch.object(_auto_mod, '_get_litellm') as mock_litellm, \
+                patch.object(_auto_mod.asyncio, 'sleep') as mock_sleep:
+            mock_sleep.return_value = None
+            mock_litellm.return_value.completion.side_effect = ServiceUnavailableError("503")
+            generator = AutoGenerator(topic="Test topic", framework="praisonai")
+            with pytest.raises(ServiceUnavailableError):
+                generator._structured_completion(response_model=DummyModel, messages=[])
+
+            assert mock_litellm.return_value.completion.call_count == 3
+
+    def test_retry_after_http_date(self):
+        from email.utils import format_datetime
+        from datetime import datetime, timedelta, timezone
+
+        when = format_datetime(datetime.now(timezone.utc) + timedelta(seconds=10), usegmt=True)
+        exc = Exception("429")
+        exc.response = Mock(headers={"retry-after": when})
+        assert 0 < _auto_mod._retry_after_seconds(exc) <= 10
+
+        exc.response = Mock(headers={"retry-after": "5"})
+        assert _auto_mod._retry_after_seconds(exc) == 5.0
+
+        exc.response = Mock(headers={"retry-after": "garbage"})
+        assert _auto_mod._retry_after_seconds(exc) is None
 
 
     def test_falls_back_to_openai_when_litellm_unavailable(self):
@@ -256,15 +392,15 @@ class TestWorkflowAutoGenerator:
     """Test suite for WorkflowAutoGenerator."""
     
     def test_default_model_is_gpt4o_mini(self):
-        """Test that default model is gpt-4o-mini."""
-        with patch.dict(os.environ, {}, clear=True):
+        """Zero-config OpenAI default is capability-ranked (not gpt-4o-mini)."""
+        with patch.dict(os.environ, {}, clear=True), _patch_best_available():
             os.environ['OPENAI_API_KEY'] = 'test-key'
             
             generator = WorkflowAutoGenerator(
                 topic="Test workflow"
             )
             
-            assert generator.config_list[0]['model'] == 'gpt-4o-mini'
+            assert generator.config_list[0]['model'] == _RANKED_OPENAI
     
     def test_lazy_loading(self):
         """Test that OpenAI client uses lazy loading."""
@@ -706,6 +842,50 @@ class TestSingleAgentOption:
                 single_agent=True
             )
             assert generator.single_agent == True
+
+    def test_auto_generator_single_agent_true_warns(self):
+        """AutoGenerator emits a DeprecationWarning when single_agent is truthy."""
+        import warnings
+        with patch.dict(os.environ, {'OPENAI_API_KEY': 'test-key'}):
+            with pytest.warns(DeprecationWarning, match="deprecated and inert"):
+                AutoGenerator(
+                    topic="Write a haiku",
+                    framework="praisonai",
+                    single_agent=True,
+                )
+
+    def test_auto_generator_single_agent_false_no_warning(self):
+        """AutoGenerator does not warn when single_agent is left False."""
+        import warnings
+        with patch.dict(os.environ, {'OPENAI_API_KEY': 'test-key'}):
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", DeprecationWarning)
+                generator = AutoGenerator(
+                    topic="Write a haiku",
+                    framework="praisonai",
+                )
+                assert generator.single_agent is False
+
+    def test_workflow_generator_single_agent_true_warns(self):
+        """WorkflowAutoGenerator emits a DeprecationWarning when single_agent is truthy."""
+        import warnings
+        with patch.dict(os.environ, {'OPENAI_API_KEY': 'test-key'}):
+            with pytest.warns(DeprecationWarning, match="deprecated and inert"):
+                WorkflowAutoGenerator(
+                    topic="Write a haiku",
+                    single_agent=True,
+                )
+
+    def test_workflow_generator_single_agent_false_no_warning(self):
+        """WorkflowAutoGenerator does not warn when single_agent is left False."""
+        import warnings
+        with patch.dict(os.environ, {'OPENAI_API_KEY': 'test-key'}):
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", DeprecationWarning)
+                generator = WorkflowAutoGenerator(
+                    topic="Write a haiku",
+                )
+                assert generator.single_agent is False
 
 
 # =============================================================================

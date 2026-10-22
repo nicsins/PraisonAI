@@ -14,6 +14,7 @@ import os
 import pathlib
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -408,6 +409,151 @@ class TrainConcurrency(unittest.TestCase):
         status, body = self.engine.request("/health")
         self.assertEqual(status, 200, "the engine died with the run it stopped")
         self.assertIsNone(self.engine.proc.poll(), "the engine process exited")
+
+
+class ChatsListing(unittest.TestCase):
+    """A stray file in chats/ must not drop the connection.
+
+    list_chats() catches (OSError, ValueError) and reports the file as a
+    corrupt row -- but valid JSON that is not an object (the app's own Export
+    emits an array) reached c.get(...) and raised AttributeError, which
+    escaped the handler and closed the connection with no status. The front
+    end then blamed the engine for being down.
+    """
+
+    def setUp(self):
+        self.engine = EngineProcess(_python("print('ok')"))
+        self.chats = pathlib.Path(self.engine.home) / "chats"
+        self.chats.mkdir(parents=True, exist_ok=True)
+
+    def tearDown(self):
+        self.engine.close()
+
+    def test_a_json_array_in_chats_is_a_corrupt_row_not_a_dropped_connection(self):
+        (self.chats / "backup.json").write_text(json.dumps([{"id": "good1"}]))
+        status, body = self.engine.request("/chats")
+        self.assertEqual(status, 200, body)
+        rows = body["chats"]
+        corrupt = [r for r in rows if r.get("corrupt")]
+        self.assertTrue(corrupt, "the array file was not surfaced as corrupt")
+        self.assertIn("backup", [r["id"] for r in corrupt])
+
+    def test_a_json_array_does_not_drop_projects_or_search(self):
+        # /projects and /search call load_chat() on every file list_chats()
+        # walks -- including the array. Hardening only list_chats() left those
+        # two routes crashing on load_chat().get(...) with the same file.
+        (self.chats / "backup.json").write_text(json.dumps([{"id": "good1"}]))
+        status, body = self.engine.request("/projects")
+        self.assertEqual(status, 200, body)
+        status, body = self.engine.request("/search?q=hello")
+        self.assertEqual(status, 200, body)
+
+
+@unittest.skipIf(os.name == "nt", "POSIX orphaning; Windows uses taskkill /T")
+class QuitStopsTheTrainer(unittest.TestCase):
+    """Quitting the engine must take the fine-tune down with it.
+
+    The trainer is spawned in its own session, so a signal aimed at the
+    engine's process group never reaches it. If the engine exits without
+    calling Trainer.stop(), the run is reparented to init (ppid 1) and keeps
+    the GPU with nothing left that can find it -- the exact failure this
+    guards against.
+    """
+
+    def setUp(self):
+        # A stub trainer that records its pid, then sleeps well past the test.
+        self.pidfile = os.path.join(
+            tempfile.mkdtemp(prefix="praison-trainer-pid-"), "pid")
+        body = (
+            "import os, time\n"
+            f"open({self.pidfile!r}, 'w').write(str(os.getpid()))\n"
+            "print('training', flush=True)\n"
+            "time.sleep(300)\n")
+        self.engine = EngineProcess(_python(body))
+
+    def tearDown(self):
+        self.engine.close()
+        shutil.rmtree(os.path.dirname(self.pidfile), ignore_errors=True)
+
+    def _trainer_pid(self):
+        if not os.path.exists(self.pidfile):
+            return None
+        text = pathlib.Path(self.pidfile).read_text().strip()
+        return int(text) if text else None
+
+    def _alive(self, pid):
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+
+    def test_quitting_the_engine_kills_the_running_trainer(self):
+        status, body = self.engine.request("/train/start", {"config": CONFIG})
+        self.assertEqual(status, 200, body)
+        self.assertTrue(_wait(
+            lambda: (self.engine.request("/train/status")[1].get("run") or {})
+            .get("state") == "running"))
+        self.assertTrue(_wait(lambda: self._trainer_pid() is not None),
+                        "the stub trainer never recorded its pid")
+        pid = self._trainer_pid()
+
+        # Quit exactly as the Tauri shell does: one SIGTERM to the engine.
+        self.engine.proc.send_signal(signal.SIGTERM)
+        self.engine.proc.wait(timeout=15)
+
+        self.assertTrue(_wait(lambda: not self._alive(pid), 10),
+                        f"the trainer (pid {pid}) outlived the engine quit")
+
+
+class DeleteChats(unittest.TestCase):
+    """DELETE /chats/<id> must answer for the delete that actually happened."""
+
+    def setUp(self):
+        self.engine = EngineProcess(_python(SHORT_RUN))
+        self.chats_dir = pathlib.Path(self.engine.home) / "chats"
+        self.chats_dir.mkdir(parents=True, exist_ok=True)
+
+    def tearDown(self):
+        self.engine.close()
+
+    def _write_chat(self, cid):
+        (self.chats_dir / f"{cid}.json").write_text(
+            json.dumps({"id": cid, "title": cid, "messages": []}))
+
+    def _listed_ids(self):
+        _, body = self.engine.request("/chats")
+        return {c["id"] for c in body.get("chats", [])}
+
+    def test_a_delete_that_succeeds_removes_the_chat(self):
+        self._write_chat("good1")
+        self.assertIn("good1", self._listed_ids())
+        status, body = self.engine.request("/chats/good1", method="DELETE")
+        self.assertEqual(status, 200, body)
+        self.assertNotIn("good1", self._listed_ids())
+
+    def test_a_delete_that_cannot_happen_is_not_reported_as_done(self):
+        # The read-only data dir and the synced folder mid-conflict from the
+        # report both surface as an OSError from unlink(). A directory standing
+        # where the chat file would be reproduces that deterministically -- even
+        # for root, unlink() refuses it -- where a chmod'd dir does not, since
+        # root ignores the permission bit. Answering 200 here is how the
+        # conversation closed on screen and was back in the sidebar on reopen.
+        blocker = self.chats_dir / "stuck.json"
+        blocker.mkdir()
+        status, body = self.engine.request("/chats/stuck", method="DELETE")
+        self.assertNotEqual(status, 200, "a delete that did not happen was reported done")
+        self.assertFalse(body.get("ok", True))
+        self.assertTrue(blocker.is_dir(), "the blocker vanished; the test proves nothing")
+
+    def test_an_empty_id_is_refused_rather_than_silently_ok(self):
+        # An id that reduces to nothing (the report's `../..` after the route
+        # is stripped) raised a ValueError that used to be swallowed as 200.
+        status, body = self.engine.request("/chats/..", method="DELETE")
+        self.assertEqual(status, 400, body)
+        self.assertFalse(body.get("ok", True))
 
 
 if __name__ == "__main__":

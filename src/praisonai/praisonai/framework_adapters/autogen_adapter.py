@@ -11,6 +11,27 @@ from .base import BaseFrameworkAdapter, warn_unsupported_fields
 
 logger = logging.getLogger(__name__)
 
+# Extended YAML fields every AutoGen-family backend consumes. The rest are
+# dropped and surfaced via warn_unsupported_fields.
+_AUTOGEN_SUPPORTED_FIELDS = frozenset({"llm", "function_calling_llm"})
+
+
+def _owning_registry(adapter):
+    """Return the registry that created ``adapter``, else the process default.
+
+    ``FrameworkAdapterRegistry.create()`` post-attaches itself as
+    ``_owning_registry`` so routers honour the injected registry (the
+    ``adapter_registry`` DI seam) instead of silently reaching into the
+    process-default registry and ignoring tenant-local/entry-point
+    registrations. Adapters constructed outside a registry fall back to the
+    default so standalone use keeps working.
+    """
+    registry = getattr(adapter, "_owning_registry", None)
+    if registry is not None:
+        return registry
+    from .registry import get_default_registry
+    return get_default_registry()
+
 
 class AutoGenAdapter(BaseFrameworkAdapter):
     """Adapter for AutoGen v0.2 framework with version resolution."""
@@ -20,6 +41,7 @@ class AutoGenAdapter(BaseFrameworkAdapter):
     requires_tools_extra = True
     # AutoGen v0.2 is sync-only; arun offloads run() to a bounded pool.
     SUPPORTS_ASYNC = False
+    SUPPORTED_YAML_FIELDS = _AUTOGEN_SUPPORTED_FIELDS
     
     def is_available(self) -> bool:
         """Check if AutoGen v0.2 is available for import."""
@@ -42,8 +64,16 @@ class AutoGenAdapter(BaseFrameworkAdapter):
         else:
             version = os.environ.get("AUTOGEN_VERSION", "auto").lower()
         
-        # Import the specific adapters
-        v4_adapter = AutoGenV4Adapter()
+        # Resolve v0.4 through the owning registry so an entry-point-registered
+        # v0.4 replacement is honoured instead of the built-in stub. Only an
+        # *unregistered* name falls back to the built-in stub — if a v0.4
+        # adapter is registered but its loader/constructor/validation raises,
+        # that error is actionable and must surface, not be masked as "absent".
+        registry = _owning_registry(self)
+        if "autogen_v4" in registry.list_names():
+            v4_adapter = registry.create("autogen_v4")
+        else:
+            v4_adapter = AutoGenV4Adapter()
         v2_adapter = self  # Current instance is v0.2
         
         if version == "v0.4" and v4_adapter.is_available():
@@ -66,6 +96,31 @@ class AutoGenAdapter(BaseFrameworkAdapter):
             f"AutoGen is not available. Version requested: {version}. "
             f"Install with 'pip install praisonai-frameworks[autogen]' for v0.2 or 'pip install praisonai-frameworks[autogen-v4]' for v0.4"
         )
+
+    @staticmethod
+    def _fire_task_callback(task_callback: Callable, payload: Dict[str, Any]) -> None:
+        """Invoke ``task_callback`` safely, honouring sync *and* async callbacks.
+
+        AutoGen v0.2's ``run()`` is sync-only, but the adapter contract lets a
+        caller hand us an ``async def`` callback (e.g. an observability sink that
+        awaits a network write). A bare ``task_callback(payload)`` would return
+        an un-awaited coroutine that never runs, so route the result through
+        :func:`dispatch_maybe_awaitable` which drains a returned coroutine (via
+        the shared bridge when inside a loop, or blocking when not). Callback
+        exceptions are caught and logged, never propagated into the chat.
+        """
+        from .._async_bridge import dispatch_maybe_awaitable, DispatchKind
+
+        try:
+            result = task_callback(payload)
+            dispatch_maybe_awaitable(
+                result, kind=DispatchKind.WRITE, op_name="autogen-task-callback"
+            )
+        except Exception as e:  # noqa: BLE001 - callbacks must never break the chat
+            logger.warning(
+                "task_callback raised for event %r: %s",
+                payload.get("event"), e,
+            )
 
     @staticmethod
     def _wrap_tool_for_execution(tool: Callable, tool_name: str) -> Callable:
@@ -134,16 +189,51 @@ class AutoGenAdapter(BaseFrameworkAdapter):
         import autogen
         
         llm_config_dict = {"config_list": llm_config}
-        
+
+        # Safe-by-default local code execution. Previously the user_proxy was
+        # hard-wired with human_input_mode="NEVER" and use_docker=False, so every
+        # framework=autogen run silently executed LLM-emitted code blocks on the
+        # host with no consent, sandbox, or opt-out. Code execution is now opt-in
+        # via config.autogen.code_execution and defaults Docker ON when enabled.
+        autogen_cfg = (config.get("config") or {}).get("autogen", {}) if isinstance(config, dict) else {}
+        if not isinstance(autogen_cfg, dict):
+            autogen_cfg = {}
+        code_exec_cfg = autogen_cfg.get("code_execution")  # None | False | True | dict
+
+        if code_exec_cfg is None or code_exec_cfg is False:
+            # Safe default: disable local code execution unless explicitly opted in.
+            resolved_code_exec = False
+        elif code_exec_cfg is True:
+            # Opt-in with no overrides: keep Docker on, sandbox the working dir.
+            resolved_code_exec = {"work_dir": "coding", "use_docker": True}
+        elif isinstance(code_exec_cfg, dict):
+            # Dict opt-in: honour user overrides but default use_docker to True.
+            resolved_code_exec = {"work_dir": "coding", "use_docker": True, **code_exec_cfg}
+        else:
+            logger.warning(
+                "framework=autogen: config.autogen.code_execution=%r is not a "
+                "recognised value (expected bool/dict); disabling code execution.",
+                code_exec_cfg,
+            )
+            resolved_code_exec = False
+
+        if isinstance(resolved_code_exec, dict) and not resolved_code_exec.get("use_docker", True):
+            logger.warning(
+                "framework=autogen: code_execution is enabled with use_docker=False; "
+                "LLM-generated code will run directly on the host. "
+                "Set config.autogen.code_execution.use_docker: true to sandbox."
+            )
+
+        # No longer force human_input_mode="NEVER"; default to TERMINATE so an
+        # operator can intervene, while remaining overridable via YAML.
+        human_input_mode = autogen_cfg.get("human_input_mode", "TERMINATE")
+
         # Set up user proxy agent
         user_proxy = autogen.UserProxyAgent(
             name="User",
-            human_input_mode="NEVER",
+            human_input_mode=human_input_mode,
             is_termination_msg=lambda x: (x.get("content") or "").rstrip().rstrip(".").lower().endswith("terminate") or "TERMINATE" in (x.get("content") or ""),
-            code_execution_config={
-                "work_dir": "coding",
-                "use_docker": False,
-            }
+            code_execution_config=resolved_code_exec,
         )
         
         from ._config_builder import build_agent_specs
@@ -155,13 +245,20 @@ class AutoGenAdapter(BaseFrameworkAdapter):
         # first callable in AutoGen's _function_map (last-write-wins).
         registered_for_execution = set()
 
-        # Single canonical YAML -> spec conversion (shared across adapters)
-        specs = build_agent_specs(config, topic, tools_dict, self._format_template)
+        # Single canonical YAML -> spec conversion (shared across adapters).
+        # Honour per-agent tool_timeout budgets via the resolver threaded from
+        # the generator through cli_config (each tool still passes through
+        # _wrap_tool_for_execution below to translate a timeout for the LLM).
+        agent_tool_wrap_resolver = (cli_config or {}).get("_agent_tool_wrap_resolver")
+        specs = build_agent_specs(
+            config, topic, tools_dict, self._format_template,
+            agent_tool_wrap_resolver=agent_tool_wrap_resolver,
+        )
 
         # Create agents from the normalized specs
         for spec in specs:
             # Surface any extended YAML fields this backend silently drops
-            warn_unsupported_fields(self.name, spec.extras)
+            warn_unsupported_fields(self, spec.extras)
 
             # Create AutoGen assistant agent
             agents[spec.key] = autogen.AssistantAgent(
@@ -229,10 +326,31 @@ class AutoGenAdapter(BaseFrameworkAdapter):
                     "message": task_spec.description,
                     "summary_method": "last_msg",
                 }
+                # Honour the adapter contract's task_callback hook. AutoGen v0.2
+                # has no first-class per-step task hook, so fire a prepared event
+                # here (mirroring the retrofitted agent_callback above) and a
+                # completed event after initiate_chats below.
+                if task_callback:
+                    self._fire_task_callback(task_callback, {
+                        "event": "task_prepared",
+                        "task_spec": task_spec,
+                        "agent": agents[spec.key],
+                    })
                 tasks.append(chat_task)
         
         # Execute tasks
         response = user_proxy.initiate_chats(tasks)
+
+        # Fan out task completion events now that AutoGen has run the chats.
+        if task_callback:
+            for chat_task, resp in zip(tasks, response or []):
+                self._fire_task_callback(task_callback, {
+                    "event": "task_completed",
+                    "task": chat_task,
+                    "response": resp,
+                    "summary": getattr(resp, "summary", None),
+                })
+
         result = "### AutoGen v0.2 Output ###\n" + (response[-1].summary if hasattr(response[-1], 'summary') else "")
         
         logger.info("AutoGen v0.2 execution completed")
@@ -246,6 +364,7 @@ class AutoGenV4Adapter(BaseFrameworkAdapter):
     install_hint = 'pip install "praisonai-frameworks[autogen-v4]"'
     requires_tools_extra = True
     implemented: bool = False  # explicit marker
+    SUPPORTED_YAML_FIELDS = _AUTOGEN_SUPPORTED_FIELDS
     
     def is_available(self) -> bool:
         """Check if AutoGen v0.4 is available for import."""
@@ -293,6 +412,7 @@ class AG2Adapter(BaseFrameworkAdapter):
     install_hint = 'pip install "praisonai-frameworks[ag2]"'
     requires_tools_extra = False
     implemented: bool = False  # explicit marker
+    SUPPORTED_YAML_FIELDS = _AUTOGEN_SUPPORTED_FIELDS
     
     def is_available(self) -> bool:
         """Check if AG2 is available for import."""
@@ -342,6 +462,7 @@ class AutoGenFamilyAdapter(BaseFrameworkAdapter):
     name = "autogen"
     install_hint = 'pip install "praisonai-frameworks[autogen]"'
     is_router = True
+    SUPPORTED_YAML_FIELDS = _AUTOGEN_SUPPORTED_FIELDS
     
     def is_available(self) -> bool:
         """Check if any AutoGen variant is runnable.
@@ -353,8 +474,7 @@ class AutoGenFamilyAdapter(BaseFrameworkAdapter):
         (no registered adapter) correctly report unavailable.
         """
         try:
-            from .registry import get_default_registry
-            registry = get_default_registry()
+            registry = _owning_registry(self)
             registered = set(registry.list_names())
         except ImportError:
             return False
@@ -384,8 +504,7 @@ class AutoGenFamilyAdapter(BaseFrameworkAdapter):
         # A variant is selectable only if its adapter is registered in the
         # registry (built-in or entry-point) and reports availability.
         try:
-            from .registry import get_default_registry
-            registry = get_default_registry()
+            registry = _owning_registry(self)
             registered = set(registry.list_names())
 
             def _selectable(alias: str) -> bool:
@@ -460,13 +579,10 @@ class AutoGenFamilyAdapter(BaseFrameworkAdapter):
         """
         # Get the adapter name to use (config autogen_version wins over env)
         adapter_name = self.resolve_alias(config)
-        
-        # Import registry to create the concrete adapter
-        from .registry import get_default_registry
-        registry = get_default_registry()
-        
-        # Create and return the concrete adapter
-        concrete_adapter = registry.create(adapter_name)
+
+        # Create the concrete adapter through the owning registry so tenant-local
+        # / entry-point registrations on the injected registry are honoured.
+        concrete_adapter = _owning_registry(self).create(adapter_name)
         logger.info(f"AutoGenFamilyAdapter resolved to: {adapter_name}")
         return concrete_adapter
     

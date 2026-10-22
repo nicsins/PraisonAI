@@ -103,6 +103,31 @@ The environment and your conversations live together in one folder:
 
 To remove the app completely, uninstall it and delete that folder.
 
+## Image generation
+
+Choose **MiniMax image-01** in the **Images** tab and set `MINIMAX_API_KEY`
+in the engine environment or its `.env` file. Set `MINIMAX_IMAGE_REGION=cn_zh`
+for the China endpoint; the default is `global_en`.
+
+The engine sends image requests to the regional MiniMax image endpoint and
+saves the result in the data folder for preview. All sizes in the image picker
+are supported. Text-to-image uses `image-01`.
+
+## Video generation
+
+The **Video** tab has a model picker. MiniMax video-01 (Replicate) is a preset,
+not the only option — SDK-capable providers (OpenAI Sora, Google Veo 3.1) are
+selectable once their key is set. Add the relevant key to the `.env` file inside
+the data folder above:
+
+| Key | Unlocks |
+|---|---|
+| `REPLICATE_API_TOKEN` | MiniMax video-01 |
+| `OPENAI_API_KEY` | Sora 2 |
+| `GEMINI_API_KEY` / `GOOGLE_API_KEY` | Veo 3.1 |
+
+Models without a configured key appear disabled in the dropdown.
+
 ## If it will not start
 
 The window shows the reason and the engine log. The two common ones:

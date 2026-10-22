@@ -22,7 +22,7 @@ Usage (selective):
     enable_audit_log()
 """
 
-from typing import TYPE_CHECKING, Optional, List
+from typing import TYPE_CHECKING, Dict, Optional, List
 
 if TYPE_CHECKING:
     from .injection import InjectionDefense, ScanResult, ThreatLevel
@@ -86,12 +86,19 @@ def enable_injection_defense(
     extra_patterns: Optional[List[str]] = None,
     block_threshold: Optional[int] = None,
     trusted_sources: Optional[List[str]] = None,
-) -> str:
+) -> Dict[str, str]:
     """
     Enable prompt injection defense globally for all agents.
 
     Registers hooks on BEFORE_TOOL and BEFORE_AGENT events that scan
     inputs through a 6-check pipeline and block critical threats.
+
+    .. warning::
+        This registers on the **process-global** ``praisonaiagents.hooks``
+        registry, so the policy applies to *every* Agent in the process. In a
+        multi-tenant host (e.g. ``praisonai serve``) do not rely on this for
+        per-tenant isolation. To scope or tear down later, keep the returned
+        hook IDs and remove them via ``praisonaiagents.hooks.remove_hook``.
 
     Args:
         extra_patterns: Additional regex patterns to detect (appended to defaults).
@@ -136,6 +143,12 @@ def enable_audit_log(
     """
     Enable an append-only JSONL audit log for all agent tool calls.
 
+    .. warning::
+        Registers on the **process-global** ``praisonaiagents.hooks`` registry;
+        the audit sink applies to every Agent in the process. Keep the returned
+        hook ID and remove it via ``praisonaiagents.hooks.remove_hook`` to scope
+        or disable it later.
+
     Args:
         log_path: Path to the audit log file.
                   Defaults to ~/.praisonai/audit.jsonl.
@@ -165,6 +178,14 @@ def enable_security(
     Enable all security features in one call.
 
     Activates both injection defense and audit logging globally.
+
+    .. warning::
+        These hooks register on the **process-global** ``praisonaiagents.hooks``
+        registry and apply to every Agent in the process. This one-liner is not
+        tenant-scoped: in a multi-tenant host (e.g. ``praisonai serve``) one
+        tenant's ``extra_patterns`` would apply to all tenants. Keep the returned
+        hook IDs and remove them via ``praisonaiagents.hooks.remove_hook`` to
+        disable per feature.
 
     Args:
         log_path: Audit log path (default: ~/.praisonai/audit.jsonl).

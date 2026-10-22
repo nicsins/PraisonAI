@@ -124,6 +124,126 @@ def test_build_tools_dict_no_wrap_when_no_timeout():
     assert tools_dict["plain"] is sentinel
 
 
+def test_build_tools_dict_clears_stale_wrap_state_on_reuse():
+    # Reusing the same generator with a different timeout layout must not leak a
+    # previous run's closure: the uniform and per-agent keys are mutually
+    # exclusive, so the inactive one is always reset to None. Otherwise an
+    # adapter could apply an earlier run's budget to the current tools.
+    gen = _make_generator()
+
+    def sentinel():
+        return "ok"
+
+    class _FakeResolver:
+        def resolve_all_from_yaml(self, config):
+            return {"plain": sentinel}
+
+    gen.tool_resolver = _FakeResolver()
+    gen.tools = []
+
+    try:
+        # Run 1: uniform CLI timeout -> uniform wrap set, resolver cleared.
+        gen.cli_config = {"tool_timeout": 5}
+        gen._build_tools_dict({"roles": {"a": {}}})
+        assert callable(gen._run_ctx.get("_tool_timeout_wrap"))
+        assert gen._run_ctx.get("_agent_tool_wrap_resolver") is None
+        # Private closures must NOT leak onto the user-facing cli_config dict.
+        assert "_tool_timeout_wrap" not in gen.cli_config
+
+        # Run 2: heterogeneous per-agent timeouts -> resolver set, stale uniform
+        # wrap MUST be cleared so adapters don't reuse run 1's budget.
+        gen.cli_config = {}
+        gen._build_tools_dict(
+            {"roles": {"a": {"tool_timeout": 10}, "b": {"tool_timeout": 30}}}
+        )
+        assert gen._run_ctx.get("_tool_timeout_wrap") is None
+        assert callable(gen._run_ctx.get("_agent_tool_wrap_resolver"))
+
+        # Run 3: no timeout at all -> both keys cleared.
+        gen.cli_config = {}
+        gen._build_tools_dict({"roles": {"a": {}}})
+        assert gen._run_ctx.get("_tool_timeout_wrap") is None
+        assert gen._run_ctx.get("_agent_tool_wrap_resolver") is None
+    finally:
+        gen.close()
+
+
+def test_dispatch_cli_config_merges_run_ctx_without_mutating_user_config():
+    # The dispatch contract adapters rely on: the merged cli_config they receive
+    # carries the user overrides PLUS the private per-run closures, while the
+    # caller-owned ``self.cli_config`` stays "user overrides only". If dispatch
+    # stopped merging, adapters would silently lose timeout enforcement; if it
+    # mutated ``self.cli_config`` the closures would leak across runs/tenants.
+    gen = _make_generator()
+
+    def sentinel():
+        return "ok"
+
+    class _FakeResolver:
+        def resolve_all_from_yaml(self, config):
+            return {"plain": sentinel}
+
+    gen.tool_resolver = _FakeResolver()
+    gen.tools = []
+
+    try:
+        user_cfg = {"tool_timeout": 5, "framework": "praisonai"}
+        gen.cli_config = user_cfg
+        gen._build_tools_dict({"roles": {"a": {}}})
+
+        dispatched = gen._dispatch_cli_config()
+        # Adapter-facing config carries user overrides untouched...
+        assert dispatched["tool_timeout"] == 5
+        assert dispatched["framework"] == "praisonai"
+        # ...plus the private per-run closures merged in.
+        assert callable(dispatched["_tool_timeout_wrap"])
+        assert "_agent_tool_wrap_resolver" in dispatched
+
+        # The caller-owned dict must NOT be mutated or stamped with closures,
+        # and dispatch must return a fresh object (never the same instance).
+        assert dispatched is not user_cfg
+        assert "_tool_timeout_wrap" not in user_cfg
+        assert "_agent_tool_wrap_resolver" not in user_cfg
+        assert user_cfg == {"tool_timeout": 5, "framework": "praisonai"}
+    finally:
+        gen.close()
+
+
+def test_build_tools_and_run_ctx_returns_per_run_context_without_touching_self():
+    # Concurrent runs on one generator must not race on ``self._run_ctx``: the
+    # run paths take the per-run closures from the returned context and pass
+    # it to dispatch explicitly, so another run cannot overwrite them (#5904).
+    gen = _make_generator()
+
+    class _FakeResolver:
+        def resolve_all_from_yaml(self, config):
+            return {"plain": lambda: "ok"}
+
+    gen.tool_resolver = _FakeResolver()
+    gen.tools = []
+    gen._run_ctx = {"_tool_timeout_wrap": "stale"}
+
+    try:
+        gen.cli_config = {"tool_timeout": 5}
+        _tools, run_ctx = gen._build_tools_and_run_ctx({"roles": {"a": {}}})
+        assert callable(run_ctx["_tool_timeout_wrap"])
+        assert gen._run_ctx == {"_tool_timeout_wrap": "stale"}
+
+        dispatched = gen._dispatch_cli_config(run_ctx)
+        assert dispatched["_tool_timeout_wrap"] is run_ctx["_tool_timeout_wrap"]
+    finally:
+        gen.close()
+
+
+def test_dispatch_cli_config_returns_base_when_no_run_ctx():
+    # Before any _build_tools_dict call there is no per-run context; dispatch
+    # must return the user config unchanged rather than fabricating closure keys.
+    gen = _make_generator()
+    gen.cli_config = {"framework": "praisonai"}
+    gen._run_ctx = {}
+    assert gen._dispatch_cli_config() == {"framework": "praisonai"}
+
+
 def test_timeout_proxy_preserves_isinstance_and_schema():
     # A shared framework-tool object wrapped for timeout must keep its type
     # identity: downstream executors (praisonaiagents tool_execution, CrewAI /
@@ -280,3 +400,728 @@ def test_autogen_adapter_passes_through_normal_result():
 
     guarded = AutoGenAdapter._wrap_tool_for_execution(_ok, "_ok")
     assert guarded(41) == 42
+
+
+# --- Issue #4449: wrapper gaps -------------------------------------------------
+
+
+def test_uniform_timeout_all_equal_declared():
+    # When every declared per-agent tool_timeout is identical a single uniform
+    # wrap is applied (cheapest path, same behaviour as before).
+    gen = _make_generator()
+    config = {"roles": {"a": {"tool_timeout": 10}, "b": {"tool_timeout": 10}}}
+    assert gen._resolve_uniform_tool_timeout(config) == 10.0
+
+
+def test_uniform_timeout_none_for_heterogeneous():
+    # Heterogeneous per-agent budgets must NOT collapse to a single value; the
+    # uniform resolver returns None so the caller falls back to per-agent wraps.
+    gen = _make_generator()
+    config = {"roles": {"a": {"tool_timeout": 5}, "b": {"tool_timeout": 120}}}
+    assert gen._resolve_uniform_tool_timeout(config) is None
+
+
+def test_uniform_timeout_cli_wins():
+    gen = _make_generator()
+    gen.cli_config = {"tool_timeout": 15}
+    config = {"roles": {"a": {"tool_timeout": 5}, "b": {"tool_timeout": 120}}}
+    assert gen._resolve_uniform_tool_timeout(config) == 15.0
+
+
+def test_uniform_timeout_none_when_one_agent_declares_and_another_omits():
+    # Greptile P1: a lone declared budget must NOT be treated as uniform, or the
+    # undeclared agent inherits it via the shared-dict wrap and its valid
+    # long-running calls fail with ToolTimeoutError. The per-agent resolver must
+    # own this case instead.
+    gen = _make_generator()
+    gen.cli_config = {}
+    config = {"roles": {"declared": {"tool_timeout": 5}, "undeclared": {}}}
+    assert gen._resolve_uniform_tool_timeout(config) is None
+
+
+def test_per_agent_resolver_leaves_undeclared_agent_unwrapped():
+    # The declaring agent gets its budget; the agent that omitted tool_timeout
+    # gets no wrap at all (None), so its tools run without an imposed timeout.
+    gen = _make_generator()
+    gen.cli_config = {}
+    config = {"roles": {"declared": {"tool_timeout": 5}, "undeclared": {}}}
+    resolver = gen.make_agent_tool_wrap_resolver(config)
+    assert callable(resolver("declared"))
+    assert resolver("undeclared") is None
+
+
+def test_resolve_agent_tool_timeout_per_agent():
+    # Each agent gets its own declared budget, no cross-agent downgrade.
+    gen = _make_generator()
+    config = {"roles": {"fast": {"tool_timeout": 5}, "slow": {"tool_timeout": 120}}}
+    assert gen.resolve_agent_tool_timeout("fast", config) == 5.0
+    assert gen.resolve_agent_tool_timeout("slow", config) == 120.0
+
+
+def test_resolve_agent_tool_timeout_falls_back_to_cli():
+    gen = _make_generator()
+    gen.cli_config = {"tool_timeout": 42}
+    config = {"roles": {"fast": {"tool_timeout": 5}, "plain": {}}}
+    assert gen.resolve_agent_tool_timeout("fast", config) == 5.0
+    assert gen.resolve_agent_tool_timeout("plain", config) == 42.0
+
+
+def test_make_agent_tool_wrap_resolver_none_without_declarations():
+    gen = _make_generator()
+    assert gen.make_agent_tool_wrap_resolver({"roles": {"a": {}}}) is None
+
+
+def test_heterogeneous_per_agent_timeouts_honoured_end_to_end():
+    # A heterogeneous config leaves the shared tools_dict unwrapped and instead
+    # exposes a per-agent resolver so each agent's tools carry its own budget.
+    gen = _make_generator()
+    gen.cli_config = {}
+
+    never = threading.Event()
+
+    def _blocking():
+        never.wait(30)
+        return "done"
+
+    def _fast():
+        return "quick"
+
+    class _FakeResolver:
+        def resolve_all_from_yaml(self, config):
+            return {"scrape_page": _blocking, "internet_search": _fast}
+
+    gen.tool_resolver = _FakeResolver()
+    gen.tools = []
+
+    config = {
+        "roles": {
+            "fast_router": {"tool_timeout": 0.3, "tools": ["internet_search"]},
+            "slow_analyst": {"tool_timeout": 30, "tools": ["scrape_page"]},
+        }
+    }
+
+    try:
+        from praisonai.agents_generator import ToolTimeoutError
+
+        tools_dict = gen._build_tools_dict(config)
+        # Shared dict is NOT uniformly wrapped (heterogeneous budgets).
+        assert tools_dict["scrape_page"] is _blocking
+        # A per-agent resolver was exposed for adapters to apply.
+        resolver = gen._run_ctx.get("_agent_tool_wrap_resolver")
+        assert callable(resolver)
+
+        # The fast agent's tools get a tight 0.3s guard.
+        fast_wrap = resolver("fast_router")
+        assert callable(fast_wrap)
+        # The slow agent keeps its own larger budget (not downgraded to 0.3).
+        assert gen.resolve_agent_tool_timeout("slow_analyst", config) == 30.0
+
+        guarded_blocking = fast_wrap(_blocking)
+        with pytest.raises(ToolTimeoutError) as exc_info:
+            guarded_blocking()
+        assert exc_info.value.timeout_seconds == 0.3
+    finally:
+        never.set()
+        gen.close()
+
+
+def test_build_agent_specs_applies_per_agent_wrap():
+    # build_agent_specs wraps each agent's resolved tools with that agent's
+    # resolver-provided wrap; tool objects stay shared (only the guard differs).
+    from praisonai.framework_adapters._config_builder import build_agent_specs
+
+    def tool_a():
+        return "a"
+
+    tools_dict = {"tool_a": tool_a}
+
+    def _fmt(v, topic=""):
+        return v
+
+    seen = {}
+
+    def resolver(agent_key):
+        seen[agent_key] = True
+
+        def wrap(tool, _key=agent_key):
+            def _wrapped(*args, **kwargs):
+                return (_key, tool(*args, **kwargs))
+            return _wrapped
+
+        return wrap
+
+    config = {
+        "roles": {
+            "alpha": {"role": "A", "tools": ["tool_a"]},
+            "beta": {"role": "B", "tools": ["tool_a"]},
+        }
+    }
+
+    specs = build_agent_specs(
+        config, "topic", tools_dict, _fmt, agent_tool_wrap_resolver=resolver
+    )
+    by_key = {s.key: s for s in specs}
+    assert by_key["alpha"].tools[0]() == ("alpha", "a")
+    assert by_key["beta"].tools[0]() == ("beta", "a")
+    assert seen == {"alpha": True, "beta": True}
+
+
+def test_build_agent_specs_no_wrap_when_resolver_absent():
+    from praisonai.framework_adapters._config_builder import build_agent_specs
+
+    def tool_a():
+        return "a"
+
+    def _fmt(v, topic=""):
+        return v
+
+    config = {"roles": {"alpha": {"role": "A", "tools": ["tool_a"]}}}
+    specs = build_agent_specs(config, "topic", {"tool_a": tool_a}, _fmt)
+    assert specs[0].tools[0] is tool_a
+
+
+def test_maybe_inject_centric_tools_applies_wrap():
+    # Injected ACP/LSP centric tools must carry the same timeout wrap as the
+    # YAML-declared tools instead of silently bypassing it.
+    try:
+        from praisonai.framework_adapters.praisonai_adapter import PraisonAIAdapter
+    except ImportError:
+        pytest.skip("PraisonAIAdapter not available")
+
+    adapter = PraisonAIAdapter.__new__(PraisonAIAdapter)
+
+    class _FakeRuntime:
+        pass
+
+    def _lsp_tool():
+        return "def"
+
+    # Patch the lazily-imported factory used inside the method.
+    import sys
+    import types
+
+    fake_mod = types.ModuleType("praisonai.cli.features.agent_tools")
+    fake_mod.create_agent_centric_tools = lambda rt: {"lsp_find_definition": _lsp_tool}
+    sys.modules["praisonai.cli.features.agent_tools"] = fake_mod
+    try:
+        marker = []
+
+        def wrap(tool):
+            marker.append(tool)
+            return lambda *a, **k: ("wrapped", tool())
+
+        merged = adapter._maybe_inject_centric_tools(
+            _FakeRuntime(), {"existing": lambda: "x"}, wrap=wrap
+        )
+        assert marker == [_lsp_tool]
+        assert merged["lsp_find_definition"]() == ("wrapped", "def")
+    finally:
+        del sys.modules["praisonai.cli.features.agent_tools"]
+
+
+def test_autogen_code_execution_disabled_by_default():
+    # Safe-by-default: without config.autogen.code_execution the resolved config
+    # must disable local code execution (no host RCE surface).
+    _assert_autogen_code_exec({}, expected=False, expected_human="TERMINATE")
+
+
+def test_autogen_code_execution_opt_in_defaults_docker():
+    _assert_autogen_code_exec(
+        {"config": {"autogen": {"code_execution": True}}},
+        expected={"work_dir": "coding", "use_docker": True},
+        expected_human="TERMINATE",
+    )
+
+
+def test_autogen_code_execution_dict_defaults_docker_true():
+    _assert_autogen_code_exec(
+        {"config": {"autogen": {"code_execution": {"work_dir": "x"}}}},
+        expected={"work_dir": "x", "use_docker": True},
+        expected_human="TERMINATE",
+    )
+
+
+def test_autogen_human_input_mode_overridable():
+    _assert_autogen_code_exec(
+        {"config": {"autogen": {"human_input_mode": "ALWAYS"}}},
+        expected=False,
+        expected_human="ALWAYS",
+    )
+
+
+def _assert_autogen_code_exec(config, *, expected, expected_human):
+    """Drive AutoGenAdapter.run just far enough to capture UserProxyAgent kwargs."""
+    try:
+        from praisonai.framework_adapters.autogen_adapter import AutoGenAdapter
+    except ImportError:
+        pytest.skip("AutoGen adapter not available")
+
+    import sys
+    import types
+    from unittest import mock
+
+    captured = {}
+
+    class _FakeUserProxy:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    fake_autogen = types.ModuleType("autogen")
+    fake_autogen.UserProxyAgent = _FakeUserProxy
+    fake_autogen.AssistantAgent = lambda **k: None
+
+    adapter = AutoGenAdapter()
+
+    # Stop execution right after user_proxy construction by making the shared
+    # spec builder raise; we only care about the captured UserProxyAgent kwargs.
+    with mock.patch.dict(sys.modules, {"autogen": fake_autogen}):
+        with mock.patch(
+            "praisonai.framework_adapters._config_builder.build_agent_specs",
+            side_effect=RuntimeError("stop after user_proxy"),
+        ):
+            with pytest.raises(RuntimeError, match="stop after user_proxy"):
+                adapter.run(config, [{"model": "gpt-4o-mini"}], "topic")
+
+    assert captured["code_execution_config"] == expected
+    assert captured["human_input_mode"] == expected_human
+
+
+def test_sync_wrapper_retries_on_pool_recycle():
+    """A concurrent recycle that shuts the captured pool down between capture
+    and submit must be retried once against a fresh pool, not surfaced as an
+    error (greptile #3/#4)."""
+    from concurrent.futures import ThreadPoolExecutor
+    from praisonai.agents_generator import _wrap_with_timeout
+
+    def tool(x):
+        return x + 1
+
+    dead = ThreadPoolExecutor(max_workers=1)
+    dead.shutdown()  # submit() will raise RuntimeError
+    live = ThreadPoolExecutor(max_workers=1)
+    pools = iter([dead, live])
+    try:
+        wrapped = _wrap_with_timeout(
+            tool, 5.0, lambda: next(pools), owner_key=uuid.uuid4()
+        )
+        # First attempt hits the shut-down pool (RuntimeError), retry succeeds.
+        assert wrapped(41) == 42
+    finally:
+        live.shutdown()
+
+
+def test_sync_wrapper_surfaces_timeout_when_factory_closed_on_retry():
+    """If the generator is closed (factory raises RuntimeError) before the
+    retry obtains a pool, the failure must become ToolTimeoutError, not leak
+    the closed-generator RuntimeError (greptile #4)."""
+    from concurrent.futures import ThreadPoolExecutor
+    from praisonai.agents_generator import _wrap_with_timeout, ToolTimeoutError
+
+    dead = ThreadPoolExecutor(max_workers=1)
+    dead.shutdown()
+
+    calls = {"n": 0}
+
+    def factory():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return dead  # first submit() raises RuntimeError -> retry
+        raise RuntimeError("timeout executor is closed")  # close() landed
+
+    wrapped = _wrap_with_timeout(
+        lambda x: x, 5.0, factory, owner_key=uuid.uuid4()
+    )
+    with pytest.raises(ToolTimeoutError):
+        wrapped(1)
+
+
+def test_sync_wrapper_retries_on_concurrent_cancel():
+    """A queued future cancelled by shutdown(cancel_futures=True) must be
+    retried on a fresh pool rather than reported as a timeout (greptile #3)."""
+    from concurrent.futures import ThreadPoolExecutor, CancelledError
+    from praisonai.agents_generator import _wrap_with_timeout
+
+    class _CancelOnceFuture:
+        def result(self, timeout=None):
+            raise CancelledError()
+
+    class _CancelOncePool:
+        def submit(self, fn, *a, **k):
+            return _CancelOnceFuture()
+
+    live = ThreadPoolExecutor(max_workers=1)
+    pools = iter([_CancelOncePool(), live])
+    try:
+        wrapped = _wrap_with_timeout(
+            lambda x: x * 2, 5.0, lambda: next(pools), owner_key=uuid.uuid4()
+        )
+        assert wrapped(21) == 42
+    finally:
+        live.shutdown()
+
+
+# --- Issue #5650: native tools delegate per-tool timeout to core --------------
+
+
+def test_native_delegation_returns_plain_callable_unwrapped():
+    # On the native framework a plain callable is enforced by core's own tool
+    # executor, so the wrapper must NOT bind it to a second pool — it returns
+    # the callable unchanged (identity) rather than a timeout wrapper.
+    from praisonai.agents_generator import _wrap_with_timeout
+
+    def tool(x):
+        return x + 1
+
+    def _factory():  # must never be consulted on the native path
+        raise AssertionError("native plain callable must not build an executor")
+
+    wrapped = _wrap_with_timeout(
+        tool, 5.0, _factory, owner_key=uuid.uuid4(), native_delegates_to_core=True
+    )
+    assert wrapped is tool
+
+
+def test_native_delegation_still_wraps_framework_tool_objects():
+    # Framework tool objects (CrewAI/LangChain BaseTool) never reach core's
+    # executor, so even on the native path they must still be wrapped so their
+    # args_schema survives and the per-call timeout is enforced by the wrapper.
+    from concurrent.futures import ThreadPoolExecutor
+
+    from praisonai.agents_generator import _wrap_with_timeout, _TimeoutBoundTool
+
+    class FrameworkTool:
+        name = "calc"
+        description = "doubles x"
+        args_schema = {"x": "int"}
+
+        def _run(self, x=1):
+            return x * 2
+
+        def run(self, x=1):
+            return self._run(x)
+
+    inner = FrameworkTool()
+    executor = ThreadPoolExecutor(max_workers=2)
+    try:
+        proxy = _wrap_with_timeout(
+            inner, 5.0, lambda: executor, owner_key=uuid.uuid4(),
+            native_delegates_to_core=True,
+        )
+        # Framework objects are still wrapped (schema-preserving proxy), never
+        # passed through as the bare inner object.
+        assert proxy is not inner
+        assert isinstance(proxy, _TimeoutBoundTool)
+        assert isinstance(proxy, FrameworkTool)
+        assert proxy.args_schema == {"x": "int"}
+        assert proxy.run(x=3) == 6
+    finally:
+        executor.shutdown()
+
+
+def test_native_delegation_off_by_default_wraps_everything():
+    # Backward compatibility: without the flag a plain callable is wrapped as
+    # before (crewai/autogen frameworks that never flow through core).
+    from concurrent.futures import ThreadPoolExecutor
+    from praisonai.agents_generator import _wrap_with_timeout
+
+    def tool(x):
+        return x + 1
+
+    executor = ThreadPoolExecutor(max_workers=1)
+    try:
+        wrapped = _wrap_with_timeout(
+            tool, 5.0, lambda: executor, owner_key=uuid.uuid4()
+        )
+        # A wrapper was installed (not identity), preserving existing behaviour.
+        assert wrapped is not tool
+        assert wrapped(41) == 42
+    finally:
+        executor.shutdown()
+
+
+def test_build_tools_dict_native_leaves_plain_callables_unwrapped():
+    # End-to-end on the native framework: the uniform CLI timeout no longer
+    # wraps plain callables (core enforces), and the generator exposes the raw
+    # per-agent budget so the native adapter can set the core tool_config.
+    gen = _make_generator()
+    gen.framework = "praisonai"
+    gen.cli_config = {"tool_timeout": 5}
+
+    def sentinel():
+        return "ok"
+
+    class _FakeResolver:
+        def resolve_all_from_yaml(self, config):
+            return {"plain": sentinel}
+
+    gen.tool_resolver = _FakeResolver()
+    gen.tools = []
+
+    try:
+        tools_dict = gen._build_tools_dict({"roles": {"a": {}}})
+        # Native path: plain callable is left unwrapped for core to enforce.
+        assert tools_dict["plain"] is sentinel
+        # The raw per-agent timeout resolver is exposed for the native adapter.
+        native_resolver = gen._run_ctx.get("_native_tool_timeout_resolver")
+        assert callable(native_resolver)
+        assert native_resolver("a") == 5.0
+    finally:
+        gen.close()
+
+
+def test_build_tools_dict_non_native_still_wraps_and_no_native_resolver():
+    # A non-native framework keeps wrapper-side wrapping and exposes no native
+    # timeout resolver (core does not own those tools).
+    gen = _make_generator()
+    gen.framework = "crewai"
+    gen.cli_config = {"tool_timeout": 5}
+
+    never = threading.Event()
+
+    def _blocking():
+        never.wait(30)
+        return "done"
+
+    class _FakeResolver:
+        def resolve_all_from_yaml(self, config):
+            return {"blocking": _blocking}
+
+    gen.tool_resolver = _FakeResolver()
+    gen.tools = []
+
+    try:
+        from praisonai.agents_generator import ToolTimeoutError
+        tools_dict = gen._build_tools_dict({"roles": {"a": {}}})
+        # Non-native: the plain callable is still wrapped (identity changed).
+        assert tools_dict["blocking"] is not _blocking
+        gen.cli_config = {"tool_timeout": 0.3}
+        # Re-wrap with a tight budget to assert enforcement still happens.
+        wrapped = gen._wrap_tool_with_timeout(_blocking, 0.3)
+        with pytest.raises(ToolTimeoutError):
+            wrapped()
+        assert gen._run_ctx.get("_native_tool_timeout_resolver") is None
+    finally:
+        never.set()
+        gen.close()
+
+
+def test_native_adapter_forwards_tool_timeout_to_core_tool_config():
+    # The native adapter must configure each core Agent's tool_config timeout
+    # from the generator's resolved per-agent budget so native tools keep their
+    # timeout even though the wrapper no longer wraps them (#5650).
+    try:
+        from praisonai.framework_adapters.praisonai_adapter import PraisonAIAdapter
+        from praisonaiagents.config.feature_configs import ToolConfig
+    except ImportError:
+        pytest.skip("PraisonAIAdapter / core ToolConfig not available")
+
+    import praisonaiagents
+    from unittest import mock
+
+    adapter = PraisonAIAdapter.__new__(PraisonAIAdapter)
+    adapter._format_template = lambda v, topic="": v
+
+    captured = {}
+
+    # Capture Agent kwargs without constructing a real agent; patch only the
+    # Agent/Task symbols on the real core module so its submodules still import.
+    class _FakeAgent:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    class _FakeTask:
+        def __init__(self, **kwargs):
+            pass
+
+    config = {"roles": {"a": {"role": "A", "tool_timeout": 7, "tools": []}}}
+
+    def _native_resolver(agent_key):
+        return 7.0 if agent_key == "a" else None
+
+    cli_config = {"_native_tool_timeout_resolver": _native_resolver}
+
+    with mock.patch.object(praisonaiagents, "Agent", _FakeAgent), \
+         mock.patch.object(praisonaiagents, "Task", _FakeTask):
+        adapter._build_agents_and_tasks(
+            config, "topic", {}, None, None, "gpt-4o-mini",
+            cli_config=cli_config,
+        )
+
+    tc = captured.get("tool_config")
+    assert isinstance(tc, ToolConfig)
+    assert tc.timeout == 7
+
+
+def test_native_adapter_preserves_subsecond_tool_timeout():
+    # Regression (#5650 review): a subsecond per-agent budget must survive the
+    # forward to core unrounded. Previously the adapter did int(round(budget)),
+    # collapsing 0.4 -> 0; core treats a non-positive timeout as "no timeout"
+    # and the native callable is left unwrapped, so enforcement was silently
+    # lost. The fractional budget must reach core intact.
+    try:
+        from praisonai.framework_adapters.praisonai_adapter import PraisonAIAdapter
+        from praisonaiagents.config.feature_configs import ToolConfig
+    except ImportError:
+        pytest.skip("PraisonAIAdapter / core ToolConfig not available")
+
+    import praisonaiagents
+    from unittest import mock
+
+    adapter = PraisonAIAdapter.__new__(PraisonAIAdapter)
+    adapter._format_template = lambda v, topic="": v
+
+    captured = {}
+
+    class _FakeAgent:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    class _FakeTask:
+        def __init__(self, **kwargs):
+            pass
+
+    config = {"roles": {"a": {"role": "A", "tool_timeout": 0.4, "tools": []}}}
+
+    def _native_resolver(agent_key):
+        return 0.4 if agent_key == "a" else None
+
+    cli_config = {"_native_tool_timeout_resolver": _native_resolver}
+
+    with mock.patch.object(praisonaiagents, "Agent", _FakeAgent), \
+         mock.patch.object(praisonaiagents, "Task", _FakeTask):
+        adapter._build_agents_and_tasks(
+            config, "topic", {}, None, None, "gpt-4o-mini",
+            cli_config=cli_config,
+        )
+
+    tc = captured.get("tool_config")
+    assert isinstance(tc, ToolConfig)
+    # Fractional budget preserved exactly (not rounded to 0, not to 1).
+    assert tc.timeout == 0.4
+    assert tc.timeout > 0
+
+
+def test_build_tools_dict_keeps_python_callables_and_framework_tools():
+    """Python-API ``tools=[...]`` entries that are not classes (plain callables,
+    framework tool instances) must be registered, not silently dropped (#5808)."""
+    gen = _make_generator()
+
+    def my_search(q: str) -> str:
+        return q
+
+    class _FrameworkTool:
+        name = "fw_tool"
+        description = "d"
+        args_schema = None
+
+        def _run(self, q):
+            return q
+
+    class _ToolClass:
+        pass
+
+    class _FakeResolver:
+        def resolve_all_from_yaml(self, config):
+            return {}
+
+    fw = _FrameworkTool()
+    gen.tool_resolver = _FakeResolver()
+    gen.tools = [my_search, fw, _ToolClass, 42]
+
+    tools_dict = gen._build_tools_dict({"roles": {"a": {}}})
+    assert tools_dict["my_search"] is my_search
+    assert tools_dict["fw_tool"] is fw
+    assert isinstance(tools_dict["_ToolClass"], _ToolClass)
+    assert 42 not in tools_dict.values()
+
+
+def test_sync_timeout_retry_shares_single_deadline():
+    """A CancelledError retry (pool recycled under a queued future) must not
+    restart the full ``tool_timeout`` budget (#5808)."""
+    import concurrent.futures
+    from unittest import mock
+    from praisonai.agents_generator import _wrap_with_timeout, ToolTimeoutError
+
+    waits = []
+
+    class _Future:
+        def __init__(self, exc):
+            self._exc = exc
+
+        def result(self, timeout=None):
+            waits.append(timeout)
+            raise self._exc
+
+        def cancel(self):
+            return True
+
+    futures = iter([
+        _Future(concurrent.futures.CancelledError()),
+        _Future(concurrent.futures.TimeoutError()),
+    ])
+
+    class _Executor:
+        def submit(self, fn, *a, **kw):
+            return next(futures)
+
+    # deadline, pre-check 0, wait 0, pre-check 1 (3s spent), wait 1 (pool
+    # setup took another 1s and must be charged to the budget).
+    ticks = [100.0, 100.0, 100.0, 103.0, 104.0]
+
+    def _clock():
+        return ticks.pop(0) if len(ticks) > 1 else ticks[0]
+
+    with mock.patch("time.monotonic", _clock):
+        wrapped = _wrap_with_timeout(lambda: None, 5.0, lambda: _Executor())
+        with pytest.raises(ToolTimeoutError):
+            wrapped()
+    # Second attempt only gets the remaining budget, not a fresh 5s.
+    assert waits == [5.0, 1.0]
+
+
+def test_run_sync_or_offload_cancels_submitted_work_when_worker_never_joins(monkeypatch):
+    """If the worker thread does not finish within the join window, the async
+    work must already be submitted so it can be cancelled rather than left
+    running (or started later) on the shared bridge loop (#5808)."""
+    import asyncio
+    from praisonai import _async_bridge
+
+    monkeypatch.setenv("PRAISONAI_ALLOW_LOOP_BLOCKING", "true")
+    submitted = []
+    real_submit = _async_bridge.AsyncBridge.submit
+
+    def _spy_submit(self, coro):
+        fut = real_submit(self, coro)
+        submitted.append(fut)
+        return fut
+
+    class _StalledThread:
+        """Worker that never gets scheduled within the join window."""
+
+        def __init__(self, *a, **kw):
+            pass
+
+        def start(self):
+            pass
+
+        def join(self, timeout=None):
+            pass
+
+        def is_alive(self):
+            return True
+
+    # Spin the bridge loop up before stalling Thread so only the worker stalls.
+    _async_bridge._default_bridge().run_sync(asyncio.sleep(0))
+    monkeypatch.setattr(_async_bridge.AsyncBridge, "submit", _spy_submit)
+    monkeypatch.setattr(_async_bridge.threading, "Thread", _StalledThread)
+
+    async def _slow():
+        await asyncio.sleep(30)
+
+    async def _caller():
+        with pytest.raises(TimeoutError):
+            _async_bridge.run_sync_or_offload(_slow(), timeout=0.05)
+
+    asyncio.run(_caller())
+    assert len(submitted) == 1
+    assert submitted[0].cancelled()

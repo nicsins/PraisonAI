@@ -154,6 +154,7 @@ class TestBridge:
         reg = HookRegistry()
         mgr = PluginManager()
         mgr.register(PIIPlugin())
+        mgr.set_plugin_options({"pii": {"allow_conversation": True}})
         assert mgr.wire_into_hook_registry(reg) == 1
         assert reg.has_hooks(HookEvent.AFTER_LLM)
 
@@ -161,6 +162,7 @@ class TestBridge:
         reg = HookRegistry()
         mgr = PluginManager()
         mgr.register(PIIPlugin())
+        mgr.set_plugin_options({"pii": {"allow_conversation": True}})
         mgr.wire_into_hook_registry(reg)
 
         runner = HookRunner(registry=reg, cwd=os.getcwd())
@@ -288,6 +290,7 @@ class TestBridge:
         reg = HookRegistry()
         mgr = PluginManager()
         mgr.register(PIIPlugin())
+        mgr.set_plugin_options({"pii": {"allow_conversation": True}})
         mgr.disable("pii")
         assert mgr.wire_into_hook_registry(reg) == 0
         assert not reg.has_hooks(HookEvent.AFTER_LLM)
@@ -299,6 +302,7 @@ class TestBridge:
         reg = HookRegistry()
         mgr = PluginManager()
         mgr.register(PIIPlugin())
+        mgr.set_plugin_options({"pii": {"allow_conversation": True}})
         assert mgr.wire_into_hook_registry(reg) == 1
         assert mgr.wire_into_hook_registry(reg) == 0
 
@@ -306,6 +310,7 @@ class TestBridge:
         reg = HookRegistry()
         mgr = PluginManager()
         mgr.register(PIIPlugin())
+        mgr.set_plugin_options({"pii": {"allow_conversation": True}})
         assert mgr.wire_into_hook_registry(reg) == 1
         assert reg.has_hooks(HookEvent.AFTER_LLM)
 
@@ -322,6 +327,7 @@ class TestBridge:
         reg = HookRegistry()
         mgr = PluginManager()
         mgr.register(PIIPlugin())
+        mgr.set_plugin_options({"pii": {"allow_conversation": True}})
         mgr.wire_into_hook_registry(reg)
         mgr.disable("pii")
         assert not reg.has_hooks(HookEvent.AFTER_LLM)
@@ -541,6 +547,7 @@ class TestDecisionPropagation:
         reg = HookRegistry()
         mgr = PluginManager()
         mgr.register(BlockMessagePlugin())
+        mgr.set_plugin_options({"blockmsg": {"allow_conversation": True}})
         mgr.wire_into_hook_registry(reg)
 
         runner = HookRunner(registry=reg, cwd=os.getcwd())
@@ -610,6 +617,10 @@ def _runner_with(plugin):
     reg = HookRegistry()
     mgr = PluginManager()
     mgr.register(plugin)
+    # These bridge tests exercise trusted guardrail/redaction plugins, so grant
+    # the conversation-content capability (as an operator would) before wiring
+    # — otherwise the least-privilege gate withholds before_llm/message_received.
+    mgr.set_plugin_options({plugin.info.name: {"allow_conversation": True}})
     mgr.wire_into_hook_registry(reg)
     return HookRunner(registry=reg, cwd=os.getcwd())
 
@@ -681,3 +692,156 @@ class TestCallerEnforcement:
         )
         results = runner.execute_sync(HookEvent.BEFORE_LLM, inp)
         assert runner.is_blocked(results) is True
+
+
+class GatewayForensicsLikePlugin(Plugin):
+    """Mirrors the bundled GatewayForensicsPlugin: declares gateway hooks and
+    defines matching observe-only methods that must actually fire."""
+
+    def __init__(self):
+        self.events = []
+
+    @property
+    def info(self):
+        return PluginInfo(
+            name="gwforensics",
+            hooks=[PluginHook.GATEWAY_START, PluginHook.GATEWAY_STOP],
+        )
+
+    def gateway_start(self, context):
+        self.events.append(("start", context.get("bot_count")))
+
+    def gateway_stop(self, context):
+        self.events.append(("stop", context.get("reason")))
+
+
+class AllRemainingLifecyclePlugin(Plugin):
+    """Declares every remaining lifecycle event the generic tail must bridge."""
+
+    def __init__(self):
+        self.fired = []
+
+    @property
+    def info(self):
+        return PluginInfo(
+            name="allremaining",
+            hooks=[
+                PluginHook.SCHEDULE_ADD,
+                PluginHook.SCHEDULE_REMOVE,
+                PluginHook.SCHEDULE_TRIGGER,
+                PluginHook.BEFORE_COMPACTION,
+                PluginHook.AFTER_COMPACTION,
+                PluginHook.SUBAGENT_STOP,
+                PluginHook.MODEL_FALLBACK,
+                PluginHook.KANBAN_TASK_CREATED,
+            ],
+        )
+
+    def schedule_add(self, context):
+        self.fired.append("schedule_add")
+
+    def schedule_remove(self, context):
+        self.fired.append("schedule_remove")
+
+    def schedule_trigger(self, context):
+        self.fired.append("schedule_trigger")
+
+    def before_compaction(self, context):
+        self.fired.append("before_compaction")
+
+    def after_compaction(self, context):
+        self.fired.append("after_compaction")
+
+    def subagent_stop(self, context):
+        self.fired.append("subagent_stop")
+
+    def model_fallback(self, context):
+        self.fired.append("model_fallback")
+
+    def kanban_task_created(self, context):
+        self.fired.append("kanban_task_created")
+
+
+class DeclaredButNotOverriddenPlugin(Plugin):
+    """Declares gateway hooks but does NOT override the base no-op methods."""
+
+    @property
+    def info(self):
+        return PluginInfo(
+            name="declared_noop",
+            hooks=[PluginHook.GATEWAY_START, PluginHook.GATEWAY_STOP],
+        )
+
+
+class TestGenericLifecycleBridge:
+    def test_gateway_hooks_wire_and_fire(self):
+        reg = HookRegistry()
+        mgr = PluginManager()
+        plugin = GatewayForensicsLikePlugin()
+        mgr.register(plugin)
+        assert mgr.wire_into_hook_registry(reg) == 2
+        assert reg.has_hooks(HookEvent.GATEWAY_START)
+        assert reg.has_hooks(HookEvent.GATEWAY_STOP)
+
+        from praisonaiagents.hooks.events import GatewayStartInput, GatewayStopInput
+
+        runner = HookRunner(registry=reg, cwd=os.getcwd())
+        runner.execute_sync(
+            HookEvent.GATEWAY_START,
+            GatewayStartInput(
+                session_id="s", cwd=os.getcwd(),
+                event_name=HookEvent.GATEWAY_START,
+                timestamp=str(time.time()), bot_count=3,
+            ),
+        )
+        runner.execute_sync(
+            HookEvent.GATEWAY_STOP,
+            GatewayStopInput(
+                session_id="s", cwd=os.getcwd(),
+                event_name=HookEvent.GATEWAY_STOP,
+                timestamp=str(time.time()), reason="sigterm",
+            ),
+        )
+        assert ("start", 3) in plugin.events
+        assert ("stop", "sigterm") in plugin.events
+
+    def test_all_remaining_lifecycle_events_bridge(self):
+        events = dict(_adapt_plugin_hooks(AllRemainingLifecyclePlugin()))
+        for event in (
+            HookEvent.SCHEDULE_ADD, HookEvent.SCHEDULE_REMOVE,
+            HookEvent.SCHEDULE_TRIGGER, HookEvent.BEFORE_COMPACTION,
+            HookEvent.AFTER_COMPACTION, HookEvent.SUBAGENT_STOP,
+            HookEvent.MODEL_FALLBACK, HookEvent.KANBAN_TASK_CREATED,
+        ):
+            assert event in events
+
+    def test_generic_hook_delivers_payload(self):
+        plugin = AllRemainingLifecyclePlugin()
+        events = dict(_adapt_plugin_hooks(plugin))
+
+        from praisonaiagents.hooks.events import SubagentStopInput
+
+        data = SubagentStopInput(
+            session_id="s", cwd=os.getcwd(),
+            event_name=HookEvent.SUBAGENT_STOP,
+            timestamp=str(time.time()), task="t", success=True,
+        )
+        events[HookEvent.SUBAGENT_STOP](data)
+        assert "subagent_stop" in plugin.fired
+
+    def test_declared_but_not_overridden_registers_nothing(self):
+        # Base no-op methods must NOT be wired as dead hooks.
+        assert list(_adapt_plugin_hooks(DeclaredButNotOverriddenPlugin())) == []
+
+    def test_undeclared_overridden_method_not_registered(self):
+        # A plugin that defines gateway_start but never declares it in
+        # PluginInfo.hooks must not be bridged (declaration-driven only).
+        class _Undeclared(Plugin):
+            @property
+            def info(self):
+                return PluginInfo(name="undeclared")
+
+            def gateway_start(self, context):
+                pass
+
+        assert list(_adapt_plugin_hooks(_Undeclared())) == []

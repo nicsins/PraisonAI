@@ -48,6 +48,7 @@ MIN_CLIENT_PROTOCOL_VERSION = 1
 
 if TYPE_CHECKING:
     import asyncio
+    from typing import BinaryIO
     from praisonai.gateway.pairing import PairedChannel
     from ..agent import Agent
     from ..bots.presentation import MessagePresentation
@@ -268,6 +269,84 @@ class OperatorScope(str, Enum):
         return list(cls)
 
 
+class SessionVisibility(str, Enum):
+    """How widely a Gateway session may be observed by other clients.
+
+    A session's visibility gates *whether* a second authorised client may
+    attach to watch (or co-drive) the same live turn stream, on top of the
+    orthogonal :class:`OperatorScope` authorisation. The vocabulary lives in
+    core so every client/impl agrees; enforcement happens in the wrapper.
+
+    Values:
+        PRIVATE:   Owner only. Today's behaviour and the default — a session
+                   stays bound 1:1 to its owning client.
+        SHARED:    Members may co-drive; additional authorised clients may
+                   attach with WRITE-capable roles.
+        READ_ONLY: Additional clients may attach as viewers to observe the
+                   transcript, but not send.
+    """
+
+    PRIVATE = "private"
+    SHARED = "shared"
+    READ_ONLY = "read_only"
+
+
+class SessionSharingRole(str, Enum):
+    """The role an attached client holds within a shared Gateway session.
+
+    Roles describe *what an attached client may do* within the session and
+    layer on top of :class:`OperatorScope`. Fan-out remains scope-aware: an
+    observer without ``READ`` receives nothing regardless of role.
+
+    Values:
+        OWNER:  Controls sharing/visibility; the session's original driver.
+        MEMBER: May co-drive (send) when the session is ``SHARED``.
+        VIEWER: Observes the live turn stream but cannot send.
+    """
+
+    OWNER = "owner"
+    MEMBER = "member"
+    VIEWER = "viewer"
+
+
+@runtime_checkable
+class SessionObserverProtocol(Protocol):
+    """Protocol for attaching multiple observers to one live session.
+
+    Extends the single-owner :class:`GatewaySessionProtocol` model so that a
+    session can fan its live turn stream (tokens, tool calls, results, final)
+    out to more than one authorised client. Implementations live in the
+    wrapper Gateway; the contract lives here so every client agrees on the
+    attach/detach/enumerate surface.
+
+    Default behaviour is unchanged: a ``PRIVATE`` session keeps a single
+    ``OWNER`` observer (today's 1:1 model).
+    """
+
+    def attach(
+        self,
+        session_id: str,
+        client_id: str,
+        role: SessionSharingRole = SessionSharingRole.VIEWER,
+    ) -> None:
+        """Attach ``client_id`` to ``session_id`` with the given role.
+
+        Adds an observer rather than re-pointing ownership, so a second
+        client can watch a session without hijacking it.
+        """
+        ...
+
+    def detach(self, session_id: str, client_id: str) -> None:
+        """Detach ``client_id`` from ``session_id`` (stop observing)."""
+        ...
+
+    def observers(
+        self, session_id: str
+    ) -> "List[Tuple[str, SessionSharingRole]]":
+        """Return ``(client_id, role)`` pairs currently attached to the session."""
+        ...
+
+
 @dataclass
 class HelloParams:
     """Parameters for initiating a versioned handshake.
@@ -297,14 +376,18 @@ class HelloResult:
     Attributes:
         protocol: The negotiated protocol version
         features: Supported methods and events
-        policy: Gateway policy limits (max_payload, heartbeat_ms, etc.)
+        policy: Gateway policy limits (max_payload, heartbeat_ms, and — Issue
+            #5207 — attachment ceilings max_attachment_bytes / max_attachments /
+            chunk_bytes so a client self-limits and chunks before sending). The
+            optional ``allowed_attachment_types`` list, when present, is carried
+            here too.
         session_id: The session ID for this connection
         resumed: Whether an existing session was resumed
         cursor: Current event cursor position
     """
     protocol: int
     features: Dict[str, List[str]]  # {"methods": [...], "events": [...]}
-    policy: Dict[str, int]  # {"max_payload": ..., "heartbeat_ms": ...}
+    policy: Dict[str, Any]  # {"max_payload": ..., "heartbeat_ms": ..., "max_attachment_bytes": ...}
     session_id: str
     resumed: bool
     cursor: int
@@ -466,6 +549,149 @@ def _require_str(value: Any, *, field_name: str) -> str:
 
 
 @dataclass
+class AttachmentRef:
+    """A first-class attachment reference on the gateway wire protocol (Issue #5207).
+
+    The gateway is the control plane every custom ``/ws`` client builds on, yet
+    the ``message`` frame carried only text or a free-form dict — a client had
+    no supported, size-bounded, validated way to hand the agent a file or to
+    receive an agent-generated artefact back. ``AttachmentRef`` is that missing
+    typed contract: one shape every client and gateway implementation agrees on,
+    additive and backward-compatible (no existing frame changes shape).
+
+    An attachment is carried one of two ways:
+
+    * **Inline** — ``data`` holds base64 for a small file, bounded by the
+      advertised ``max_attachment_bytes`` policy so a well-behaved client
+      self-limits before sending rather than discovering the limit by being
+      disconnected.
+    * **By reference** — ``ref_id`` names an entry the gateway materialised in
+      its attachment store (see :class:`AttachmentStoreProtocol`), used for
+      larger files streamed via chunked upload instead of a single frame.
+
+    The same shape is reused outbound: agent-generated files surface as
+    ``AttachmentRef`` entries a generic client can fetch over the same
+    connection, instead of relying on platform (Telegram/Slack/…) delivery.
+
+    Attributes:
+        filename: Client-facing file name (display / download target).
+        mime: MIME type of the payload (e.g. ``image/png``, ``application/pdf``).
+        size: Declared size in bytes (used to validate against policy ceilings).
+        data: Inline base64 payload for a small file, or ``None`` when the
+            attachment is carried by ``ref_id``.
+        ref_id: Identifier in the gateway attachment store for a chunked / large
+            file, or ``None`` for a purely inline attachment.
+    """
+
+    filename: str
+    mime: str
+    size: int
+    data: Optional[str] = None      # inline base64 for small files
+    ref_id: Optional[str] = None    # id in the gateway attachment store (chunked/large)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize to a wire dict, omitting the unused carrier field."""
+        frame: Dict[str, Any] = {
+            "filename": self.filename,
+            "mime": self.mime,
+            "size": self.size,
+        }
+        if self.data is not None:
+            frame["data"] = self.data
+        if self.ref_id is not None:
+            frame["ref_id"] = self.ref_id
+        return frame
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "AttachmentRef":
+        """Validate a raw attachment dict into a typed ref.
+
+        Rejects a malformed attachment deterministically with the same
+        structured ``HelloError`` envelope the rest of the inbound codec uses,
+        so handlers keep receiving already-validated objects.
+        """
+        if not isinstance(data, dict):
+            raise FrameDecodeError(
+                HelloError(
+                    code=ConnectErrorCode.CONFIGURATION_ERROR,
+                    message="Each attachment must be an object",
+                    next_step=ConnectRecoveryStep.DO_NOT_RETRY,
+                )
+            )
+        filename = _require_str(data.get("filename"), field_name="attachment.filename")
+        mime = _require_str(data.get("mime"), field_name="attachment.mime")
+        size = _coerce_int(data.get("size"), field_name="attachment.size", default=0)
+        if size < 0:
+            raise FrameDecodeError(
+                HelloError(
+                    code=ConnectErrorCode.CONFIGURATION_ERROR,
+                    message="Field 'attachment.size' must be >= 0",
+                    next_step=ConnectRecoveryStep.DO_NOT_RETRY,
+                )
+            )
+        inline = _as_opt_str(data.get("data"))
+        ref_id = _as_opt_str(data.get("ref_id"))
+        if inline is None and ref_id is None:
+            raise FrameDecodeError(
+                HelloError(
+                    code=ConnectErrorCode.CONFIGURATION_ERROR,
+                    message=(
+                        "An attachment must carry either inline 'data' (base64) "
+                        "or a store 'ref_id'"
+                    ),
+                    next_step=ConnectRecoveryStep.DO_NOT_RETRY,
+                )
+            )
+        if inline is not None and ref_id is not None:
+            raise FrameDecodeError(
+                HelloError(
+                    code=ConnectErrorCode.CONFIGURATION_ERROR,
+                    message=(
+                        "An attachment must carry exactly one of inline 'data' "
+                        "(base64) or a store 'ref_id', not both"
+                    ),
+                    next_step=ConnectRecoveryStep.DO_NOT_RETRY,
+                )
+            )
+        return cls(
+            filename=filename,
+            mime=mime,
+            size=size,
+            data=inline,
+            ref_id=ref_id,
+        )
+
+
+@runtime_checkable
+class AttachmentStoreProtocol(Protocol):
+    """Seam for a gateway-managed attachment store (Issue #5207).
+
+    Large files cannot ride inline inside a single ``message`` frame (bounded by
+    ``max_payload``), so they are streamed as chunks into a store keyed by a
+    reserved ``ref_id`` (reserve → put chunk at offset → close), then referenced
+    from :class:`AttachmentRef`. The contract lives in core so every client and
+    implementation agree on one shape; the concrete durable store (filesystem /
+    object store) is a wrapper/bot concern, kept out of the dependency-free core.
+    """
+
+    def reserve(self, filename: str, mime: str, size: int) -> str:
+        """Reserve an entry for an incoming file and return its ``ref_id``."""
+        ...
+
+    def put_chunk(self, ref_id: str, offset: int, data: bytes) -> None:
+        """Write ``data`` at ``offset`` for the reserved ``ref_id``."""
+        ...
+
+    def close(self, ref_id: str) -> AttachmentRef:
+        """Finalize the upload and return the resulting :class:`AttachmentRef`."""
+        ...
+
+    def open(self, ref_id: str) -> "BinaryIO":
+        """Open the stored attachment for reading (outbound download)."""
+        ...
+
+
+@dataclass
 class MessageParams:
     """Validated ``message`` frame — a client turn sent to the agent.
 
@@ -476,12 +702,23 @@ class MessageParams:
         content: The message body (text, or a structured payload).
         session_id: Optional session the message belongs to.
         message_id: Optional client-supplied idempotency/correlation id.
+        request_id: Optional client-supplied request-idempotency key (Issue
+            #5193). When present the gateway dedups a resend of the same
+            ``request_id`` — a request queued while reconnecting and flushed on
+            reconnect runs the turn exactly once instead of being lost or
+            double-run. Absent keeps the legacy fire-and-forget behaviour.
+        attachments: Optional list of :class:`AttachmentRef` (Issue #5207) — a
+            first-class, size-bounded way for any ``/ws`` client (not just
+            platform bots) to hand the agent files. Defaults to empty, so a
+            frame without attachments decodes exactly as before.
         metadata: Optional additional message metadata.
     """
 
     content: Union[str, Dict[str, Any]]
     session_id: Optional[str] = None
     message_id: Optional[str] = None
+    request_id: Optional[str] = None
+    attachments: List[AttachmentRef] = field(default_factory=list)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     type: str = field(default="message", init=False)
@@ -509,10 +746,24 @@ class MessageParams:
         metadata = data.get("metadata")
         if not isinstance(metadata, dict):
             metadata = {}
+        raw_attachments = data.get("attachments")
+        attachments: List[AttachmentRef] = []
+        if raw_attachments is not None:
+            if not isinstance(raw_attachments, (list, tuple)):
+                raise FrameDecodeError(
+                    HelloError(
+                        code=ConnectErrorCode.CONFIGURATION_ERROR,
+                        message="Field 'attachments' must be an array",
+                        next_step=ConnectRecoveryStep.DO_NOT_RETRY,
+                    )
+                )
+            attachments = [AttachmentRef.from_dict(a) for a in raw_attachments]
         return cls(
             content=content,
             session_id=_as_opt_str(data.get("session_id")),
             message_id=_as_opt_str(data.get("message_id")),
+            request_id=_as_opt_str(data.get("request_id")),
+            attachments=attachments,
             metadata=metadata,
         )
 
@@ -1938,7 +2189,16 @@ class RouteBinding:
         chat_type: Chat type ("dm" | "group" | "channel").
         peer: Sender/user id (most specific).
         role: Role / guild-role membership of the sender.
-        channel_id: Specific chat/channel id.
+        channel_id: Specific chat/channel id. Also matches a message whose
+            parent channel is this id (a thread/forum-post under it), so a
+            channel-level route naturally covers the threads beneath it
+            without listing each thread by hand (Issue #4839).
+        thread_id: Specific thread / forum-post id (most specific unit — one
+            triage-spun support thread can route to a specialist agent,
+            Issue #4839).
+        guild_id: Server / workspace id. One rule covers every current and
+            future channel in the guild, so an operator can multiplex by the
+            tenant boundary they actually think in (Issue #4839).
         account: Receiving bot account (for multi-account channels).
         priority: Higher wins; ties are broken by specificity then order.
         trust: Optional trust tier ("untrusted" | "standard" | "trusted").
@@ -1967,13 +2227,21 @@ class RouteBinding:
     allow_tools: Optional[List[str]] = None
     deny_tools: Optional[List[str]] = None
     profile: Optional[str] = None
+    # New optional conditions are appended here (never inserted mid-list) so
+    # existing positional constructors — RouteBinding("a", "dm", ..., priority)
+    # — keep their meaning and stay backward-compatible (Issue #4839 review).
+    thread_id: Optional[str] = None
+    guild_id: Optional[str] = None
 
-    # Specificity weights — exact peer beats role/channel beats account
-    # beats chat-type. Higher means more specific.
+    # Specificity weights — exact thread beats peer beats role/channel beats
+    # guild/account beats chat-type. Higher means more specific, so a single
+    # thread rule wins over a whole-guild rule (Issue #4839).
     _SPECIFICITY = {
+        "thread_id": 32,
         "peer": 16,
         "role": 8,
         "channel_id": 8,
+        "guild_id": 4,
         "account": 4,
         "chat_type": 2,
     }
@@ -2017,7 +2285,20 @@ class RouteBinding:
         """Return True if every constrained condition equals the facts."""
         if self.peer is not None and str(self.peer) != str(facts.peer):
             return False
-        if self.channel_id is not None and str(self.channel_id) != str(facts.channel_id):
+        if self.channel_id is not None:
+            # Parent-chain match (Issue #4839): a channel_id condition matches
+            # the channel itself OR a thread/forum-post whose parent is that
+            # channel, so channel-level routes cover the threads beneath them
+            # without enumerating each thread.
+            expected_channel = str(self.channel_id)
+            candidates = {str(facts.channel_id)}
+            if facts.parent_channel_id is not None:
+                candidates.add(str(facts.parent_channel_id))
+            if expected_channel not in candidates:
+                return False
+        if self.thread_id is not None and str(self.thread_id) != str(facts.thread_id):
+            return False
+        if self.guild_id is not None and str(self.guild_id) != str(facts.guild_id):
             return False
         if self.account is not None and str(self.account) != str(facts.account):
             return False
@@ -2066,6 +2347,8 @@ class RouteBinding:
             role=data.get("role"),
             channel_id=_as_opt_str(data.get("channel_id")),
             account=_as_opt_str(data.get("account")),
+            thread_id=_as_opt_str(data.get("thread_id")),
+            guild_id=_as_opt_str(data.get("guild_id")),
             priority=int(data.get("priority", 0) or 0),
             trust=_as_opt_str(data.get("trust")),
             allow_tools=_as_opt_str_list(data.get("allow_tools")),
@@ -2084,6 +2367,13 @@ class RouteFacts:
         roles: Roles/guild-role memberships of the sender.
         channel_id: The chat/channel id the message arrived in.
         account: The receiving bot account (multi-account channels).
+        thread_id: The thread / forum-post id the message arrived in, when the
+            platform threads conversations (Issue #4839).
+        guild_id: The server / workspace id the message belongs to (Discord
+            guild, Slack workspace), used for whole-server routing (Issue #4839).
+        parent_channel_id: The parent channel of a thread/forum-post, so a
+            channel-level binding can cover the threads beneath it via
+            parent-chain matching (Issue #4839).
     """
 
     chat_type: str = "default"
@@ -2091,6 +2381,9 @@ class RouteFacts:
     roles: List[str] = field(default_factory=list)
     channel_id: Optional[str] = None
     account: Optional[str] = None
+    thread_id: Optional[str] = None
+    guild_id: Optional[str] = None
+    parent_channel_id: Optional[str] = None
 
 
 @dataclass
@@ -2148,8 +2441,9 @@ def resolve_route(
     """Resolve the handling agent from priority-ordered bindings.
 
     Bindings are evaluated most-specific-first: the matching binding with the
-    highest ``priority`` wins; ties are broken by specificity (exact peer →
-    role/channel → account → chat-type), then by declaration order.
+    highest ``priority`` wins; ties are broken by specificity (exact thread →
+    peer → role/channel → guild/account → chat-type), then by declaration
+    order.
 
     Args:
         bindings: Candidate route bindings (any order).
@@ -2259,6 +2553,225 @@ def resolve_auth_mode(bind_host: str, configured: Optional[AuthMode] = None) -> 
         return configured
     
     return "local" if is_loopback(bind_host) else "token"
+
+
+# ---------------------------------------------------------------------------
+# Ingress attribution / trusted-proxy real-client-IP resolution (Issue #5312)
+# ---------------------------------------------------------------------------
+#
+# The gateway keys rate-limiting, the pre-auth connection budget, and the
+# operator identity on the *raw socket peer*. Behind a reverse proxy or tunnel
+# (nginx, Caddy, Traefik, a cloud LB, Cloudflare, Tailscale Serve/Funnel) that
+# peer is the *proxy* for every request, so every per-IP bucket collapses to
+# one and the operator id becomes identical for all callers. Trusting
+# ``X-Forwarded-For`` unconditionally is worse — a directly-reachable gateway
+# would accept a spoofed client IP any attacker can set.
+#
+# This pure, import-free contract resolves the real client address *only* by
+# walking the forwarded chain across hops the operator has explicitly declared
+# trusted, and **fails closed** for anything proxy-shaped but unattributable
+# (rate-limited as one bucket keyed on the socket peer; never trusts a header).
+# It lives in core so every seam consults one unit-testable decision, exactly
+# like the sibling ``resolve_route`` / ``evaluate_pressure`` contracts.
+
+IngressTrust = Literal[
+    "direct-local",
+    "direct-remote",
+    "trusted-proxy",
+    "tunnel",
+    "unattributable-proxy",
+]
+"""Classification of where an inbound request actually came from.
+
+- ``direct-local``: loopback peer, no proxy headers (local CLI / same host).
+- ``direct-remote``: a remote peer talking to us directly, no proxy headers.
+- ``trusted-proxy``: arrived via one or more hops all in ``trusted_proxies``;
+  the real client IP was resolved from the forwarded chain.
+- ``tunnel``: a trusted loopback/private tunnel hop (e.g. Tailscale/Cloudflare
+  sidecar on loopback) presented a forwarded client — resolved like a trusted
+  proxy.
+- ``unattributable-proxy``: proxy-shaped (forwarded headers present) but the
+  immediate hop is not declared trusted — fails closed, header not trusted.
+"""
+
+
+@dataclass(frozen=True)
+class IngressAttribution:
+    """Resolved answer to "who/where is this request from", consulted before
+    any per-IP policy.
+
+    Attributes:
+        trust: The :data:`IngressTrust` classification.
+        client_ip: The subject to key per-IP policy on. The *real* client only
+            when it was resolved across trusted hops; otherwise the raw socket
+            peer (never a spoofable header value).
+        via_proxy: Whether forwarded headers were present at all.
+        fail_closed: True when the request was proxy-shaped but unattributable —
+            the caller must rate-limit it as a single bucket keyed on the socket
+            peer and must never trust a client IP from a header.
+    """
+
+    trust: IngressTrust
+    client_ip: str
+    via_proxy: bool
+    fail_closed: bool
+
+
+def parse_forwarded_for(header: Optional[str]) -> "List[str]":
+    """Parse an ``X-Forwarded-For`` header into an ordered list of hops.
+
+    The chain is left→right, client-first: ``client, proxy1, proxy2``. Empty
+    tokens and surrounding whitespace are dropped; ``None``/empty yields an
+    empty list. Pure string handling — no name resolution, no validation of
+    whether each token is a real IP (that is the caller's trust decision).
+    """
+    if not header:
+        return []
+    return [tok.strip() for tok in header.split(",") if tok.strip()]
+
+
+def _is_valid_ip(host: Optional[str]) -> bool:
+    """Return whether ``host`` parses as a literal IPv4/IPv6 address.
+
+    Forwarded-header tokens are attacker-influenced strings; a value such as
+    ``unknown`` or an arbitrary label must never become a per-IP policy subject
+    (it would group unrelated callers or split one caller across buckets). The
+    caller uses this to fail closed to the socket peer for a non-IP hop.
+    """
+    if not host:
+        return False
+    import ipaddress
+
+    try:
+        ipaddress.ip_address(str(host).strip())
+        return True
+    except ValueError:
+        return False
+
+
+def _is_trusted_hop(host: str, trusted_proxies: "Sequence[str]") -> bool:
+    """Return whether ``host`` is a member of the declared trusted set.
+
+    A trusted entry may be a bare IP or a CIDR (``10.0.0.0/8``). Loopback is
+    *not* implicitly trusted here — the caller decides how to treat a loopback
+    tunnel — so this stays a pure membership test.
+    """
+    import ipaddress
+
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    for entry in trusted_proxies:
+        entry = str(entry).strip()
+        if not entry:
+            continue
+        try:
+            if "/" in entry:
+                if ip in ipaddress.ip_network(entry, strict=False):
+                    return True
+            elif ip == ipaddress.ip_address(entry):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def resolve_ingress_attribution(
+    *,
+    peer_ip: str,
+    forwarded_for: "Sequence[str]" = (),
+    real_ip: Optional[str] = None,
+    trusted_proxies: "Sequence[str]" = (),
+) -> IngressAttribution:
+    """Resolve the real client attribution for an inbound request.
+
+    Pure and side-effect-free so it is unit-testable in isolation and every
+    seam (rate limiters, connection budget, operator id) consults the same
+    decision.
+
+    Args:
+        peer_ip: Raw socket peer (``request.client.host``).
+        forwarded_for: Parsed ``X-Forwarded-For`` chain, left→right
+            (client-first). See :func:`parse_forwarded_for`.
+        real_ip: Optional ``X-Real-IP`` value (used only when there is no
+            forwarded chain and the immediate hop is trusted).
+        trusted_proxies: CIDRs/IPs the operator declares trusted.
+
+    Returns:
+        An :class:`IngressAttribution`. The real client IP is resolved *only*
+        across hops in ``trusted_proxies``; anything proxy-shaped but
+        unattributable fails closed to the socket peer.
+
+    Resolution rules:
+        * No proxy headers → ``direct-local`` (loopback peer) or
+          ``direct-remote``; ``client_ip`` is the peer, never fail-closed.
+        * Proxy headers present but the socket peer is not a trusted hop →
+          ``unattributable-proxy``, ``fail_closed=True``, ``client_ip`` = peer
+          (a spoofable header is never trusted on a directly-reachable
+          gateway).
+        * Socket peer is a trusted hop → walk the forwarded chain right→left,
+          peeling trusted hops, and stop at the first untrusted address: that
+          address is the real client. If the chain is empty, fall back to
+          ``real_ip`` then the peer. The resolved client must be a literal IP —
+          a malformed/non-IP hop fails closed to the peer. A loopback trusted
+          hop is classified ``tunnel``; otherwise ``trusted-proxy``.
+    """
+    has_headers = bool(forwarded_for) or bool(real_ip)
+
+    # No forwarded headers at all — attribute straight to the socket peer.
+    if not has_headers:
+        trust: IngressTrust = "direct-local" if is_loopback(peer_ip) else "direct-remote"
+        return IngressAttribution(
+            trust=trust,
+            client_ip=peer_ip,
+            via_proxy=False,
+            fail_closed=False,
+        )
+
+    # Proxy-shaped. The immediate hop (socket peer) must itself be trusted for
+    # any header to be believed; otherwise fail closed to the socket peer.
+    if not _is_trusted_hop(peer_ip, trusted_proxies):
+        return IngressAttribution(
+            trust="unattributable-proxy",
+            client_ip=peer_ip,
+            via_proxy=True,
+            fail_closed=True,
+        )
+
+    # Trusted immediate hop. Walk the forwarded chain right→left, peeling hops
+    # that are themselves trusted; the first untrusted address is the real
+    # client. Stop as soon as we hit it so a client-supplied spoofed prefix
+    # cannot be peeled past.
+    client_ip = None
+    for hop in reversed(list(forwarded_for)):
+        if _is_trusted_hop(hop, trusted_proxies):
+            continue
+        client_ip = hop
+        break
+    if client_ip is None:
+        # Entire chain was trusted (or empty). Prefer X-Real-IP, then peer.
+        client_ip = (real_ip.strip() if real_ip else None) or peer_ip
+
+    # The resolved client must be a literal IP before it keys per-IP policy. A
+    # malformed hop (e.g. ``unknown`` or an arbitrary label injected upstream)
+    # would otherwise group unrelated callers or split one caller across
+    # buckets — fail closed to the socket peer instead (Greptile P2).
+    if not _is_valid_ip(client_ip):
+        return IngressAttribution(
+            trust="unattributable-proxy",
+            client_ip=peer_ip,
+            via_proxy=True,
+            fail_closed=True,
+        )
+
+    trust = "tunnel" if is_loopback(peer_ip) else "trusted-proxy"
+    return IngressAttribution(
+        trust=trust,
+        client_ip=client_ip,
+        via_proxy=True,
+        fail_closed=False,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2683,6 +3196,37 @@ class DeliveryPreflightProtocol(Protocol):
         ...
 
 
+@runtime_checkable
+class RemoteMediaResolver(Protocol):
+    """Resolves a sandbox-local media path to a gateway-local deliverable path.
+
+    When an agent runs in a remote/serverless sandbox (Modal, E2B, Daytona,
+    Fly.io, SSH host, remote Docker, …) and emits a ``MEDIA:<path>`` directive,
+    the referenced file lives on the *sandbox* filesystem, not the gateway host.
+    The outbound media path only delivers local files, so such a directive would
+    otherwise be silently dropped.
+
+    A resolver bridges that gap: the active sandbox backend (which already
+    exposes a ``download_file``/``read_file`` primitive) satisfies this protocol
+    so the wrapper's outbound media path can pull the artifact down into a local
+    delivery cache and then deliver it, without the wrapper importing any
+    concrete heavy sandbox SDK.
+    """
+
+    def owns_path(self, path: str) -> bool:
+        """Return True if ``path`` refers to a file inside this sandbox."""
+        ...
+
+    async def fetch_to_local(self, remote_path: str) -> str:
+        """Fetch ``remote_path`` out of the sandbox to a local path.
+
+        Returns the gateway-local filesystem path of the fetched copy, which the
+        caller is expected to re-screen through the outbound-path guard before
+        delivery.
+        """
+        ...
+
+
 # ---------------------------------------------------------------------------
 # Agent-facing outbound messaging (Issue #2183)
 # ---------------------------------------------------------------------------
@@ -2747,6 +3291,57 @@ ReactionStatus = Literal["ok", "unsupported", "failed", "no_route"]
 * ``failed`` — the transport rejected the reaction (e.g. no such message).
 * ``no_route`` — the target could not be resolved to a reachable channel.
 """
+
+
+MessageActionStatus = Literal["ok", "unsupported", "failed", "no_route"]
+"""Closed set of outcomes for a message-mutation verb (``edit`` / ``delete``).
+
+Mirrors :data:`ReactionStatus` so every agent-callable message action returns
+the same typed shape:
+
+* ``ok`` — the message was edited/deleted.
+* ``unsupported`` — the channel has no matching capability
+  (``supports_edit`` / ``supports_delete``).
+* ``failed`` — the transport rejected the action (e.g. no such message, or the
+  message is not editable/deletable by this bot).
+* ``no_route`` — the target could not be resolved to a reachable channel.
+"""
+
+
+@dataclass
+class MessageActionResult:
+    """Outcome of an agent-initiated message mutation (Issue #5054).
+
+    Shared typed result for the ``edit`` and ``delete`` verbs of the unified
+    message-action surface. Every call resolves to exactly one
+    :data:`MessageActionStatus`, so a channel that cannot edit/delete returns a
+    typed ``unsupported`` outcome instead of raising — identical to how
+    :class:`ReactionResult` and :class:`ThreadResult` degrade.
+
+    Attributes:
+        status: The outcome (``ok`` / ``unsupported`` / ``failed`` /
+            ``no_route``).
+        target: The resolved target the action was routed to.
+        detail: Optional model-readable explanation.
+    """
+
+    status: MessageActionStatus
+    target: str = ""
+    detail: Optional[str] = None
+
+    @property
+    def ok(self) -> bool:
+        """Whether the action succeeded (``status == "ok"``)."""
+        return self.status == "ok"
+
+    def as_dict(self) -> Dict[str, Any]:
+        """Convert to a serializable dictionary for the tool return value."""
+        data: Dict[str, Any] = {"status": self.status}
+        if self.target:
+            data["target"] = self.target
+        if self.detail:
+            data["detail"] = self.detail
+        return data
 
 
 @dataclass
@@ -2934,6 +3529,51 @@ class OutboundMessengerProtocol(Protocol):
         """
         ...
 
+    async def edit(
+        self,
+        target: str,
+        message_id: str,
+        text: str,
+    ) -> "MessageActionResult":
+        """Edit a prior message this agent/session sent (Issue #5054).
+
+        Lets an agent update its own live status message in place rather than
+        posting a follow-up — e.g. editing "Working…" to "Done ✅". Gated on the
+        channel's ``PlatformCapabilities.supports_edit``; a channel that cannot
+        edit returns a typed ``unsupported`` outcome instead of raising.
+
+        Args:
+            target: Symbolic target token ("origin", "<platform>",
+                "<platform>:<chat_id>[:<thread_id>]", or a friendly alias).
+            message_id: The id of the message to edit.
+            text: The new message text.
+
+        Returns:
+            A :class:`MessageActionResult` describing the outcome.
+        """
+        ...
+
+    async def delete(
+        self,
+        target: str,
+        message_id: str,
+    ) -> "MessageActionResult":
+        """Delete/unsend a prior message this agent/session sent (Issue #5054).
+
+        Lets an agent retract a message it should not have sent. Gated on the
+        channel's ``PlatformCapabilities.supports_delete``; a channel that
+        cannot delete returns a typed ``unsupported`` outcome instead of raising.
+
+        Args:
+            target: Symbolic target token ("origin", "<platform>",
+                "<platform>:<chat_id>[:<thread_id>]", or a friendly alias).
+            message_id: The id of the message to delete.
+
+        Returns:
+            A :class:`MessageActionResult` describing the outcome.
+        """
+        ...
+
 
 # ---------------------------------------------------------------------------
 # Agent-callable cross-conversation request/reply (Issue #3689)
@@ -3037,6 +3677,122 @@ class ConversationRequestProtocol(Protocol):
         Returns:
             A :class:`ConversationReply` describing the outcome.
         """
+        ...
+
+
+# ---------------------------------------------------------------------------
+# Server→client interactive request/reply over the gateway transport
+# (Issue #5351)
+#
+# A blocked HITL turn (approval / choice / free-text input) needs to reach a
+# generic gateway client — a web dashboard, TUI, or custom app — and correlate
+# the client's answer back into the waiting turn. Structured elicitation today
+# only renders through per-channel button backends; a client on the gateway
+# WebSocket cannot see or answer one, and an in-flight prompt is lost when the
+# client drops (the ``since`` cursor replays *past events*, not *still-open
+# requests*).
+#
+# Core owns only the *shape*: the typed request (:class:`GatewayServerRequest`),
+# the correlated reply (:class:`GatewayServerReply`), and the protocol seam
+# (:class:`GatewayRequestChannelProtocol`) — including the ``open_requests``
+# contract that the resume path honours so a reconnecting client is re-sent
+# every still-open (and *only* still-open) request for its sessions. The socket
+# delivery, correlation, and durable open-request set are bound by the running
+# gateway (praisonai-bot) exactly as the outbound messenger is — no heavy
+# import lives in core.
+# ---------------------------------------------------------------------------
+
+GatewayRequestKind = Literal["approval", "choice", "input"]
+"""Closed set of server→client interactive request kinds.
+
+* ``approval`` — allow/deny; the reply ``value`` is ``"allow"`` or ``"deny"``.
+* ``choice`` — select one of ``options``; the reply ``value`` is the option.
+* ``input`` — free text; the reply ``value`` is the entered text.
+"""
+
+
+@dataclass
+class GatewayServerRequest:
+    """A typed server→client interactive request (Issue #5351).
+
+    Delivered to a connected gateway client as a ``server_request`` frame while
+    a turn is blocked awaiting a human answer, and re-issued verbatim on resume
+    for as long as it stays open.
+
+    Attributes:
+        request_id: Correlation id echoed back in the :class:`GatewayServerReply`.
+        kind: One of :data:`GatewayRequestKind`.
+        prompt: Human-readable prompt to render.
+        options: Selectable options, populated only for ``kind == "choice"``.
+        session_id: Session the request belongs to (used for resume replay).
+    """
+
+    request_id: str
+    kind: GatewayRequestKind
+    prompt: str
+    options: Optional[List[str]] = None
+    session_id: str = ""
+
+    def as_dict(self) -> Dict[str, Any]:
+        """Convert to a serializable dictionary for the ``server_request`` frame."""
+        data: Dict[str, Any] = {
+            "request_id": self.request_id,
+            "kind": self.kind,
+            "prompt": self.prompt,
+        }
+        if self.options is not None:
+            data["options"] = list(self.options)
+        if self.session_id:
+            data["session_id"] = self.session_id
+        return data
+
+
+@dataclass
+class GatewayServerReply:
+    """A client's correlated answer to a :class:`GatewayServerRequest`.
+
+    Attributes:
+        request_id: The id of the request being answered.
+        value: ``"allow"``/``"deny"`` for approval, the chosen option for
+            choice, or the entered text for input.
+    """
+
+    request_id: str
+    value: str
+
+    def as_dict(self) -> Dict[str, Any]:
+        """Convert to a serializable dictionary."""
+        return {"request_id": self.request_id, "value": self.value}
+
+
+@runtime_checkable
+class GatewayRequestChannelProtocol(Protocol):
+    """Protocol for server→client interactive request/reply over the transport.
+
+    A concrete implementation is bound by the running gateway (in praisonai-bot)
+    and registered into the per-turn context so a blocked HITL turn can deliver
+    an :class:`GatewayServerRequest` to the connected client and await the
+    correlated :class:`GatewayServerReply`. ``open_requests`` returns the
+    still-open requests for a session so the gateway's resume path can re-issue
+    them alongside the event replay — a dropped connection never wedges a turn.
+    """
+
+    async def request(
+        self,
+        req: "GatewayServerRequest",
+        *,
+        timeout_s: float = 120.0,
+    ) -> Optional["GatewayServerReply"]:
+        """Deliver ``req`` to the session's client and await its reply.
+
+        Returns the correlated :class:`GatewayServerReply`, or ``None`` when no
+        reply arrives within ``timeout_s`` (the request is then cleared from the
+        open set so it is not replayed on a later reconnect).
+        """
+        ...
+
+    def open_requests(self, session_id: str) -> List["GatewayServerRequest"]:
+        """Return the still-open (unanswered) requests for ``session_id``."""
         ...
 
 
@@ -3382,6 +4138,150 @@ GatewayIdlePolicy = GatewayIdlePolicyProtocol
 
 
 # ---------------------------------------------------------------------------
+# Gateway freeze-thaw (involuntary host-suspend gap) recovery (Issue #4767)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ThawDecision:
+    """Result of a freeze-thaw (host-suspend gap) evaluation.
+
+    Attributes:
+        suspended: Whether an involuntary host-suspend gap was detected
+            since the previous observation.
+        gap_seconds: Estimated duration the host was frozen (0.0 when not
+            suspended).
+        restart_transports: Whether the wrapper should re-probe / restart
+            outbound channel sockets (idle-gated) because they may be
+            silently half-dead after the freeze.
+        reconcile_schedule: Whether the wrapper should reconcile the
+            scheduler (coalesce missed cron fires) against the gap instead
+            of letting wall-clock catch-up storm on resume.
+    """
+
+    suspended: bool
+    gap_seconds: float = 0.0
+    restart_transports: bool = False
+    reconcile_schedule: bool = False
+
+
+@runtime_checkable
+class ThawPolicyProtocol(Protocol):
+    """Protocol for freeze-thaw (involuntary host-suspend) detection.
+
+    Pure, import-free decision contract consumed by the wrapper's
+    ``BotOS`` run-loop. The wrapper ticks the policy with a matched pair
+    of ``time.monotonic()`` and ``time.time()`` readings; the policy
+    compares the elapsed monotonic delta against the elapsed wall-clock
+    delta and returns a :class:`ThawDecision`. On Linux ``CLOCK_MONOTONIC``
+    does not advance while the host is suspended, so a wall-clock delta
+    that runs far ahead of the monotonic delta is a positive signature of
+    a freeze the process could not otherwise observe. Concrete recovery
+    (restart channel sockets when idle, refresh presence, reconcile the
+    scheduler) lives in the wrapper; this contract keeps the *detection*
+    testable in isolation.
+    """
+
+    def observe(self, *, monotonic_now: float, wall_now: float) -> ThawDecision:
+        """Return a :class:`ThawDecision` for the supplied clock readings."""
+        ...
+
+
+class WallClockGapThawPolicy:
+    """Config-driven default freeze-thaw detector.
+
+    The default referenced by ``gateway.thaw:`` blocks in ``gateway.yaml``
+    and the ``BotOS(..., thaw_policy=...)`` Python surface. It is
+    intentionally minimal and dependency-free so the decision lives in
+    core and is provable in isolation; the wrapper owns the side effects
+    (restart channel sockets, refresh presence, reconcile the scheduler).
+
+    A suspend gap is detected when, between two consecutive
+    :meth:`observe` calls, the wall-clock delta ran ahead of the monotonic
+    delta by more than ``gap_threshold_s`` *and* the monotonic clock itself
+    stayed near-frozen (advanced by no more than one tick plus a small
+    tolerance). Both conditions are the true signature of a frozen host:
+    wall-clock jumps forward while ``CLOCK_MONOTONIC`` stalls. The reported
+    ``gap_seconds`` is the wall-vs-monotonic divergence — the time the host
+    was actually frozen.
+
+    Requiring the monotonic delta to stay near-frozen distinguishes a real
+    host suspend from a forward *wall-clock correction* (NTP step / manual
+    clock set) that occurs while the process is running normally: in the
+    correction case monotonic keeps advancing on schedule, so no recovery
+    is requested and healthy transports/schedule are left untouched.
+
+    The first observation only seeds the baseline and never reports a gap,
+    so the default preserves current behaviour when no freeze occurs.
+
+    Example::
+
+        WallClockGapThawPolicy(tick_interval_s=15.0, gap_threshold_s=60.0)
+    """
+
+    def __init__(
+        self,
+        tick_interval_s: float = 15.0,
+        gap_threshold_s: float = 60.0,
+        enabled: bool = True,
+    ):
+        if tick_interval_s <= 0:
+            raise ValueError(
+                f"tick_interval_s must be > 0, got {tick_interval_s!r}"
+            )
+        if gap_threshold_s <= 0:
+            raise ValueError(
+                f"gap_threshold_s must be > 0, got {gap_threshold_s!r}"
+            )
+        self.tick_interval_s = float(tick_interval_s)
+        self.gap_threshold_s = float(gap_threshold_s)
+        self.enabled = bool(enabled)
+        self._last_monotonic: Optional[float] = None
+        self._last_wall: Optional[float] = None
+
+    def observe(self, *, monotonic_now: float, wall_now: float) -> ThawDecision:
+        if not self.enabled:
+            return ThawDecision(suspended=False)
+
+        prev_monotonic = self._last_monotonic
+        prev_wall = self._last_wall
+        self._last_monotonic = monotonic_now
+        self._last_wall = wall_now
+
+        # First tick only seeds the baseline; nothing to compare against.
+        if prev_monotonic is None or prev_wall is None:
+            return ThawDecision(suspended=False)
+
+        monotonic_delta = monotonic_now - prev_monotonic
+        wall_delta = wall_now - prev_wall
+        # Divergence: how far wall-clock ran ahead of the process's own
+        # elapsed (monotonic) time — i.e. the frozen window.
+        divergence = wall_delta - monotonic_delta
+
+        # A real host suspend freezes CLOCK_MONOTONIC: it stalls, so across
+        # the gap it advances by less than one scheduled tick. A forward
+        # wall-clock *correction* (NTP step / manual set) instead leaves
+        # monotonic advancing in step with the loop — a full tick or more —
+        # proving the process kept running. Requiring monotonic to have
+        # stalled below one tick rejects that false positive so healthy
+        # transports and the scheduler are left untouched.
+        monotonic_frozen = monotonic_delta < self.tick_interval_s
+        gap_detected = (
+            divergence > self.gap_threshold_s
+            and monotonic_frozen
+        )
+        if not gap_detected:
+            return ThawDecision(suspended=False)
+
+        return ThawDecision(
+            suspended=True,
+            gap_seconds=divergence,
+            restart_transports=True,
+            reconcile_schedule=True,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Gateway graceful-drain on shutdown (Issue #2375)
 # ---------------------------------------------------------------------------
 
@@ -3542,6 +4442,14 @@ class GatewayConcurrencyPolicyProtocol(Protocol):
     A config-driven default (:class:`ConcurrencyLimitPolicy`) is provided for
     the common "N concurrent runs, bounded wait queue, declared overflow"
     case.
+
+    On a shared/multi-tenant gateway the decision may additionally be scoped
+    by a tenant/profile token (Issue #5168), mirroring the ``scope`` axis of
+    :class:`RateLimitPolicyProtocol` / :class:`SpendBudgetPolicyProtocol` — the
+    wrapper passes the caller's ``scope`` plus the live per-scope in-flight and
+    queued counts so a single tenant cannot occupy every global slot. When no
+    per-scope sub-limit is configured the scope arguments are ignored and the
+    global-only decision is returned unchanged (backward compatible).
     """
 
     max_concurrent_runs: int
@@ -3553,6 +4461,9 @@ class GatewayConcurrencyPolicyProtocol(Protocol):
         in_flight: int,
         queued: int,
         session_id: str = "",
+        scope: str = "",
+        scope_in_flight: int = 0,
+        scope_queued: int = 0,
     ) -> AdmissionDecision:
         """Return an :class:`AdmissionDecision` for the supplied facts."""
         ...
@@ -3585,10 +4496,18 @@ class ConcurrencyLimitPolicy:
     A ``max_concurrent_runs`` of ``0`` disables admission control entirely
     (today's behaviour: every inbound turn is admitted immediately).
 
+    On a shared/multi-tenant gateway an optional ``max_concurrent_runs_per_scope``
+    caps concurrency *per tenant/scope* within the global ceiling (Issue #5168):
+    a tenant that already holds its sub-limit is queued/shed against its own
+    slice even when a global slot is notionally free, so a noisy neighbour
+    cannot starve quiet tenants. A value of ``0`` (the default) disables the
+    per-scope sub-limit, preserving the byte-for-byte global-only behaviour.
+
     Example::
 
         ConcurrencyLimitPolicy(max_concurrent_runs=32, queue_depth=128,
-                               overflow_policy="reject")
+                               overflow_policy="reject",
+                               max_concurrent_runs_per_scope=4)
     """
 
     _OVERFLOW = ("reject", "queue", "shed_oldest")
@@ -3598,6 +4517,7 @@ class ConcurrencyLimitPolicy:
         max_concurrent_runs: int = 0,
         queue_depth: int = 0,
         overflow_policy: str = "reject",
+        max_concurrent_runs_per_scope: int = 0,
     ):
         try:
             ceiling = int(max_concurrent_runs)
@@ -3624,9 +4544,22 @@ class ConcurrencyLimitPolicy:
                 f"overflow_policy must be one of {self._OVERFLOW}, "
                 f"got {overflow_policy!r}"
             )
+        try:
+            per_scope = int(max_concurrent_runs_per_scope)
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"max_concurrent_runs_per_scope must be an integer, "
+                f"got {max_concurrent_runs_per_scope!r}"
+            )
+        if per_scope < 0:
+            raise ValueError(
+                f"max_concurrent_runs_per_scope must be >= 0, "
+                f"got {max_concurrent_runs_per_scope!r}"
+            )
         self.max_concurrent_runs = ceiling
         self.queue_depth = depth
         self.overflow_policy = overflow
+        self.max_concurrent_runs_per_scope = per_scope
 
     @property
     def enabled(self) -> bool:
@@ -3639,13 +4572,30 @@ class ConcurrencyLimitPolicy:
         in_flight: int,
         queued: int,
         session_id: str = "",
+        scope: str = "",
+        scope_in_flight: int = 0,
+        scope_queued: int = 0,
     ) -> AdmissionDecision:
         # Disabled: preserve legacy always-admit behaviour.
         if self.max_concurrent_runs <= 0:
             return AdmissionDecision.ADMIT
+        # Per-scope fairness (Issue #5168): a tenant already at its sub-limit
+        # is queued/shed against its own slice even when a global slot is free,
+        # so a noisy tenant cannot starve quiet ones. Applied first because it
+        # is the tighter, per-tenant ceiling; the global gate below still caps
+        # aggregate concurrency. ``scope`` must be non-empty for the sub-limit
+        # to apply (an unscoped caller falls through to the global decision).
+        if self.max_concurrent_runs_per_scope > 0 and scope:
+            if scope_in_flight >= self.max_concurrent_runs_per_scope:
+                return self._overflow(scope_queued)
         if in_flight < self.max_concurrent_runs:
             return AdmissionDecision.ADMIT
         # At the ceiling: consult the bounded wait queue.
+        return self._overflow(queued)
+
+    def _overflow(self, queued: int) -> AdmissionDecision:
+        # At a ceiling: queue while the bounded wait queue has room, else apply
+        # the declared overflow behaviour.
         if queued < self.queue_depth:
             return AdmissionDecision.QUEUE
         # Queue is full: declared overflow behaviour.
@@ -4126,6 +5076,193 @@ class SlidingWindowRateLimitPolicy:
 
 # Backward-compatible alias following the repo's ``*Protocol`` convention.
 RateLimitPolicy = RateLimitPolicyProtocol
+
+
+# ---------------------------------------------------------------------------
+# Gateway cost-aware spend-budget admission (Issue #4894)
+#
+# Rate limiting gates on *request count*; a public multi-user gateway also
+# needs to gate on *cumulative cost per identity*. This mirrors
+# :class:`RateLimitPolicyProtocol` exactly — a pure, import-free decision over
+# typed facts (an identity, a scope, the amount already ``spent_usd`` in the
+# window and a timestamp) returning the same closed :class:`RateLimitDecision`.
+# The wrapper supplies ``spent_usd`` from a durable
+# :class:`~praisonaiagents.telemetry.protocols.TokenUsageSinkProtocol`
+# (e.g. :class:`~praisonaiagents.telemetry.durable_sink.SqliteTokenUsageSink`)
+# and consults this policy at the same admit decision as concurrency /
+# rate-limit, *before* the LLM call. Concrete state and storage live outside
+# the decision, keeping it injectable and testable in isolation.
+# ---------------------------------------------------------------------------
+
+
+@runtime_checkable
+class SpendBudgetPolicyProtocol(Protocol):
+    """Protocol for gateway cumulative-spend admission decisions.
+
+    Pure, import-free decision contract symmetric with
+    :class:`RateLimitPolicyProtocol`. The wrapper supplies typed facts — the
+    caller ``identity``, the ``scope`` (channel / tenant token), the amount
+    already ``spent_usd`` for that identity+scope in the current window, the
+    current ``now`` timestamp, and (optionally) the ``pending_usd`` estimated
+    cost of the turn being admitted and the ``oldest_spend_ts`` of the spend in
+    the window — and the policy decides whether the turn is allowed or
+    rejected/throttled with a ``retry_after_seconds`` hint. Storage of the
+    spend ledger lives in a
+    :class:`~praisonaiagents.telemetry.protocols.TokenUsageSinkProtocol`; this
+    contract keeps only the *decision* injectable and provable in isolation.
+
+    A config-driven default (:class:`WindowedSpendBudgetPolicy`) is provided
+    for the common "cap $X per identity per rolling window" case.
+    """
+
+    def check(
+        self,
+        *,
+        identity: str,
+        scope: str,
+        spent_usd: float,
+        now: float,
+        pending_usd: float = 0.0,
+        oldest_spend_ts: Optional[float] = None,
+    ) -> RateLimitDecision:
+        """Return a :class:`RateLimitDecision` for the supplied facts."""
+        ...
+
+
+class WindowedSpendBudgetPolicy:
+    """Config-driven cumulative per-identity spend-budget policy.
+
+    Intended as the default the wrapper will wire onto a forthcoming
+    ``gateway.budget`` config block and a ``spend_budget_policy=`` gateway
+    constructor argument (neither of which exists in the repo yet — this PR
+    ships only the core decision primitive; the CLI/YAML and constructor
+    surfaces are a follow-up wrapper change). It is intentionally minimal and
+    dependency-free so the decision lives in core and is provable in isolation,
+    exactly like :class:`SlidingWindowRateLimitPolicy`.
+
+    The decision, given the amount ``spent_usd`` already accumulated for the
+    identity+scope in the current window and the ``pending_usd`` estimated cost
+    of the turn being admitted:
+
+    * ``allowed`` while ``spent_usd + pending_usd`` is below ``limit_usd``.
+    * Otherwise the turn is denied with a ``retry_after_seconds`` hint equal to
+      the time until enough spend rolls out of the window. When
+      ``oldest_spend_ts`` is supplied the hint is computed precisely
+      (``oldest_spend_ts + window_seconds - now``); without it the policy falls
+      back to the full ``window_seconds`` as a safe upper bound.
+
+    Passing ``pending_usd`` lets a caller reserve budget for the turn's
+    estimated cost *before* the LLM call so a single expensive turn cannot
+    overshoot the cap; leaving it at the default ``0.0`` preserves the simpler
+    "gate on spend so far" behaviour.
+
+    A ``limit_usd`` of ``0`` (or negative) disables the budget entirely (every
+    turn is allowed) — the legacy default when no budget is configured.
+
+    Unlike :class:`SlidingWindowRateLimitPolicy` this policy is *stateless*: the
+    cumulative spend is owned by a durable
+    :class:`~praisonaiagents.telemetry.protocols.TokenUsageSinkProtocol`, so the
+    same budget survives restarts and is shared across processes.
+
+    Example::
+
+        WindowedSpendBudgetPolicy(limit_usd=2.00, window_seconds=86_400)
+    """
+
+    def __init__(
+        self,
+        *,
+        limit_usd: float = 0.0,
+        window_seconds: float = 86_400.0,
+    ):
+        try:
+            limit = float(limit_usd)
+        except (TypeError, ValueError) as err:
+            raise ValueError(
+                f"limit_usd must be a number, got {limit_usd!r}"
+            ) from err
+        try:
+            window = float(window_seconds)
+        except (TypeError, ValueError) as err:
+            raise ValueError(
+                f"window_seconds must be a number, got {window_seconds!r}"
+            ) from err
+        if window <= 0:
+            raise ValueError(
+                f"window_seconds must be > 0, got {window_seconds!r}"
+            )
+        self.limit_usd = limit
+        self.window_seconds = window
+
+    @property
+    def enabled(self) -> bool:
+        """Whether budgeting is active (a positive limit is set)."""
+        return self.limit_usd > 0
+
+    def window_start(self, now: float) -> float:
+        """Start timestamp of the current window for a ``now`` timestamp.
+
+        Helper for the wrapper so it can query the durable sink for
+        ``spent_usd`` over the same window the policy enforces.
+        """
+        return float(now) - self.window_seconds
+
+    def check(
+        self,
+        *,
+        identity: str,
+        scope: str,
+        spent_usd: float,
+        now: float,
+        pending_usd: float = 0.0,
+        oldest_spend_ts: Optional[float] = None,
+    ) -> RateLimitDecision:
+        # Disabled: preserve legacy always-allow behaviour.
+        if self.limit_usd <= 0:
+            return RateLimitDecision(allowed=True)
+        try:
+            spent = float(spent_usd)
+        except (TypeError, ValueError):
+            spent = 0.0
+        try:
+            pending = float(pending_usd)
+        except (TypeError, ValueError):
+            pending = 0.0
+        if pending < 0:
+            pending = 0.0
+        # Reserve budget for the pending turn's estimated cost so a single
+        # expensive turn cannot overshoot the cap before its cost is recorded.
+        if spent + pending < self.limit_usd:
+            return RateLimitDecision(allowed=True)
+        return RateLimitDecision(
+            allowed=False,
+            retry_after_seconds=self._retry_after(now, oldest_spend_ts),
+        )
+
+    def _retry_after(
+        self, now: float, oldest_spend_ts: Optional[float]
+    ) -> float:
+        """Seconds until enough spend rolls out of the rolling window.
+
+        With ``oldest_spend_ts`` the earliest in-window charge expires at
+        ``oldest_spend_ts + window_seconds``; the hint is the time until then,
+        clamped to ``(0, window_seconds]``. Without it, fall back to the full
+        window as a safe upper bound.
+        """
+        if oldest_spend_ts is None:
+            return self.window_seconds
+        try:
+            remaining = (float(oldest_spend_ts) + self.window_seconds) - float(now)
+        except (TypeError, ValueError):
+            return self.window_seconds
+        if remaining <= 0:
+            # Spend has already aged out; retry effectively immediately.
+            return 0.0
+        return min(remaining, self.window_seconds)
+
+
+# Backward-compatible alias following the repo's ``*Protocol`` convention.
+SpendBudgetPolicy = SpendBudgetPolicyProtocol
 
 
 # ---------------------------------------------------------------------------
@@ -4801,6 +5938,308 @@ class RestartLoopGuard:
     def reset(self) -> None:
         """Clear the recorded restart history (e.g. after a clean run)."""
         self._events = []
+
+
+# ---------------------------------------------------------------------------
+# Process-lifecycle record + unclean/OOM classification (Issue #4603)
+#
+# ``RestartLoopGuard`` above tracks the *rate* of restart-worthy boots in
+# memory, and ``classify_exit_reason`` maps a caught exception to an exit code.
+# Neither survives a ``SIGKILL``/OOM-kill — no in-process hook runs for those —
+# so a hosted gateway cannot tell on its next boot that its previous process
+# died uncleanly. These three pure primitives close that gap: a small durable
+# lifecycle *record* the runtime restamps on boot/shutdown, a pure predicate
+# that classifies "was the last exit clean?", and a restart-loop guard whose
+# events load from / flush to an injected durable store so the breaker survives
+# the very death it guards. All I/O — the ``/proc``/cgroup sampling and the
+# durable sentinel — lives in the ``praisonai-bot`` runtime; core stays
+# protocol + pure default policy, symmetric with the block above.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class LifecycleRecord:
+    """Durable, boot-scoped snapshot of the gateway process's lifecycle.
+
+    Written by the runtime at boot (``phase="running"``) and on a graceful stop
+    (``phase="exited"``), with a memory sample folded in by the heartbeat. On
+    the *next* boot the runtime reads the prior record and runs
+    :func:`classify_unclean_exit`: a record still marked ``running`` means the
+    previous process never reached its graceful-stop path — an unclean exit,
+    and (given a high last memory sample) a suspected OOM-kill.
+
+    Pure and JSON-round-trippable so both the durable store and the health
+    surface share one shape; the wrapper owns persistence.
+
+    Attributes:
+        phase: ``"running"`` | ``"draining"`` | ``"exited"`` — the last phase
+            the process recorded for itself.
+        exit_kind: ``"clean"`` | ``"unclean"`` | ``"unknown"`` — set by
+            :func:`classify_unclean_exit` on the *next* boot (never
+            ``"unknown"``-treated-as-healthy downstream).
+        suspected_oom: ``True`` when an unclean exit coincided with a high last
+            memory sample (memory pressure at death).
+        last_mem_fraction: Last sampled memory-budget fraction in ``[0, 1]``, or
+            ``None`` when the platform could not report it.
+        restart_events: Persisted monotonic-independent wall-clock timestamps of
+            restart-worthy boots, for :class:`PersistentRestartLoopGuard`.
+    """
+
+    phase: Literal["running", "draining", "exited"] = "running"
+    exit_kind: Literal["clean", "unclean", "unknown"] = "unknown"
+    suspected_oom: bool = False
+    last_mem_fraction: Optional[float] = None
+    restart_events: List[float] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to a JSON-serializable dict for the durable sentinel."""
+        return {
+            "phase": self.phase,
+            "exit_kind": self.exit_kind,
+            "suspected_oom": self.suspected_oom,
+            "last_mem_fraction": self.last_mem_fraction,
+            "restart_events": list(self.restart_events),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Optional[Mapping[str, Any]]) -> "LifecycleRecord":
+        """Rebuild from a persisted dict, tolerating partial/legacy shapes."""
+        if not isinstance(data, Mapping):
+            return cls()
+
+        phase = data.get("phase")
+        if phase not in ("running", "draining", "exited"):
+            phase = "running"
+        exit_kind = data.get("exit_kind")
+        if exit_kind not in ("clean", "unclean", "unknown"):
+            exit_kind = "unknown"
+
+        frac = data.get("last_mem_fraction")
+        try:
+            frac_val: Optional[float] = None if frac is None else float(frac)
+        except (TypeError, ValueError):
+            frac_val = None
+
+        raw_events = data.get("restart_events") or []
+        events: List[float] = []
+        if isinstance(raw_events, (list, tuple)):
+            for item in raw_events:
+                try:
+                    events.append(float(item))
+                except (TypeError, ValueError):
+                    continue
+
+        return cls(
+            phase=phase,  # type: ignore[arg-type]
+            exit_kind=exit_kind,  # type: ignore[arg-type]
+            suspected_oom=bool(data.get("suspected_oom", False)),
+            last_mem_fraction=frac_val,
+            restart_events=events,
+        )
+
+
+def classify_unclean_exit(
+    prev: Optional[LifecycleRecord],
+    *,
+    oom_fraction: float = 0.9,
+) -> LifecycleRecord:
+    """Classify the previous boot's exit and return a fresh boot record (pure).
+
+    Given the record persisted by the *previous* process, decide whether that
+    process exited cleanly and stamp a new ``phase="running"`` record for *this*
+    boot. Side-effect free so it is provable in isolation, mirroring
+    :func:`classify_exit_reason`.
+
+    Rules:
+
+    * No prior record ⇒ first boot / fresh store: ``exit_kind="unknown"`` (the
+      caller must never treat ``"unknown"`` as healthy, but there is nothing to
+      resume).
+    * Prior ``phase == "exited"`` ⇒ the previous process reached its graceful
+      stop: ``exit_kind="clean"``.
+    * Prior ``phase in ("running", "draining")`` ⇒ the previous process died
+      before recording a clean exit (SIGKILL/OOM/segfault/orchestrator kill):
+      ``exit_kind="unclean"``, and ``suspected_oom`` when its last memory sample
+      was at/above ``oom_fraction`` of the budget.
+
+    The returned record carries forward the prior ``restart_events`` so the
+    persistent restart-loop guard sees the full cross-boot history.
+
+    Args:
+        prev: The previous process's persisted :class:`LifecycleRecord`, or
+            ``None`` on a fresh store.
+        oom_fraction: Memory-budget fraction at/above which an unclean exit is
+            flagged as a suspected OOM-kill.
+
+    Returns:
+        A fresh ``phase="running"`` :class:`LifecycleRecord` for this boot.
+    """
+    carried = list(prev.restart_events) if prev is not None else []
+    if prev is None:
+        return LifecycleRecord(
+            phase="running", exit_kind="unknown", restart_events=carried
+        )
+    if prev.phase == "exited":
+        return LifecycleRecord(
+            phase="running", exit_kind="clean", restart_events=carried
+        )
+    # Still "running"/"draining" in the prior record ⇒ never reached graceful stop.
+    frac = prev.last_mem_fraction
+    suspected_oom = frac is not None and frac >= oom_fraction
+    return LifecycleRecord(
+        phase="running",
+        exit_kind="unclean",
+        suspected_oom=suspected_oom,
+        last_mem_fraction=frac,
+        restart_events=carried,
+    )
+
+
+@runtime_checkable
+class RestartStoreProtocol(Protocol):
+    """Durable-store contract for cross-boot restart timestamps (Issue #4603).
+
+    The pure decision (:class:`PersistentRestartLoopGuard`) lives in core; the
+    wrapper injects a concrete store that reads/writes the timestamps to a small
+    sentinel file. Both methods are best-effort: an implementation that cannot
+    reach its backing store returns ``[]`` from :meth:`load_events` and silently
+    drops :meth:`save_events`, so the breaker degrades to in-memory behaviour
+    rather than crashing the gateway it protects.
+    """
+
+    def load_events(self) -> List[float]:
+        """Return the persisted restart timestamps (``[]`` when unavailable)."""
+        ...
+
+    def save_events(self, events: List[float]) -> None:
+        """Persist the restart timestamps (best-effort, never raises)."""
+        ...
+
+
+class PersistentRestartLoopGuard(RestartLoopGuard):
+    """A :class:`RestartLoopGuard` whose events survive a process restart.
+
+    The in-memory guard is reconstructed fresh on every boot, so a persisted
+    turn that hard-crashes the *whole* process (OOM, segfault) can drive an
+    infinite ``supervisor → boot → auto-resume → crash`` loop the breaker never
+    sees. This subclass loads its event history from an injected
+    :class:`RestartStoreProtocol` at construction and flushes back on every
+    mutation, so the breaker observes the true cross-boot restart rate and can
+    trip on a crash cycle *slower* than a single in-process window.
+
+    The window defaults to one hour (vs. the in-process 60s) because a
+    cross-boot crash loop is paced by process (re)start latency, not by an
+    in-loop retry. Pure decision preserved: all persistence is delegated to the
+    injected store, so the trip logic remains provable in isolation.
+
+    Example::
+
+        guard = PersistentRestartLoopGuard(store, max_restarts=3,
+                                           window_seconds=3600)
+        if guard.record(now=time.time()):
+            # too many restart-interrupted boots — stop auto-resuming the turn
+            ...
+    """
+
+    def __init__(
+        self,
+        store: RestartStoreProtocol,
+        *,
+        max_restarts: int = 3,
+        window_seconds: float = 3600.0,
+    ):
+        super().__init__(max_restarts=max_restarts, window_seconds=window_seconds)
+        self._store = store
+        try:
+            loaded = store.load_events()
+        except Exception:
+            loaded = []
+        if loaded:
+            self._events = [float(t) for t in loaded]
+
+    def _flush(self) -> None:
+        try:
+            self._store.save_events(list(self._events))
+        except Exception:
+            pass
+
+    def record(self, now: float) -> bool:
+        """Record a restart at wall-clock ``now`` and flush to the store.
+
+        Unlike the base class this expects a *wall-clock* timestamp
+        (``time.time()``), because a monotonic clock resets across process
+        boots and would make persisted events meaningless.
+        """
+        tripped = super().record(now)
+        self._flush()
+        return tripped
+
+    def reset(self) -> None:
+        """Clear the history in memory *and* in the durable store."""
+        super().reset()
+        self._flush()
+
+
+def classify_resource_pressure(
+    *,
+    mem_fraction: Optional[float] = None,
+    disk_free_mb: Optional[float] = None,
+    mem_elevated: float = 0.75,
+    mem_critical: float = 0.9,
+    disk_min_free_mb: float = 512.0,
+) -> Dict[str, str]:
+    """Classify coarse memory + disk pressure for the health surface (pure).
+
+    A tiny, redaction-safe classifier that folds the wrapper's ``/proc``/cgroup
+    memory-budget fraction and free-disk sample into a closed ``ok`` /
+    ``elevated`` / ``critical`` / ``unknown`` vocabulary. Lives in core so the
+    SDK and the bot classify identically; the wrapper owns the sampling.
+
+    ``unknown`` is returned when a signal is missing and — per the issue — must
+    never be treated as healthy by callers (it is deliberately *not* ``ok``).
+
+    Args:
+        mem_fraction: Anonymous-RSS / memory-budget fraction in ``[0, ∞)``, or
+            ``None`` when the platform has no cgroup limit to report against.
+        disk_free_mb: Free disk headroom in MiB for the gateway's state dir, or
+            ``None`` when it could not be sampled.
+        mem_elevated: Fraction at/above which memory is ``"elevated"``.
+        mem_critical: Fraction at/above which memory is ``"critical"``.
+        disk_min_free_mb: Free-MiB floor below which disk is ``"critical"``;
+            ``"elevated"`` below twice that.
+
+    Returns:
+        ``{"memory": <level>, "disk": <level>}`` with values drawn from the
+        closed vocabulary above.
+    """
+
+    def _mem(frac: Optional[float]) -> str:
+        if frac is None:
+            return "unknown"
+        try:
+            f = float(frac)
+        except (TypeError, ValueError):
+            return "unknown"
+        if f >= mem_critical:
+            return "critical"
+        if f >= mem_elevated:
+            return "elevated"
+        return "ok"
+
+    def _disk(free_mb: Optional[float]) -> str:
+        if free_mb is None:
+            return "unknown"
+        try:
+            mb = float(free_mb)
+        except (TypeError, ValueError):
+            return "unknown"
+        if mb < disk_min_free_mb:
+            return "critical"
+        if mb < disk_min_free_mb * 2:
+            return "elevated"
+        return "ok"
+
+    return {"memory": _mem(mem_fraction), "disk": _disk(disk_free_mb)}
 
 
 class FleetSupervisionPolicy:
@@ -6261,12 +7700,80 @@ def resolve_required_scope(
 
     Default-deny: an unclassified/unknown method requires ``ADMIN`` so new
     control surface is closed until explicitly classified — the omission fails
-    **closed** rather than open.
+    **closed** rather than open. A non-string (or unhashable) ``method`` is
+    likewise treated as unclassified and requires ``ADMIN``, so a malformed
+    frame fails closed deterministically instead of raising ``TypeError``.
     """
+    if not isinstance(method, str):
+        return OperatorScope.ADMIN
     desc = GATEWAY_METHODS.get(method)
     if desc is None:
         return OperatorScope.ADMIN
     return desc.resolve(params)
+
+
+class GatewayUnauthorized(PermissionError):
+    """Raised when a caller lacks the scope a gateway method requires.
+
+    Carries the ``method`` and the ``required`` scope so the dispatcher can
+    render a structured, machine-readable denial (matching today's
+    ``insufficient scope`` envelope) without re-deriving either.
+    """
+
+    def __init__(self, method: str, required: OperatorScope) -> None:
+        self.method = method
+        self.required = required
+        super().__init__(
+            f"method {method!r} requires scope {required.value!r}"
+        )
+
+
+def _scope_satisfies(
+    held: "Set[OperatorScope]", required: OperatorScope
+) -> bool:
+    """Whether the ``held`` scopes satisfy ``required``.
+
+    Two implication rules, matching the wrapper's long-standing behaviour so
+    wiring the registry into dispatch does not regress already-classified
+    methods:
+
+    - ``ADMIN`` implies every scope (top of the lattice).
+    - ``READ`` is the baseline lifecycle/observation scope that every
+      authorised operator implicitly holds. An operator provisioned with any
+      actionable scope (``WRITE``/``APPROVALS``/``PAIRING``/``ADMIN``) can
+      therefore still complete the READ-classified session lifecycle
+      (``hello``/``join``/``leave``/status) — exactly as it could before this
+      guard existed, when those frames carried no per-endpoint scope check.
+
+    Otherwise a caller is authorised only when it holds the exact required
+    scope.
+    """
+    if OperatorScope.ADMIN in held:
+        return True
+    if required == OperatorScope.READ:
+        # Any authorised operator (holding at least one scope) may perform the
+        # read-only lifecycle/observation surface.
+        return bool(held)
+    return required in held
+
+
+def authorize_method(
+    method: str,
+    client_scopes: "Set[OperatorScope]",
+    params: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Central, default-deny authorisation gate for a gateway method.
+
+    Resolves the required scope from the single source of truth
+    (:func:`resolve_required_scope`) — so an unclassified/plugin-registered
+    method is ``ADMIN``-only by omission rather than reachable ungated — and
+    raises :class:`GatewayUnauthorized` when ``client_scopes`` do not satisfy
+    it. Dispatch calls this once, centrally, instead of scattering per-endpoint
+    checks that can drift from the registry.
+    """
+    required = resolve_required_scope(method, params)
+    if not _scope_satisfies(set(client_scopes), required):
+        raise GatewayUnauthorized(method=method, required=required)
 
 
 # Core method classification. Registered once at import so the dispatcher can
@@ -6283,10 +7790,21 @@ def _register_core_gateway_methods() -> None:
         "leave": OperatorScope.READ,
         "agent.message": OperatorScope.WRITE,
         "message": OperatorScope.WRITE,
-        # Aborting a turn mutates it, so it carries the same scope as sending one.
+        # Aborting a turn mutates it, so it carries the same scope as sending
+        # one. The wire also accepts the ``message_abort`` event-type alias for
+        # the same action, so both names carry the WRITE scope in lockstep.
         "abort": OperatorScope.WRITE,
+        "message_abort": OperatorScope.WRITE,
+        # Issue #5351: answering a server→client interactive request (approval /
+        # choice / input) on behalf of the blocked turn mutates it, so it needs
+        # the same WRITE scope as sending a message.
+        "server_reply": OperatorScope.WRITE,
         "session.status": OperatorScope.READ,
         "session.transcript": OperatorScope.READ,
+        # Resolve a friendly reference (short id / slug / label / ``main``
+        # sentinel, optionally agent-scoped) to a concrete session id (Issue
+        # #5383). Read-only lookup: it reveals no more than session.status.
+        "session.resolve": OperatorScope.READ,
         "approvals.resolve": OperatorScope.APPROVALS,
         "pairing.approve": OperatorScope.PAIRING,
         "pairing.revoke": OperatorScope.PAIRING,
@@ -6492,3 +8010,77 @@ class FileEmergencyStop:
             # JSON object with a non-numeric ``at`` (e.g. a list) raises
             # TypeError from ``float()`` and must also fail-safe engaged.
             return EmergencyStopState(engaged=True, reason="unreadable-sentinel")
+
+
+# ---------------------------------------------------------------------------
+# Per-session stop scope (Issue #5129)
+# ---------------------------------------------------------------------------
+#
+# The existing stop primitives cover the two ends of the spectrum: per-turn
+# (``agent/interrupt.py:InterruptController`` cancels the *running* turn) and
+# global (``EmergencyStop*`` above, an operator-wide brake for the *whole*
+# gateway). Neither owns the middle case a chat-first gateway hits constantly:
+# a single conversation's *queued-but-not-yet-started* backlog. A user fires
+# several messages, the agent is mid-turn, the user types "stop" — the running
+# turn halts but the leftover queue is still executed.
+#
+# ``StopScope`` is the missing pure vocabulary: it names whether a stop owns
+# just the in-flight turn (``TURN``, the back-compat default) or the whole
+# session — the running turn *and* its pending ingress (``SESSION``). It is a
+# decision primitive only; the inbox drain itself lives in the gateway/bot
+# implementation that owns the queue.
+
+
+class StopScope(str, Enum):
+    """How much of a session's work a stop owns.
+
+    ``TURN`` cancels only the running turn (today's behaviour; default for
+    backward compatibility). ``SESSION`` cancels the running turn *and* drains
+    the session's queued-but-unstarted ingress so no backlogged message is
+    executed after the stop.
+    """
+
+    TURN = "turn"
+    SESSION = "session"
+
+    @classmethod
+    def coerce(cls, value: Any, default: "StopScope" = None) -> "StopScope":
+        """Best-effort parse of an external ``scope`` value.
+
+        Accepts a ``StopScope``, its string value (case-insensitively), or a
+        boolean/None ``stop_cancels_pending`` style flag. Unknown values fall
+        back to ``default`` (``TURN`` when unset) so a malformed scope never
+        escalates a stop beyond the caller's intent.
+        """
+        fallback = cls.TURN if default is None else default
+        if isinstance(value, cls):
+            return value
+        if isinstance(value, bool):
+            return cls.SESSION if value else cls.TURN
+        if value is None:
+            return fallback
+        try:
+            return cls(str(value).strip().lower())
+        except ValueError:
+            return fallback
+
+
+@dataclass(frozen=True)
+class StopResult:
+    """Outcome of a scoped stop, reported to the requesting client.
+
+    ``pending_cancelled`` is a visible, intentional non-outcome: the count of
+    queued messages drained by a ``SESSION`` stop, never silently dropped. For
+    a ``TURN`` stop it is always ``0``.
+    """
+
+    scope: StopScope
+    turn_aborted: bool
+    pending_cancelled: int = 0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "scope": self.scope.value,
+            "turn_aborted": self.turn_aborted,
+            "pending_cancelled": self.pending_cancelled,
+        }

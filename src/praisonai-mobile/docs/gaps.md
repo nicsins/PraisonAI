@@ -8,19 +8,23 @@ fact rather than something a reader has to infer from a `false` in a struct.
 
 ### The one root cause
 
-Upstream `Agent.streamEvents()` emits a three-variant union:
+Upstream `Agent.streamEvents()` emits a five-variant union:
 
 ```ts
 type AgentEvent =
-  | { type: 'text';   delta: string }
-  | { type: 'finish'; text: string }
-  | { type: 'error';  error: Error }
+  | { type: 'text';        delta: string }
+  | { type: 'tool_call';   callId: string; name: string; args: Record<string, unknown> }
+  | { type: 'tool_result'; callId: string; name: string; ok: boolean; output: string }
+  | { type: 'finish';      text: string }
+  | { type: 'error';       error: Error }
 ```
 
-Protocol v2 has **eleven** events. Nothing in the upstream channel carries a
-tool call, a tool result, an approval request, reasoning, or usage — so this
-engine cannot produce them, and the five conformance scenarios below are
-declared unsupported rather than faked.
+Protocol v2 has **eleven** events. The channel now carries tool calls and
+results, so this engine reports tool activity. What it still cannot carry is an
+approval request, reasoning, or usage — so the `two_approvals` conformance
+scenario below is declared unsupported rather than faked. (`approval` is *not*
+unsupported: its case only decides an unknown id, which needs no approval
+channel — see the note under the table.)
 
 ### What that means per capability
 
@@ -29,11 +33,17 @@ declared unsupported rather than faked.
 | `streaming` | `true` | `text` deltas map straight to `delta`. |
 | `cancellation` | `true` | Via `AgentStreamOptions.signal` (added upstream in #4426). |
 | `reasoning` | `false` | No reasoning channel upstream. |
-| `tools` | **`false`** | See the note below — this one is easy to misread. |
+| `tools` | **`true`** | Since upstream gained `tool_call`/`tool_result`. Was false — see the note below. |
 | `approvals` | `false` | `ApprovalManager` exists upstream but cannot reach the event channel. |
 | `attachments` | `false` | `streamEvents` takes a prompt string only. |
 
-**`tools: false` does not mean tools do not run.** praisonai-ts executes tools
+**RESOLVED.** Upstream now emits `tool_call` and `tool_result`, so the flag is
+`true` and three conformance scenarios that were declared unsupported
+(`tool_ok`, `tool_failed`, `tool_unresolved`) are produced and passing. The
+original note is kept below because the reasoning is what made the flag
+trustworthy in the first place.
+
+**`tools: false` did not mean tools do not run.** praisonai-ts executes tools
 normally; it just never *announces* them. The flag describes what the engine can
 **report**, because a UI that renders tool rows from a `true` flag would render
 nothing and look broken. A tool call that silently failed would then be
@@ -44,21 +54,27 @@ indistinguishable from a normal answer — which is the exact defect protocol v2
 
 | Scenario | Reason |
 |---|---|
-| `tool_ok` | no `tool_call`/`tool_result` variant upstream |
-| `tool_failed` | no `tool_result`, so `ok: false` cannot be reported |
-| `tool_unresolved` | no `tool_call`, so there is no row to leave unresolved |
-| `approval` | `ApprovalManager` cannot reach the event channel |
-| `two_approvals` | same as `approval` |
+| `two_approvals` | `ApprovalManager` gates tool execution upstream but its prompt cannot reach the event channel, so two `approval_request` events cannot be emitted |
 
-The suite prints every one of these on each run, so a contract that quietly
-shrinks is visible in the output rather than silently green.
+`tool_ok`, `tool_failed` and `tool_unresolved` were listed here until upstream
+gained `tool_call`/`tool_result`; they are now produced and passing. The suite
+prints every remaining omission on each run, so a contract that quietly shrinks
+is visible in the output rather than silently green.
 
-### Closing the gap
+`approval` was also listed here until it was confirmed dead: that case only
+asserts that deciding an *unknown* id returns `false`, which this engine's
+`decide()` always does — it needs no approval channel. Declaring it unsupported
+skipped a case that already passed, so it now runs. `capabilities.approvals`
+stays `false`: the engine still cannot *emit* an approval request, which is what
+`two_approvals` needs.
 
-This needs an upstream change: `AgentEvent` gaining tool and approval variants,
-mirroring Python's `StreamEventType` (17 members). Until then the mobile app
-either runs without tool visibility, or uses the `remote-http` engine — which
-speaks the full vocabulary because the desktop server already emits it.
+### Closing the remaining gap
+
+Approvals need a further upstream change: `AgentEvent` gaining an approval
+variant, mirroring Python's `StreamEventType` (17 members). Until then the
+mobile app either runs without approval prompts, or uses the `remote-http`
+engine — which speaks the full vocabulary because the desktop server already
+emits it.
 
 ## Node-only globals on the Agent import graph
 
@@ -120,13 +136,13 @@ paragraphs it ran between, and only the LAST text block streams (an earlier one
 was closed by the tool call after it, and a caret on it would claim two places
 are being written at once).
 
-### 2. `settle()` empties `approvals`, so an ended turn cannot show what was approved
+### ~~2. `settle()` empties `approvals`, so an ended turn cannot show what was approved~~ — CLOSED
 
 Right for actionability — a settled approval is not pressable — but wrong as an
 audit trail: after the turn ends the transcript can never say "you allowed
 `rm -rf /`". A `resolved: true` flag kept on the entry would give the UI both.
 
-### 3. `PendingApproval` and `ApprovalEntry` are the same four fields in two places
+### ~~3. `PendingApproval` and `ApprovalEntry` are the same four fields in two places~~ — CLOSED
 
 `transcript.ts` and `approvals.ts` each declare them, so the view model joins by
 `approvalId` at render time. Making `ApprovalEntry` literally
@@ -134,29 +150,394 @@ audit trail: after the turn ends the transcript can never say "you allowed
 future author reintroduces index-pairing, which is the bug the whole
 `approvalId` design exists to prevent.
 
-### 4. There is no user-message side, and no stable identity for a live turn
+### ~~4. There is no user-message side, and no stable identity for a live turn~~ — CLOSED
 
 `TurnState` is assistant-only; `StoredChat.messages` has a different shape
 (`role`/`content`/`at`). `end.userIndex` is the only link and it is `null` until
 the turn ends, so a live turn cannot be keyed the same way before and after
-persistence. **This stitching is currently owned by no layer** — it needs to
-land in the composition root or in `core/`, deliberately, before two callers
-invent two different answers.
+persistence.
 
-### 5. `ShellPort` exposes `insets` synchronously but the keyboard only by callback
+The join now has an owner: `core/src/chat/session.ts` implements
+`RunPersistence` and is where `end.userIndex` is produced by whatever really did
+the write. But it is **not yet wired into the run loop**: `createPraisonTsEngine`
+is the only engine that takes a `RunPersistence`, and it is constructed with one
+only in its tests — `boot.ts` builds the `session` and never hands it to an
+engine, and the `remote-http` engine has no persistence at all. So a completed
+turn is still not written to disk in production, and the live-turn identity the
+gap is about is still not stable end-to-end. Closing this needs the composition
+root to pass `session` as the praisonai-ts engine's persistence, and a persist
+step for `remote-http`.
+
+### ~~5. `ShellPort` exposes `insets` synchronously but the keyboard only by callback~~ — CLOSED
 
 First paint therefore has to assume height 0. Correct on a cold launch, wrong on
 a warm resume with a hardware or floating keyboard already up: one wrong frame,
 then a jump — the exact "web page in a box" tell the synchronous `insets`
-snapshot was introduced to avoid. A `readonly keyboardHeightPx: number` would
-apply the reasoning already written into that port to its sibling event.
+snapshot was introduced to avoid.
 
-### 6. `SettingsFacade` cannot enumerate or observe
+`ShellPort` now carries a synchronous `readonly keyboardHeightPx: number`, so a
+component can *read* the current height at mount instead of waiting for the first
+callback. But the value is not seeded the way `insets` is: both `createWebShell`
+and `createTauriShell` initialise `keyboardHeightPx = 0` and only correct it on a
+later `resize`/`keyboard-height` event, whereas `insets` is seeded synchronously
+from the mirrored CSS custom properties (`readInsets(source)` in the Tauri shell,
+before anything can paint). So a warm resume with the keyboard already up still
+reads 0 on the first frame and jumps — the exact behaviour this entry is about.
+Closing it needs each adapter to seed `keyboardHeightPx` from a synchronous
+source at construction, mirroring what `insets` already does.
+
+### ~~6. `SettingsFacade` cannot enumerate or observe~~ — CLOSED
 
 No `keys()`, no change notification, and `SettingDef[]` is not reachable from
 the facade — so a settings screen must hard-code the key list that already
 exists as data, and re-render blindly after every `set()`.
 
-### 7. `Dropped.reason` has no user-facing text
+### ~~7. `Dropped.reason` has no user-facing text~~ — CLOSED
 
 The diagnostic row renders raw reason strings. Honest, but not readable.
+
+
+---
+
+# Why this file gets audited, not just appended to
+
+A re-audit of the gaps above found the first draft of this section had made the
+very error it warns about: it recorded three gaps as closed when only one (Gap
+6) was, and the other two had landed a mechanism without the wiring that would
+actually close them. That is not a filing problem, it is the same failure this
+package is built against, one level up: **a document asserting a state nobody
+re-checked** — including the check that a "closed" gap is closed *end-to-end*
+and not just given a type or a function nothing calls.
+
+It has a cost. A stale P0 list for `praisonai-ts` sent two agents to verify
+nine "blockers" that were every one of them already fixed — useful work, since
+it turned up three real bugs nobody had listed, but not the work it was
+supposed to be.
+
+So the rule for this file: **when a gap closes, close it here in the same
+commit that closes it — and a gap is closed only when it is wired end-to-end,
+not when the mechanism exists.** And when reading it, verify before believing.
+Every claim below is checkable in under a minute.
+
+## What closed, and what only half-closed
+
+The re-audit found one gap fully closed and two that landed a mechanism without
+finishing the wiring — recorded here as such rather than as closed, because a
+half-closed gap read as closed is exactly the stale claim this file exists to
+prevent.
+
+- **Gap 6 — CLOSED.** `defs()`, `subscribe()`, `setSecret()` and `clearSecret()`
+  on the facade (`core/src/settings/store.ts`). `subscribe` fires only after an
+  *accepted* write; notifying on a refused one makes a screen redraw a value the
+  user did not manage to change. A settings screen can now enumerate and observe
+  from the facade alone.
+- **Gap 4 — mechanism landed, not wired.** `core/src/chat/session.ts` implements
+  `RunPersistence` and owns the join between the assistant-only `TurnState` and
+  the two-sided `StoredChat`. But no engine is constructed with it in
+  production: `createPraisonTsEngine` is the only one that takes a
+  `RunPersistence` and gets one only in its tests, `boot.ts` never hands the
+  `session` to an engine, and `remote-http` has no persistence at all. The join
+  exists; the turn is still not recorded end-to-end.
+- **Gap 5 — property added, snapshot not seeded.** `ShellPort.keyboardHeightPx`
+  is readable synchronously, but both shell adapters initialise it to 0 and only
+  correct it on a later event, so — unlike `insets`, which is seeded from CSS
+  before first paint — a warm resume with the keyboard up still paints once at 0
+  and jumps.
+
+## Genuinely still open
+
+Gaps **2**, **3**, **4**, **5** and **7** above. None blocks shipping:
+
+- **2** is an audit-trail nicety — a settled approval cannot be shown after the
+  turn ends.
+- **3** is a duplicated four-field type, and worth closing because the join it
+  forces at render time is exactly where index-pairing gets reintroduced.
+- **4** has its join owner in place but is unwired in the composition root, so
+  turns are not yet persisted in production.
+- **5** has its synchronous property in place but no synchronous seed, so the
+  warm-resume keyboard jump it targets is not yet prevented.
+- **7** renders raw reason enums to a user.
+
+Also open, and larger than any of them: **route→view dispatch** (the view models
+exist and nothing mounts them) and the **Tauri Rust crate**. Neither is a gap in
+the sense this file records — they are unbuilt work, not defects.
+
+
+## Gaps 4 and 5, actually closed this time
+
+A reviewer amended both of these back to open after I marked them closed, and
+was right to. The corrections are worth keeping, because both are the same
+mistake: **a mechanism existing is not the same as a mechanism working.**
+
+- **Gap 4 was "MECHANISM LANDED, NOT WIRED".** `createSession` was called and
+  `RunPersistence.record` was called, and nothing connected them -- the two
+  signatures did not even line up (`record(prompt, answer)` against
+  `record(request, answer)`), which is why nobody had noticed. So no
+  conversation was ever written, and the gap read as closed from either end.
+  `persistenceFor()` is now the named adapter where the two vocabularies meet,
+  and `AppDeps.engines` is a FACTORY taking the persistence -- so there is no
+  longer a way to obtain the engine list without being handed the thing engines
+  write through. Enforced by the type, not by a comment.
+
+  SCOPE, stated so it is not read later as an oversight: only the in-process
+  `praisonai-ts` engine writes through this session. `remote-http` deliberately
+  does not, because the desktop server it talks to is the owner of that write
+  and the only thing that can report authoritative indices for its own store
+  (registry.ts). A reviewer flagged that a turn answered by the default remote
+  engine therefore leaves the *local* mobile session empty; that is true and
+  intended -- local mirroring of a server-owned transcript is a separate feature
+  (it needs a read-back from the server on connect), not part of closing this
+  wiring gap. What this gap was about -- the in-process engine's turn never
+  reaching disk -- is now closed and asserted end to end.
+
+- **Gap 5 was "PROPERTY ADDED, SNAPSHOT NOT SEEDED".** `keyboardHeightPx` was
+  declared `= 0` and only ever updated by an event, so a component mounting
+  while the keyboard was already up laid out at 0 for one frame and then
+  jumped -- exactly the bug the synchronous property was added to prevent. It
+  is seeded from `visualViewport` at construction now.
+
+Both are verified by a positive control: reverting either makes a named test
+fail.
+
+
+## Gaps 2, 3 and 7, closed
+
+The last three. None blocked shipping, which is exactly why they sat — and two
+of them were one bad day away from mattering.
+
+- **Gap 2.** `settle()` deleted the approvals, so a finished transcript could
+  never say *"you were asked to allow `rm -rf /` and the turn ended first"* —
+  the thing a reader most wants to see afterwards. They are kept now and marked
+  `resolved`, which means *not actionable* rather than *not recorded*. The pair
+  test matters here: marking everything resolved would satisfy the audit-trail
+  case while making every live prompt unanswerable.
+
+- **Gap 3.** `ApprovalEntry` is now literally `PendingApproval & { state }`
+  rather than a second copy of the same four fields. The duplication forced the
+  view model to join them by `approvalId` at render time, and **that join is
+  where index-pairing gets reintroduced** — pairing an approval by position is
+  the defect the whole `approvalId` design exists to prevent.
+
+  **Correction.** This entry used to end "Removing the join removes the
+  opportunity." The join was never removed — only the *type* duplication was.
+  `view-model.ts` still calls `findApproval(table, pending.approvalId)`, and
+  replacing that with `table.entries[0]` passed the entire suite, because every
+  test had exactly one approval in flight. With two outstanding, the second row
+  rendered the first's decision: an `rm -rf /` prompt shown as already-allowed,
+  against a decision nobody made. The join is correct and is now pinned by two
+  tests in both directions. The opportunity still exists; what changed is that
+  taking it now fails.
+
+- **Gap 7.** A dropped event said `wrong_msg_id` to a user, which tells them
+  nothing. It now reads as a sentence *and* keeps the tag: translating the tag
+  away would make the one searchable string in the message unsearchable for
+  whoever they report it to. An unknown tag passes through rather than becoming
+  "unknown reason", because a newer engine can invent one and the tag is still
+  the only information there.
+
+Each verified by reverting it: emptying the approvals again fails 2 tests,
+returning bare tags fails 3.
+
+**Every gap originally recorded in this file is closed.** That is a narrower
+claim than the one this line used to make, and the difference is the point: a
+later multi-agent validation pass found fourteen mutation survivors and three
+product defects that no test could reach, none of which were "gaps" in the
+sense this file was recording. A file that lists closed gaps is not evidence
+that nothing is wrong.
+
+Corrected since: this line used to say what remained was "the Tauri Rust
+crate". The crate exists — `src-tauri/src/{lib,commands,main}.rs`, the shell
+module and two test files — with a CI job that compiles it on Linux and macOS.
+It also used to omit **route→view dispatch**, which the body of this file lists
+as open and which is still open; dropping it from the closing line implied it
+had landed.
+
+## The publish gate was wired and unreachable — CLOSED
+
+`core/src/pacing/publish-gate.ts` is a verbatim port of the desktop's
+stream-pacing, with two constants tightened deliberately for mobile
+(`MAX_HELD_CHARS = 96`, `UNPAINTED_REOPEN_MS = 200`). It WAS called --
+`controller.ts` had `if (frames.length > 0 && gate(streamed)) publish()` -- but
+in the shipped pipeline that condition was almost never true, so neither
+constant affected anything.
+
+The reason was the coalescer's flush tick, added to fix answers arriving in one
+lump. The tick drains the coalescer every `maxDelayMs`, so by the time a delta
+arrives `push()` usually returns `[]` and the gate was not consulted at all. The
+tick's own publish was ungated, on the reasoning that its frame "exists
+precisely because nothing has painted recently."
+
+Measured by driving the real controller with a virtual clock and counting
+whether the gate was consulted even once (it calls `requestFrame` on its first
+invocation, so the count is exact rather than inferred):
+
+| tokens/sec | publishes for 2000 tokens | gate consulted (before) |
+|-----------:|--------------------------:|:------------------------|
+|         20 |                      2004 | no                      |
+|         60 |                      2004 | no                      |
+|        150 |                       670 | no                      |
+|        400 |                       289 | no                      |
+|       1600 |                        80 | no                      |
+|       3200 |                        42 | YES                     |
+|       8000 |                        42 | YES                     |
+
+The threshold was where 256 bytes land inside a single 16ms window. Real model
+streaming is 20-150 tokens/sec, so the gate was unreachable in practice.
+
+This was not a live defect: paints stayed bounded by time (20-38/sec observed).
+But two things followed from it. There was no backpressure path at all -- the
+gate is the mechanism that notices the renderer cannot keep up, and it never
+ran. And a module with its own tuned constants that never executes reads as
+load-bearing to the next person who changes pacing.
+
+**CLOSED by wiring, not deletion.** The flush tick now publishes THROUGH the
+gate: `if (gate(streamed)) publish()`. The old "ungated is correct here"
+reasoning had the gate's state backwards -- `gate()` returns `true` whenever the
+gate is OPEN, and it is open exactly when nothing has painted recently (it opens
+on its first call and reopens on a frame callback or after `UNPAINTED_REOPEN_MS`
+with no paint). So the tick after a quiet period still paints immediately; the
+gate only skips a tick that fires just after a paint, which is backpressure and
+the one thing this pipeline lacked. `MAX_HELD_CHARS` still forces the tail out,
+so a closed gate cannot swallow the end of an answer, and the final
+`finally`-publish is ungated as before. Both constants are now load-bearing.
+
+Pinned by `controller.test.ts` ("the flush tick paints through the publish gate,
+so backpressure bounds it"): 40 ticks with no frame release produce a handful of
+paints, not 40. Reverting to the ungated tick makes every tick paint (measured:
+45 paints for 40 ticks) and fails the bound.
+
+One subtlety the wiring had to answer, or it would have traded a paint-rate
+problem for a visibility one. A tick DRAINS the coalescer before the gate is
+consulted, so a frame the gate rejects is already gone from the coalescer -- its
+text is on the transcript (the run loop applies every event) but not yet
+painted. If the stream then PAUSES, no later tick sees pending text and the gate
+reopening does not itself publish, so that progress would sit invisible until
+the next delta or the final publish -- on a phone, a provider pausing mid-answer
+is ordinary, so this is a real stall, not a corner case. The controller tracks
+how far the screen has actually painted (`paintedChars`) and, on a tick that
+finds nothing new to drain, flushes that stranded progress once the gate has
+reopened. This is the backpressure RELEASE the gate needs to be safe: skip a
+paint under load, then catch up the moment the renderer can. Pinned by
+`controller.test.ts` ("text drained by a rejected tick is still painted when the
+stream pauses"): the reopen fires mid-pause and the full answer paints WHILE THE
+RUN IS STILL LIVE, not only at `end`.
+
+Five settings used to be declared and consumed by nothing: `model`,
+`temperature`, `showReasoning`, `showDiagnostics` and `apiKey` (issue #4636).
+They were written for a settings screen and engine parameterisation that do not
+exist yet. That is not a neutral "not done": a declared-but-unread setting is a
+control the UI promises and the app does not keep, and `showDiagnostics` was
+worse still — its `false` default claimed to hide dropped events, which are
+rendered unconditionally. `apiKey` was the sharp one: `setSecret` was its only
+write path and nothing outside tests called it, and even a written key was never
+sent, because `enginesFor` never passed a `token`.
+
+**Removed rather than half-wired.** `registry.ts` now declares only `engineId`
+and `baseUrl` — the two the shipping app reads — and `registry.test.ts` pins
+`SETTING_DEFS` to `CONSUMED_SETTING_KEYS`, so declaring a setting without also
+wiring the code that reads it fails. The store's secret and validation machinery
+stays (it is contract-tested in `core/src/settings/store.test.ts`), so a real
+setting can return the day its consumer does.
+
+What actually remains for praisonai-mobile, all of it unbuilt rather than
+broken:
+
+- **The keyboard half of the shell, and an iOS back.** The Rust crate now
+  emits three of the four events: `lifecycle` from Tauri's suspend/resume/focus
+  window events, `safe-area-changed` (an empty payload, meaning "re-read the
+  CSS") on resize and scale change, and `back-gesture` from Android's system
+  back via the in-repo `tauri-plugin-back-gesture`, answered through
+  `back_gesture_result`. `keyboard-height` is still never emitted natively --
+  the TypeScript reads `visualViewport` instead, and would take a native event
+  as an override -- and nothing installs an iOS edge-swipe back. Haptics and
+  share have no plugin; the bridge's invokes for them reject and degrade.
+- **Route→view dispatch.** `ui/src/screens.ts` and `app/src/mount.ts` are built
+  and tested, and `main.ts` imports neither. Tapping "Settings" pushes onto a
+  stack nothing reads.
+- **Every screen except the transcript.** Settings, chat list and about have
+  complete view models and no renderer.
+- **Tauri-native secrets and HTTP.** Declared honestly at
+  `app/src/platform.ts`. Storage is no longer on this list: the Tauri build now
+  writes chats to the app's data directory through `src-tauri/src/store.rs`
+  (temp file, fsync, rename, fsync the directory), because the WKWebView
+  `localStorage` it used before is evictable under storage pressure -- so
+  `en.crashed`'s "Your conversations are saved" was false on a device. The
+  StoragePort contract gained an atomicity case and three relaunch cases, both
+  with break modes, and an existing install's `localStorage` data is migrated
+  once (`adapters/src/storage/migrate.ts`) so the fix cannot look like the
+  disease.
+- **The in-process praisonai-ts engine as a shipping option.** Its stated
+  blocker — bare `crypto` and `events` imports on the Agent graph — is fixed
+  upstream; the wiring here is not done.
+
+The decode-rejection defect recorded here is now closed. remote-http was the
+only production caller of `decodeEvent` and discarded every rejection, so a
+malformed frame made its tool vanish and the turn rendered as a clean answer.
+`core/src/run/drop-sink.ts` is the channel between the engine (built at
+composition) and the controller (built per app); refusals are drained onto the
+transcript per event and again in `finally`, so one arriving beside the last
+frame is still shown. Eight mutations, one per hop, each fails -- including
+the two that make it *wired* rather than merely present: removing the sink
+from `createRunController` and dropping the registry's forward both left the
+suite green until composition tests were added for each.
+
+One correction landed with it. `apply(start)` carried `dropped` across every
+new `start`, including one that followed a FINISHED turn -- so a refusal on
+turn 1 painted turn 2's clean answer as damaged, a success made to look like a
+defect (the same failure this channel exists against, inverted). A turn that
+already ended owns its drops; only a `before_start` drop, recorded while
+`idle`, belongs to the turn now opening. Fixed by clearing `dropped` on a
+`start` that replaces an ended turn, pinned at both hops: reverting it fails
+one reducer test and one controller test.
+
+
+## Conversation memory, and the one thing it deliberately does not do
+
+**Closed.** `engines/src/praisonai-ts/engine.ts` sent `request.prompt` and only
+`request.prompt`. Nothing in `engines/src` assembled prior messages, so the app
+stored a conversation, rendered it, and showed the model none of it. Measured on
+an Android emulator against the real provider: "What is the capital of France?"
+→ "Paris.", then "And its population?" → a request for clarification, because
+the second question arrived with no subject.
+
+The fix is `Agent.setHistory`, upstream's documented answer to exactly this
+("Restore a previously saved conversation so the model regains its memory of
+it"). The engine builds a **fresh agent per turn** — the model and the key come
+from settings and can change between messages — so upstream's own accumulation
+across `streamEvents` calls dies with each agent and the conversation has to be
+restored explicitly, every turn.
+
+**Where the layering fell out.** Conversation memory is an *engine-level*
+responsibility, owned by whoever owns the store, and it is NOT on
+`AgentEnginePort`. Widening `RunRequest` with a `history` field would hand the
+conversation to `remote-http` as well — and that engine POSTs `chat_id` to a
+server that keeps its own history for that id, so every prior turn would arrive
+twice, once from the client and once from the server's store. A doubled
+conversation is worse than a missing one: silent, growing, and it makes the
+model contradict itself. This is the same split `RegistryDeps.persistence`
+already draws for the WRITE, drawn once more for the READ: two engines, two
+owners of the conversation.
+
+### Truncation: what happens, and what a user sees
+
+`core/src/chat/history.ts` bounds a turn's history to
+`HISTORY_CHAR_BUDGET` (24,000 characters, ≈6,000 tokens) by keeping the
+**recent** end, stopping at the first message that does not fit, and dropping a
+leading assistant message so the history never begins with an answer to a
+question the model cannot see. Characters rather than tokens because tokenizing
+would pull a model-specific tokenizer into a webview bundle; the budget is
+deliberately an order of magnitude under the default model's window, because it
+exists to make the failure impossible rather than to use the window efficiently.
+
+**Still open, and stated rather than implied:** truncation is *not surfaced in
+the UI*. When it fires, the transcript on screen is unchanged — nothing is
+deleted, scrolling back still shows every message — but the model stops being
+able to refer to the oldest turns, and the user is not told. Protocol v2 has no
+event for "context was trimmed" and adding one is a protocol bump, so this is
+recorded here instead of being half-done. `truncateHistory` already returns
+`dropped`, so the value a notice would carry exists; nothing consumes it yet.
+
+**Also still open:** `remote-http` conversations remain server-owned end to end,
+so a chat answered by the default remote engine leaves the local session empty
+and has no local history to restore. That is the same scope note Gap 4 carries
+and it is unchanged by this.

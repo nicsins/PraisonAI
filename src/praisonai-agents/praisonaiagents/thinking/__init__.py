@@ -26,12 +26,14 @@ Usage:
     # Compute an adaptive token budget for a given task complexity (0.0-1.0)
     tokens = budget.get_tokens_for_complexity(0.8)
 
-    # Note: `agent.thinking_budget` stores this object on the agent as a hint,
-    # but the core Agent request pipeline does not yet apply it automatically.
-    # To influence step-by-step reasoning today, use the built-in
-    # `reasoning_steps` option instead:
-    agent = Agent(instructions="...", reasoning_steps=True)
+    # `agent.thinking_budget` is a backward-compatible alias for the unified
+    # `reasoning_effort` control. Prefer the graded level directly, which the
+    # core request pipeline translates to each provider's native parameter
+    # (OpenAI/xAI `reasoning_effort`, Anthropic/Gemini extended-thinking budget):
+    agent = Agent(instructions="...", reasoning_effort="high")
 """
+
+from .._lazy import create_lazy_getattr
 
 __all__ = [
     # Core classes
@@ -40,25 +42,21 @@ __all__ = [
     # Tracking
     "ThinkingUsage",
     "ThinkingTracker",
+    # Reasoning-effort translation (provider-portable)
+    "resolve_reasoning_params",
+    "normalize_effort",
+    "EFFORT_LEVELS",
 ]
 
 
-def __getattr__(name: str):
-    """Lazy load module components to avoid import overhead."""
-    if name == "ThinkingBudget":
-        from .budget import ThinkingBudget
-        return ThinkingBudget
-    
-    if name == "ThinkingConfig":
-        from .config import ThinkingConfig
-        return ThinkingConfig
-    
-    if name == "ThinkingUsage":
-        from .tracker import ThinkingUsage
-        return ThinkingUsage
-    
-    if name == "ThinkingTracker":
-        from .tracker import ThinkingTracker
-        return ThinkingTracker
-    
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+_LAZY_IMPORTS = {
+    "ThinkingBudget": ("praisonaiagents.thinking.budget", "ThinkingBudget"),
+    "ThinkingConfig": ("praisonaiagents.thinking.config", "ThinkingConfig"),
+    "ThinkingUsage": ("praisonaiagents.thinking.tracker", "ThinkingUsage"),
+    "ThinkingTracker": ("praisonaiagents.thinking.tracker", "ThinkingTracker"),
+    "resolve_reasoning_params": ("praisonaiagents.thinking.effort", "resolve_reasoning_params"),
+    "normalize_effort": ("praisonaiagents.thinking.effort", "normalize_effort"),
+    "EFFORT_LEVELS": ("praisonaiagents.thinking.effort", "EFFORT_LEVELS"),
+}
+
+__getattr__ = create_lazy_getattr(_LAZY_IMPORTS, __name__)

@@ -30,10 +30,13 @@ Usage::
 import asyncio
 import logging
 import os
+import threading
 import warnings
 from dataclasses import dataclass, field
 from typing import AsyncIterator, Callable, Dict, Any, Optional, List, Union
 from enum import Enum
+
+from ._managed_base import ManagedBackendBase
 
 logger = logging.getLogger(__name__)
 
@@ -235,7 +238,7 @@ class ManagedConfig:
     vault_ids: List[str] = field(default_factory=list)
 
 
-class AnthropicManagedAgent:
+class AnthropicManagedAgent(ManagedBackendBase):
     """Anthropic Managed Agents backend for PraisonAI.
 
     Satisfies ``ManagedBackendProtocol`` (Core SDK).  All heavy SDK usage
@@ -293,6 +296,16 @@ class AnthropicManagedAgent:
         self._session_id: Optional[str] = None
         self._client: Any = None
 
+        # Guards check-then-create of cloud resources (agent/environment/
+        # session) and lazy client init. Without these, concurrent execute()
+        # calls on a shared instance both pass the "already created?" check and
+        # both hit the REST API, orphaning (and billing for) the losing agent /
+        # environment / session — save_ids() records only the winner, so a later
+        # restart cannot reconcile the leak. Locks wrap only check+create+assign;
+        # long-running stream reads never hold them.
+        self._resource_lock = threading.Lock()
+        self._client_lock = threading.Lock()
+
         # Usage tracking (accumulated per instance)
         self.total_input_tokens: int = 0
         self.total_output_tokens: int = 0
@@ -304,8 +317,12 @@ class AnthropicManagedAgent:
     # Client
     # ------------------------------------------------------------------
     def _get_client(self):
-        """Lazy-init Anthropic client."""
-        if self._client is None:
+        """Lazy-init Anthropic client (double-checked locking)."""
+        if self._client is not None:
+            return self._client
+        with self._client_lock:
+            if self._client is not None:
+                return self._client
             try:
                 import anthropic
             except ImportError:
@@ -322,7 +339,7 @@ class AnthropicManagedAgent:
                 api_key=self.api_key,
                 timeout=self.timeout,
             )
-        return self._client
+            return self._client
     
     @property
     def vaults(self) -> VaultManager:
@@ -336,39 +353,43 @@ class AnthropicManagedAgent:
     # Agent
     # ------------------------------------------------------------------
     def _ensure_agent(self) -> str:
-        """Create agent if not cached, return agent_id."""
+        """Create agent if not cached, return agent_id (double-checked locking)."""
         if self.agent_id:
             return self.agent_id
 
-        client = self._get_client()
-        c = self._cfg
+        with self._resource_lock:
+            if self.agent_id:
+                return self.agent_id
 
-        kwargs: Dict[str, Any] = {
-            "name": c.get("name", "Agent"),
-            "model": c.get("model", "claude-haiku-4-5"),
-            "system": c.get("system", self.instructions),
-            "tools": c.get("tools", [{"type": "agent_toolset_20260401"}]),
-        }
-        # Optional description field
-        if c.get("description"):
-            kwargs["description"] = c["description"]
-        # Optional fields — only send if non-empty
-        if c.get("mcp_servers"):
-            kwargs["mcp_servers"] = c["mcp_servers"]
-        if c.get("skills"):
-            kwargs["skills"] = c["skills"]
-        if c.get("callable_agents"):
-            kwargs["callable_agents"] = c["callable_agents"]
-        if c.get("metadata"):
-            kwargs["metadata"] = c["metadata"]
+            client = self._get_client()
+            c = self._cfg
 
-        agent = client.beta.agents.create(**kwargs)
-        self.agent_id = agent.id
-        self.agent_version = getattr(agent, "version", None)
-        logger.info(
-            "[managed] agent created: %s (v%s)", agent.id, self.agent_version
-        )
-        return self.agent_id
+            kwargs: Dict[str, Any] = {
+                "name": c.get("name", "Agent"),
+                "model": c.get("model", "claude-haiku-4-5"),
+                "system": c.get("system", self.instructions),
+                "tools": c.get("tools", [{"type": "agent_toolset_20260401"}]),
+            }
+            # Optional description field
+            if c.get("description"):
+                kwargs["description"] = c["description"]
+            # Optional fields — only send if non-empty
+            if c.get("mcp_servers"):
+                kwargs["mcp_servers"] = c["mcp_servers"]
+            if c.get("skills"):
+                kwargs["skills"] = c["skills"]
+            if c.get("callable_agents"):
+                kwargs["callable_agents"] = c["callable_agents"]
+            if c.get("metadata"):
+                kwargs["metadata"] = c["metadata"]
+
+            agent = client.beta.agents.create(**kwargs)
+            self.agent_id = agent.id
+            self.agent_version = getattr(agent, "version", None)
+            logger.info(
+                "[managed] agent created: %s (v%s)", agent.id, self.agent_version
+            )
+            return self.agent_id
 
     # ------------------------------------------------------------------
     # Additional Agent API methods (fill gaps)
@@ -439,49 +460,53 @@ class AnthropicManagedAgent:
     # Environment
     # ------------------------------------------------------------------
     def _ensure_environment(self) -> str:
-        """Create environment if not cached, return environment_id."""
+        """Create environment if not cached, return environment_id (double-checked locking)."""
         if self.environment_id:
             return self.environment_id
 
-        client = self._get_client()
-        c = self._cfg
+        with self._resource_lock:
+            if self.environment_id:
+                return self.environment_id
 
-        # Handle typed networking config
-        networking = c.get("networking", NetworkingConfig())
-        if isinstance(networking, NetworkingConfig):
-            networking_dict = {
-                "type": networking.type.value,
-            }
-            if networking.type == NetworkingType.LIMITED:
-                if networking.allowed_hosts:
-                    networking_dict["allowed_hosts"] = networking.allowed_hosts
-                if networking.allow_mcp_servers is not None:
-                    networking_dict["allow_mcp_servers"] = networking.allow_mcp_servers
-                if networking.allow_package_managers is not None:
-                    networking_dict["allow_package_managers"] = networking.allow_package_managers
-        else:
-            networking_dict = networking
+            client = self._get_client()
+            c = self._cfg
 
-        env_config: Dict[str, Any] = {
-            "type": "cloud",
-            "networking": networking_dict,
-        }
-
-        # Handle typed packages config  
-        packages = c.get("packages")
-        if packages:
-            if isinstance(packages, PackagesConfig):
-                env_config["packages"] = packages.to_dict()
+            # Handle typed networking config
+            networking = c.get("networking", NetworkingConfig())
+            if isinstance(networking, NetworkingConfig):
+                networking_dict = {
+                    "type": networking.type.value,
+                }
+                if networking.type == NetworkingType.LIMITED:
+                    if networking.allowed_hosts:
+                        networking_dict["allowed_hosts"] = networking.allowed_hosts
+                    if networking.allow_mcp_servers is not None:
+                        networking_dict["allow_mcp_servers"] = networking.allow_mcp_servers
+                    if networking.allow_package_managers is not None:
+                        networking_dict["allow_package_managers"] = networking.allow_package_managers
             else:
-                env_config["packages"] = packages
+                networking_dict = networking
 
-        environment = client.beta.environments.create(
-            name=c.get("env_name", "praisonai-env"),
-            config=env_config,
-        )
-        self.environment_id = environment.id
-        logger.info("[managed] environment created: %s", environment.id)
-        return self.environment_id
+            env_config: Dict[str, Any] = {
+                "type": "cloud",
+                "networking": networking_dict,
+            }
+
+            # Handle typed packages config
+            packages = c.get("packages")
+            if packages:
+                if isinstance(packages, PackagesConfig):
+                    env_config["packages"] = packages.to_dict()
+                else:
+                    env_config["packages"] = packages
+
+            environment = client.beta.environments.create(
+                name=c.get("env_name", "praisonai-env"),
+                config=env_config,
+            )
+            self.environment_id = environment.id
+            logger.info("[managed] environment created: %s", environment.id)
+            return self.environment_id
 
     # ------------------------------------------------------------------
     # Additional Environment API methods (fill gaps)
@@ -544,38 +569,46 @@ class AnthropicManagedAgent:
     # Session
     # ------------------------------------------------------------------
     def _ensure_session(self) -> str:
-        """Create session if not cached, return session_id."""
+        """Create session if not cached, return session_id (double-checked locking)."""
         if self._session_id:
             return self._session_id
 
+        # Resolve dependent resources *before* taking the session lock. Each
+        # _ensure_* acquires _resource_lock itself, and threading.Lock is not
+        # reentrant, so nesting these calls inside the lock would deadlock.
         client = self._get_client()
         agent_id = self._ensure_agent()
         env_id = self._ensure_environment()
-        c = self._cfg
 
-        # Support agent version pinning
-        agent_ref = agent_id
-        if self.agent_version is not None:
-            agent_ref = {
-                "type": "agent",
-                "id": agent_id,
-                "version": self.agent_version
+        with self._resource_lock:
+            if self._session_id:
+                return self._session_id
+
+            c = self._cfg
+
+            # Support agent version pinning
+            agent_ref = agent_id
+            if self.agent_version is not None:
+                agent_ref = {
+                    "type": "agent",
+                    "id": agent_id,
+                    "version": self.agent_version
+                }
+
+            kwargs: Dict[str, Any] = {
+                "agent": agent_ref,
+                "environment_id": env_id,
+                "title": c.get("session_title", "PraisonAI session"),
             }
+            if c.get("resources"):
+                kwargs["resources"] = c["resources"]
+            if c.get("vault_ids"):
+                kwargs["vault_ids"] = c["vault_ids"]
 
-        kwargs: Dict[str, Any] = {
-            "agent": agent_ref,
-            "environment_id": env_id,
-            "title": c.get("session_title", "PraisonAI session"),
-        }
-        if c.get("resources"):
-            kwargs["resources"] = c["resources"]
-        if c.get("vault_ids"):
-            kwargs["vault_ids"] = c["vault_ids"]
-
-        session = client.beta.sessions.create(**kwargs)
-        self._session_id = session.id
-        logger.info("[managed] session created: %s", session.id)
-        return self._session_id
+            session = client.beta.sessions.create(**kwargs)
+            self._session_id = session.id
+            logger.info("[managed] session created: %s", session.id)
+            return self._session_id
 
     # ------------------------------------------------------------------
     # Event processing helpers
@@ -716,8 +749,7 @@ class AnthropicManagedAgent:
 
         Runs the synchronous Anthropic SDK in a thread executor to stay async-safe.
         """
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, self._execute_sync, prompt)
+        return await self._execute_in_executor(self._execute_sync, prompt, **kwargs)
 
     def _execute_sync(self, prompt: str, stream_live: bool = False) -> str:
         """Synchronous execution using the SDK's native streaming.
@@ -783,48 +815,32 @@ class AnthropicManagedAgent:
                 emitter.agent_end(agent_name)
 
     # ------------------------------------------------------------------
-    # stream() — ManagedBackendProtocol
+    # stream() — ManagedBackendProtocol (via ManagedBackendBase)
     # ------------------------------------------------------------------
-    async def stream(self, prompt: str, **kwargs) -> AsyncIterator[str]:
-        """Yield text chunks as the managed agent produces them."""
-        loop = asyncio.get_running_loop()
-        import queue
-        import threading
+    def _iter_events(self, session_id: str, prompt: str):
+        """Yield agent-message text chunks off the Anthropic SSE stream.
 
-        q: queue.Queue[Optional[str]] = queue.Queue()
-
-        def _producer():
-            try:
-                client = self._get_client()
-                session_id = self._ensure_session()
-                with client.beta.sessions.events.stream(session_id) as s:
-                    client.beta.sessions.events.send(
-                        session_id,
-                        events=[{
-                            "type": "user.message",
-                            "content": [{"type": "text", "text": prompt}],
-                        }],
-                    )
-                    for event in s:
-                        etype = getattr(event, "type", None)
-                        if etype == "agent.message":
-                            for block in getattr(event, "content", []):
-                                text = getattr(block, "text", None)
-                                if text:
-                                    q.put(text)
-                        elif etype == "session.status_idle":
-                            break
-            finally:
-                q.put(None)  # sentinel
-
-        thread = threading.Thread(target=_producer, daemon=True)
-        thread.start()
-
-        while True:
-            chunk = await loop.run_in_executor(None, q.get)
-            if chunk is None:
-                break
-            yield chunk
+        Runs on ``ManagedBackendBase.stream``'s producer thread, so the blocking
+        SDK stream context is fine here.
+        """
+        client = self._get_client()
+        with client.beta.sessions.events.stream(session_id) as s:
+            client.beta.sessions.events.send(
+                session_id,
+                events=[{
+                    "type": "user.message",
+                    "content": [{"type": "text", "text": prompt}],
+                }],
+            )
+            for event in s:
+                etype = getattr(event, "type", None)
+                if etype == "agent.message":
+                    for block in getattr(event, "content", []):
+                        text = getattr(block, "text", None)
+                        if text:
+                            yield text
+                elif etype == "session.status_idle":
+                    return
 
     # ------------------------------------------------------------------
     # Session management — ManagedBackendProtocol

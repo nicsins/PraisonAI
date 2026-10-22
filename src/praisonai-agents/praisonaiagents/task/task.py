@@ -10,6 +10,7 @@ import os
 import time
 
 from .protocols import TaskStatus, TaskLifecycleManager
+from ..llm.model_providers import default_auxiliary_model
 
 # Set up logger
 logger = get_logger(__name__)
@@ -67,6 +68,8 @@ class Task:
         images: Optional[List[str]] = None,
         next_tasks: Optional[List[str]] = None,
         task_type: str = "task",
+        human_input: bool = False,
+        human_review_prompt: Optional[str] = None,
         condition: Optional[Dict[str, List[str]]] = None,
         is_start: bool = False,
         loop_state: Optional[Dict[str, Union[str, int]]] = None,
@@ -198,6 +201,13 @@ class Task:
         self.images = images if images else []
         self.next_tasks = next_tasks if next_tasks else []
         self.task_type = task_type
+        #: Require a person to approve this task's OUTPUT before the next task
+        #: consumes it. Distinct from the approval system, which gates a TOOL
+        #: CALL, and from guardrails, which validate automatically. Python
+        #: parity target: CrewAI's Task(human_input=True).
+        self.human_input = human_input
+        #: What the reviewer is asked. Defaults to a generic prompt.
+        self.human_review_prompt = human_review_prompt
         self.condition = condition if condition else {}
         self.is_start = is_start
         self.loop_state = loop_state if loop_state else {}
@@ -729,7 +739,7 @@ class Task:
                         if hasattr(self.agent.llm_instance, 'model'):
                             llm_model = self.agent.llm_instance.model
                         else:
-                            llm_model = "gpt-4o-mini"  # Default fallback
+                            llm_model = default_auxiliary_model()
                     elif hasattr(self.agent, 'llm') and self.agent.llm:
                         # For standard model strings
                         llm_model = self.agent.llm
@@ -873,22 +883,37 @@ Context:
         Returns:
             GuardrailResult: The result of the guardrail validation
         """
-        from ..guardrails import GuardrailResult
-        
+        from ..guardrails import GuardrailResult, GuardrailRetry
+
         if not self._guardrail_fn:
             return GuardrailResult(success=True, result=task_output)
-        
+
         try:
-            # Call the guardrail function
-            result = self._guardrail_fn(task_output)
-            
+            # Call the guardrail function, awaiting it if the caller supplied an
+            # async def. Calling a coroutine function synchronously would only
+            # build a coroutine object (never running its body), which then
+            # crashes GuardrailResult.from_tuple and is misreported as a
+            # validation failure. This mirrors how Task.callback already detects
+            # and awaits coroutine callbacks.
+            if asyncio.iscoroutinefunction(self._guardrail_fn):
+                result = self._run_async_guardrail(task_output)
+            else:
+                result = self._guardrail_fn(task_output)
+
             # Check if result is already a GuardrailResult
             if isinstance(result, GuardrailResult):
                 return result
-            
+
             # Otherwise, convert the tuple result to a GuardrailResult
             return GuardrailResult.from_tuple(result)
-            
+
+        except GuardrailRetry as e:
+            # Deliberate rejection carrying a message for the model: keep the
+            # author's wording so the retry prompt reads as an instruction, not
+            # as an internal error report.
+            logger.warning(f"Task {self.id}: Guardrail asked for a retry: {e.feedback}")
+            return GuardrailResult(success=False, result=None, error=e.feedback)
+
         except Exception as e:
             logger.error(f"Task {self.id}: Error in guardrail validation: {e}")
             # On error, return failure
@@ -897,7 +922,18 @@ Context:
                 result=None,
                 error=f"Guardrail validation error: {str(e)}"
             )
-    
+
+    def _run_async_guardrail(self, task_output):
+        """Run an async def guardrail from the synchronous guardrail path.
+
+        The async orchestration path already offloads _process_guardrail to a
+        worker thread (no running loop there), so asyncio.run is safe. If called
+        while a loop is running in this thread, surface a clear error instead of
+        the misattributed 'coroutine was never awaited' failure.
+        """
+        from ..utils.async_bridge import run_coroutine_from_any_context
+        return run_coroutine_from_any_context(self._guardrail_fn(task_output))
+
     async def _execute_callback_with_metadata(self, task_output):
         """Execute callback with metadata support while maintaining backward compatibility.
         

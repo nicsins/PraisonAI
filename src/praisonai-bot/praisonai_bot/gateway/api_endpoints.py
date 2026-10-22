@@ -14,14 +14,24 @@ call back into its public/registered state (``list_agents``, ``get_agent``,
 
 from __future__ import annotations
 
+import asyncio
+import contextvars
 import json
 import time
 import uuid
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 
 def _now() -> int:
     return int(time.time())
+
+
+def _body_of(response: Any) -> dict:
+    """Decode a JSONResponse body back to a dict for idempotent replay storage."""
+    try:
+        return json.loads(response.body.decode())
+    except Exception:  # noqa: BLE001 - never let replay-capture break a request
+        return {}
 
 
 def _msg_content(msg: Any) -> str:
@@ -94,6 +104,217 @@ class GatewayApiEndpoints:
 
     def __init__(self, gateway: Any) -> None:
         self._gw = gateway
+        # In-process store for background/stored Response objects, keyed by id.
+        # Lightweight and dependency-free: a background run's status/output
+        # survives the originating HTTP request so a client can retrieve it by
+        # id later. Each entry also holds the run's InterruptController (for
+        # cancel) and the driving asyncio.Task. Not persisted across restarts;
+        # the durable-run ledger (Issue #4028) remains the cross-restart store.
+        self._responses: Dict[str, dict] = {}
+        # Cap the in-process store so a sustained stream of background/stored
+        # submissions cannot grow memory without bound in a long-lived gateway
+        # (Greptile P1). When full, the oldest *terminal* (completed/cancelled/
+        # failed) entry is evicted first; in-flight runs are never evicted.
+        self._responses_max = 1024
+        # Client idempotency for the run-create endpoints (Issue #5726). Maps a
+        # tenant/operator-scoped ``Idempotency-Key`` to the fingerprint of the
+        # originating request and the run it produced, so a retried or
+        # load-balancer-duplicated POST returns the *first* run instead of
+        # starting a second. Dependency-free and bounded like ``_responses``;
+        # it stores only a request fingerprint and the run's public id/status
+        # (never request bodies or credentials). Absent header → unchanged.
+        self._idem: Dict[str, dict] = {}
+        self._idem_max = 1024
+
+    # ── client idempotency (Issue #5726) ───────────────────────────────
+    @staticmethod
+    def _fingerprint(body: Any) -> str:
+        """Hash a canonicalised request body for idempotent-replay detection."""
+        import hashlib
+
+        try:
+            canonical = json.dumps(body, sort_keys=True, separators=(",", ":"))
+        except (TypeError, ValueError):
+            canonical = repr(body)
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    def _idem_scope_key(self, request: Any, key: str, route: str) -> str:
+        """Scope a client ``Idempotency-Key`` to the caller *and route* so keys
+        never collide across tenants/operators or across endpoints sharing one
+        gateway.
+
+        Stable identities (a session header or bearer token) scope the key to
+        that tenant/operator. Anonymous callers (auth disabled, no session
+        header) get a *fresh* per-request key from ``_caller_key``, which would
+        defeat replay; since they cannot re-identify anyway, the client's own
+        ``Idempotency-Key`` is the only stable handle, so it scopes itself —
+        matching the open posture the no-auth transport already grants ``/v1/*``.
+
+        The ``route`` component ensures a key reused across ``/v1/responses`` and
+        ``/v1/chat/completions`` (both accept a body carrying ``messages``/
+        ``input``) never replays the other route's response shape — a
+        ``chat.completion`` must never be returned for a ``response`` request and
+        vice-versa (Greptile P1).
+        """
+        caller = self._caller_key(request)
+        if caller.startswith("anon:"):
+            caller = "anon"
+        return f"{route}\x00{caller}\x00{key}"
+
+    def _idem_lookup(self, request: Any, body: Any, route: str):
+        """Resolve a prior run for this caller's ``Idempotency-Key`` on ``route``.
+
+        Returns ``(key, verdict, entry)`` where ``verdict`` is:
+          - ``None``  — no header; caller opted out (unchanged behaviour).
+          - ``"new"`` — first use of this key; caller reserved it and should
+            proceed, then call ``_idem_record`` (or ``_idem_release`` on error).
+          - ``"reuse"`` — same key + equivalent body; ``entry`` is the stored
+            run and its response must be returned unchanged.
+          - ``"conflict"`` — same key, materially different body; a 409 is due.
+          - ``"inflight"`` — same key + equivalent body, but the first run has
+            not finished yet; ``entry`` carries the in-flight reservation whose
+            future the caller must await rather than starting a second run
+            (Greptile P1 — overlapping retries must not duplicate the run).
+
+        A ``"new"`` verdict *atomically reserves* the key (records an in-flight
+        placeholder) before returning, so a concurrent retry arriving while the
+        first run is still working sees ``"inflight"`` instead of ``"new"`` and
+        joins the original run.
+        """
+        raw = request.headers.get("idempotency-key") or request.headers.get(
+            "Idempotency-Key"
+        )
+        if not raw:
+            return None, None, None
+        scoped = self._idem_scope_key(request, raw, route)
+        fp = self._fingerprint(body)
+        existing = self._idem.get(scoped)
+        if existing is None:
+            # Reserve the key before dispatch so overlapping retries join this
+            # run instead of starting their own.
+            self._idem_evict_if_full()
+            self._idem[scoped] = {
+                "fingerprint": fp,
+                "response_id": None,
+                "payload": None,
+                "status_code": None,
+                "pending": asyncio.get_running_loop().create_future(),
+            }
+            return scoped, "new", None
+        if existing.get("fingerprint") != fp:
+            return scoped, "conflict", None
+        if existing.get("pending") is not None:
+            return scoped, "inflight", existing
+        return scoped, "reuse", existing
+
+    def _idem_evict_if_full(self) -> None:
+        """Drop the oldest *settled* idempotency entry when the store is full.
+
+        An entry is settled once its reservation future has resolved (i.e. the
+        first run reached a terminal commit). In-flight reservations (a pending
+        future) are never evicted so an overlapping retry can always find the
+        run it must join; if every entry is still pending, nothing is evicted.
+        """
+        while len(self._idem) >= self._idem_max:
+            victim = None
+            for k, e in self._idem.items():
+                if e.get("pending") is None:
+                    victim = k
+                    break
+            if victim is None:
+                break
+            del self._idem[victim]
+
+    def _idem_release(self, key: Optional[str]) -> None:
+        """Abandon a reservation whose run failed before it could be recorded.
+
+        Drops the in-flight placeholder (resolving any waiters so they retry)
+        so a transient failure never wedges the key as permanently in-flight.
+        """
+        if not key:
+            return
+        entry = self._idem.pop(key, None)
+        if entry is not None:
+            pending = entry.get("pending")
+            if pending is not None and not pending.done():
+                pending.set_result(None)
+
+    def _idem_record(
+        self,
+        key: Optional[str],
+        body: Any,
+        response_id: str,
+        payload: dict,
+        status_code: int = 200,
+    ) -> None:
+        """Commit the run produced for a reserved ``Idempotency-Key``.
+
+        The stored ``payload`` is the exact response object so a retry replays
+        the first response verbatim, and ``response_id`` lets retention check
+        the live run's terminal state. Resolves the reservation future so any
+        retry that joined the in-flight run is released with the committed
+        result.
+        """
+        if not key:
+            return
+        entry = self._idem.get(key)
+        if entry is None:
+            # Reservation was dropped (e.g. evicted while in-flight): recreate.
+            entry = {}
+            self._idem[key] = entry
+        pending = entry.get("pending")
+        # Mutate the reserved entry in place so any waiter that captured it in
+        # ``_idem_await_inflight`` sees the committed payload after awaiting.
+        entry["fingerprint"] = self._fingerprint(body)
+        entry["response_id"] = response_id
+        entry["payload"] = payload
+        entry["status_code"] = status_code
+        entry["pending"] = None
+        if pending is not None and not pending.done():
+            pending.set_result(True)
+
+    async def _idem_await_inflight(self, entry: dict):
+        """Await a concurrent first run then replay its committed response.
+
+        Called when an overlapping retry resolves to ``"inflight"``: it waits on
+        the reservation future (resolved by ``_idem_record``/``_idem_release``)
+        then returns the same response the first request produced, so the second
+        POST never starts a duplicate run (Greptile P1).
+        """
+        pending = entry.get("pending")
+        if pending is not None:
+            try:
+                await pending
+            except Exception:  # noqa: BLE001 - never let a waiter hang on error
+                pass
+        return self._idem_reuse_response(entry)
+
+    def _idem_reuse_response(self, entry: dict):
+        """Return the stored first response for a reused ``Idempotency-Key``.
+
+        A background/stored run is replayed from its *current* persisted state
+        (so a completed run returns its result, not the original ``queued``);
+        a synchronous run replays its stored payload verbatim. If the linked run
+        was evicted from ``_responses`` after completing, the committed payload
+        is the stored fallback — which for background runs is refreshed to the
+        terminal result at completion (never the stale ``queued`` snapshot,
+        Greptile P1).
+        """
+        from starlette.responses import JSONResponse
+
+        run = self._responses.get(entry.get("response_id"))
+        if run is not None:
+            return self._stored_response_json(run)
+        return JSONResponse(
+            entry.get("payload") or {}, status_code=entry.get("status_code") or 200
+        )
+
+    def _idem_conflict(self):
+        return self._openai_error(
+            "Idempotency-Key reused with a different request body",
+            409,
+            "invalid_request_error",
+        )
 
     # ── shared dispatch ────────────────────────────────────────────────
     def _resolve_agent(self, requested: Optional[str]):
@@ -110,19 +331,223 @@ class GatewayApiEndpoints:
         aid = agents[0]
         return aid, self._gw.get_agent(aid)
 
-    async def _dispatch(self, session: Any, agent: Any, content: str) -> str:
-        """Run one agent turn through the same admission gate as chat users."""
+    async def _dispatch(
+        self,
+        session: Any,
+        agent: Any,
+        content: str,
+        interrupt: Any = None,
+        rejected: Optional[dict] = None,
+    ) -> tuple:
+        """Run one agent turn through the same admission gate as chat users.
+
+        Returns ``(reply, usage)`` where ``usage`` is a snapshot of the agent's
+        per-turn token metrics captured **in the same execution context that
+        produced the turn's result**.
+
+        One ``Agent`` instance can serve overlapping turns for several sessions.
+        The SDK stores per-turn counts on a *shared, mutable*
+        ``llm.last_token_metrics`` reference that each turn overwrites, so any
+        read that is not bound to the completing turn's own context can report a
+        different concurrent request's counts. The native async path runs on the
+        single event loop (no cross-turn interleaving without an ``await``), but
+        the sync ``chat`` fallback runs in a worker **thread**, so a bare read
+        after the ``await`` could still observe another thread's overwrite
+        (Greptile/Qodo P1). We therefore hand ``_dispatch_agent_turn`` an
+        ``on_complete`` callback that snapshots the metrics *inside that same
+        context* — the worker thread for sync agents, the loop tick for async —
+        before it can be clobbered.
+        """
+        holder: dict = {}
+
+        def _capture(a: Any) -> None:
+            holder["usage"] = self._usage_for(a)
+
+        # Forward ``interrupt`` only when supplied so callers/dispatchers that do
+        # not expect a ``cancel_token`` seam (e.g. the synchronous chat path)
+        # keep their exact prior signature; the background path passes it so a
+        # ``.../cancel`` can stop the turn cooperatively.
+        extra = {"interrupt": interrupt} if interrupt is not None else {}
+
         gate = getattr(self._gw, "_admission_gate", None)
         if gate is not None and getattr(gate, "enabled", False):
             from ..bots._admission import AdmissionRejected
             try:
                 async with gate.admit(session_id=session.session_id):
-                    result = await self._gw._dispatch_agent_turn(agent, content)
+                    result = await self._gw._dispatch_agent_turn(
+                        agent, content, on_complete=_capture, **extra
+                    )
             except AdmissionRejected as rej:
-                return str(rej.message)
+                # Signal capacity rejection to the caller so a background run is
+                # recorded as ``failed`` (never ``completed``): the agent never
+                # ran, so a client polling the id must not mistake the busy
+                # message for a successful result (Greptile P1).
+                if rejected is not None:
+                    rejected["rejected"] = True
+                    rejected["message"] = str(rej.message)
+                return str(rej.message), self._zero_usage()
         else:
-            result = await self._gw._dispatch_agent_turn(agent, content)
-        return "" if result is None else str(result)
+            result = await self._gw._dispatch_agent_turn(
+                agent, content, on_complete=_capture, **extra
+            )
+        usage = holder.get("usage") or self._zero_usage()
+        return ("" if result is None else str(result)), usage
+
+    def _streaming_enabled(self) -> bool:
+        """Whether token-level SSE streaming is opted in via ``gateway.api.stream``.
+
+        Off by default so the streaming surface stays byte-for-byte the buffered
+        single-chunk path until an operator explicitly enables it.
+        """
+        cfg = getattr(self._gw, "config", None)
+        api = getattr(cfg, "api", None)
+        return bool(getattr(api, "stream", False))
+
+    # Task-local marker so a stream callback only forwards events emitted by
+    # *its own* turn. One ``Agent`` instance (hence one shared
+    # ``stream_emitter``) can serve overlapping turns for several callers; the
+    # emitter fans every event out to every registered callback with no turn
+    # identity. Without isolation, caller A's SSE stream would receive caller
+    # B's tokens (Greptile P1 — concurrent streams mix caller text). The turn's
+    # execution context (native async task, or the copied context that
+    # ``asyncio.to_thread`` runs a sync agent under) carries this token, so a
+    # callback compares the running turn's token to the one it was created for
+    # and drops foreign events.
+    _stream_turn_var: "contextvars.ContextVar[Optional[object]]" = (
+        contextvars.ContextVar("praisonai_gw_stream_turn", default=None)
+    )
+
+    async def _dispatch_stream(self, session: Any, agent: Any, content: str):
+        """Run one agent turn while yielding its token deltas as they arrive.
+
+        Wires the agent's existing ``stream_emitter`` (the same surface the
+        WebSocket relay consumes) through the request hot path: a callback pushes
+        each answer text chunk onto an :class:`asyncio.Queue`, the turn runs via
+        the normal :meth:`_dispatch` (same admission gate + usage snapshot), and
+        this generator yields text chunks in real time. On completion it yields a
+        final ``("final", (reply, usage))`` marker so the caller has the buffered
+        reply (for a no-delta fallback) and the per-turn usage.
+
+        Correctness guarantees baked into the callback:
+
+        * **First token included** — the SDK emits the opening piece as
+          ``FIRST_TOKEN`` and only later pieces as ``DELTA_TEXT``; both are
+          forwarded so the client never loses the first chunk (Greptile P1).
+        * **Reasoning excluded** — deltas flagged ``is_reasoning=True`` are the
+          model's private thinking, not the answer, so they are dropped and never
+          leaked as answer content to an OpenAI-compatible client (Greptile P1).
+        * **Turn isolation** — a per-turn ContextVar token guards the callback so
+          concurrent callers sharing one agent never receive each other's text
+          (Greptile P1).
+
+        The callback may fire from a worker thread (sync ``chat`` agents), so it
+        hands chunks to the loop via ``call_soon_threadsafe``. If the agent has
+        no ``stream_emitter``, the turn still completes and only the final marker
+        is yielded — the caller then emits today's single buffered chunk.
+        """
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue = asyncio.Queue()
+
+        _TEXT_TYPES: tuple = ()
+        try:
+            from praisonaiagents.streaming.events import StreamEventType as _SET
+            _TEXT_TYPES = (_SET.DELTA_TEXT, _SET.FIRST_TOKEN)
+        except Exception:
+            _SET = None
+
+        # Unique identity for this turn; the callback only forwards events whose
+        # running context carries this same token.
+        turn_token = object()
+
+        def _on_event(event: Any) -> None:
+            if not _TEXT_TYPES:
+                return
+            if getattr(event, "type", None) not in _TEXT_TYPES:
+                return
+            # Drop reasoning/thinking deltas — they are not answer content.
+            if getattr(event, "is_reasoning", False):
+                return
+            # Only relay events produced by this turn's execution context.
+            if self._stream_turn_var.get() is not turn_token:
+                return
+            text = getattr(event, "content", None)
+            if text:
+                loop.call_soon_threadsafe(queue.put_nowait, ("delta", text))
+
+        emitter = getattr(agent, "stream_emitter", None) if _SET is not None else None
+        if emitter is not None:
+            try:
+                emitter.add_callback(_on_event)
+            except Exception:
+                emitter = None
+
+        async def _run() -> None:
+            # Stamp this turn's identity so events emitted during its execution
+            # (and only those) pass the callback's isolation check. Native async
+            # runs inherit this task's context; ``asyncio.to_thread`` copies it
+            # into the worker thread, so the sync ``chat`` path is covered too.
+            self._stream_turn_var.set(turn_token)
+            try:
+                reply, usage = await self._dispatch(session, agent, content)
+                await queue.put(("final", (reply, usage)))
+            except Exception as exc:  # surface as a terminal marker, never hang
+                await queue.put(("error", exc))
+
+        task = asyncio.ensure_future(_run())
+        try:
+            while True:
+                kind, payload = await queue.get()
+                if kind == "delta":
+                    yield ("delta", payload)
+                elif kind == "error":
+                    raise payload
+                else:  # final
+                    yield ("final", payload)
+                    break
+        finally:
+            if emitter is not None:
+                try:
+                    emitter.remove_callback(_on_event)
+                except (ValueError, AttributeError):
+                    pass
+            if not task.done():
+                await task
+
+    @staticmethod
+    def _zero_usage() -> dict:
+        return {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+    @staticmethod
+    def _usage_for(agent: Any) -> dict:
+        """Snapshot the agent's last-turn token metrics as an OpenAI ``usage`` block.
+
+        The core SDK records true per-turn counts on the LLM instance
+        (``last_token_metrics`` with ``input_tokens``/``output_tokens``). We read
+        them straight off the boundary so cost-accounting clients get real
+        figures instead of the previous hardcoded zeros. When metrics are
+        unavailable (e.g. a custom agent that does not expose an LLM instance)
+        we fall back to zeros so the response stays spec-shaped.
+
+        Call sites MUST invoke this immediately after the dispatched turn
+        completes with no intervening ``await`` (see ``_dispatch``); the value
+        is read into plain ints here so the returned dict is an immutable
+        snapshot that a later concurrent turn cannot mutate.
+        """
+        zero = GatewayApiEndpoints._zero_usage()
+        # Read the already-created LLM instance without forcing lazy creation.
+        llm = getattr(agent, "_llm_instance", None) or getattr(
+            agent, "llm_instance", None
+        )
+        metrics = getattr(llm, "last_token_metrics", None) if llm else None
+        if metrics is None:
+            return zero
+        prompt = int(getattr(metrics, "input_tokens", 0) or 0)
+        completion = int(getattr(metrics, "output_tokens", 0) or 0)
+        return {
+            "prompt_tokens": prompt,
+            "completion_tokens": completion,
+            "total_tokens": prompt + completion,
+        }
 
     def _session_for(self, agent_id: str, key: str) -> Any:
         """Get or create a stable session keyed by the API caller."""
@@ -210,43 +635,87 @@ class GatewayApiEndpoints:
         completion_id = "chatcmpl-" + uuid.uuid4().hex
 
         if stream:
-            return self._sse_chat(agent_id, agent, session, content, completion_id)
+            opts = body.get("stream_options")
+            include_usage = bool(
+                isinstance(opts, dict) and opts.get("include_usage")
+            )
+            # Streaming responses are not replayable, so idempotency applies to
+            # the buffered (non-stream) path only (Issue #5726).
+            return self._sse_chat(
+                agent_id, agent, session, content, completion_id, include_usage
+            )
 
-        reply = await self._dispatch(session, agent, content)
-        return JSONResponse(
-            {
-                "id": completion_id,
-                "object": "chat.completion",
-                "created": _now(),
-                "model": agent_id,
-                "choices": [
-                    {
-                        "index": 0,
-                        "message": {"role": "assistant", "content": reply},
-                        "finish_reason": "stop",
-                    }
-                ],
-                "usage": {
-                    "prompt_tokens": 0,
-                    "completion_tokens": 0,
-                    "total_tokens": 0,
-                },
-            }
+        # Client idempotency (Issue #5726): a retried/LB-duplicated POST with the
+        # same ``Idempotency-Key`` returns the first completion instead of
+        # starting a second run; a reused key with a different body is a 409. An
+        # overlapping retry while the first run is still working joins that run
+        # rather than starting a second (Greptile P1).
+        idem_key, verdict, idem_entry = self._idem_lookup(
+            request, body, "chat.completions"
         )
+        if verdict == "reuse":
+            return self._idem_reuse_response(idem_entry)
+        if verdict == "inflight":
+            return await self._idem_await_inflight(idem_entry)
+        if verdict == "conflict":
+            return self._idem_conflict()
 
-    def _sse_chat(self, agent_id, agent, session, content, completion_id):
+        try:
+            reply, usage = await self._dispatch(session, agent, content)
+        except BaseException:
+            self._idem_release(idem_key)
+            raise
+        obj = {
+            "id": completion_id,
+            "object": "chat.completion",
+            "created": _now(),
+            "model": agent_id,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": reply},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": usage,
+        }
+        self._idem_record(idem_key, body, completion_id, obj, 200)
+        return JSONResponse(obj)
+
+    def _sse_chat(
+        self, agent_id, agent, session, content, completion_id, include_usage=False
+    ):
         """Emit a spec-shaped SSE chat-completion stream.
 
         The frames are correctly ``chat.completion.chunk`` shaped and terminate
-        with ``[DONE]`` so any OpenAI streaming client parses them. The content
-        is delivered as a single chunk once the agent turn completes (buffered)
-        rather than token-by-token: true incremental token streaming would need
-        the agent's ``stream_emitter`` wired through the gateway hot path, which
-        is deliberately out of scope here to avoid a hot-path regression. Latency
-        to first *content* therefore matches non-streaming; response correctness
-        and client compatibility are unaffected.
+        with ``[DONE]`` so any OpenAI streaming client parses them.
+
+        When token streaming is enabled (``gateway.api.stream``), the agent's
+        existing ``stream_emitter`` is wired through the hot path so each
+        ``DELTA_TEXT`` chunk is emitted as its own ``delta.content`` frame in
+        real time — genuine time-to-first-token. When streaming is off (the
+        default), or the agent produced no token deltas, the content is
+        delivered as a single buffered chunk once the turn completes, exactly as
+        before; response correctness and client compatibility are unaffected
+        either way.
+
+        When the client sets ``stream_options.include_usage`` (the OpenAI
+        opt-in for streamed usage), a final ``usage``-only chunk carrying the
+        real per-turn token counts is emitted before ``[DONE]``, matching the
+        OpenAI streaming contract.
         """
         from starlette.responses import StreamingResponse
+
+        def _content_frame(created, text):
+            return {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": agent_id,
+                "choices": [
+                    {"index": 0, "delta": {"content": text}, "finish_reason": None}
+                ],
+            }
 
         async def gen():
             created = _now()
@@ -261,17 +730,28 @@ class GatewayApiEndpoints:
             }
             yield f"data: {json.dumps(first)}\n\n"
 
-            reply = await self._dispatch(session, agent, content)
-            chunk = {
-                "id": completion_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": agent_id,
-                "choices": [
-                    {"index": 0, "delta": {"content": reply}, "finish_reason": None}
-                ],
-            }
-            yield f"data: {json.dumps(chunk)}\n\n"
+            usage = self._zero_usage()
+            if self._streaming_enabled():
+                streamed_any = False
+                reply = ""
+                async for kind, payload in self._dispatch_stream(
+                    session, agent, content
+                ):
+                    if kind == "delta":
+                        streamed_any = True
+                        yield f"data: {json.dumps(_content_frame(created, payload))}\n\n"
+                    else:  # final
+                        reply, usage = payload
+                # No token deltas seen (agent didn't stream): emit the buffered
+                # reply as one chunk so content is never lost. Emitted even for
+                # an empty reply so the frame shape matches today's buffered
+                # single-chunk path exactly (Greptile P2 — empty replies must
+                # still carry a content frame).
+                if not streamed_any:
+                    yield f"data: {json.dumps(_content_frame(created, reply))}\n\n"
+            else:
+                reply, usage = await self._dispatch(session, agent, content)
+                yield f"data: {json.dumps(_content_frame(created, reply))}\n\n"
 
             final = {
                 "id": completion_id,
@@ -281,6 +761,18 @@ class GatewayApiEndpoints:
                 "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
             }
             yield f"data: {json.dumps(final)}\n\n"
+
+            if include_usage:
+                usage_chunk = {
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": agent_id,
+                    "choices": [],
+                    "usage": usage,
+                }
+                yield f"data: {json.dumps(usage_chunk)}\n\n"
+
             yield "data: [DONE]\n\n"
 
         return StreamingResponse(gen(), media_type="text/event-stream")
@@ -306,30 +798,331 @@ class GatewayApiEndpoints:
                 "No agents registered on this gateway", 503, "server_error"
             )
 
+        # Client idempotency (Issue #5726): a retried/LB-duplicated POST with
+        # the same ``Idempotency-Key`` returns the first run instead of starting
+        # a second; a reused key with a different body is a 409; an overlapping
+        # retry while the first run is still working joins that run (Greptile
+        # P1). No header → unchanged behaviour.
+        idem_key, verdict, idem_entry = self._idem_lookup(request, body, "responses")
+        if verdict == "reuse":
+            return self._idem_reuse_response(idem_entry)
+        if verdict == "inflight":
+            return await self._idem_await_inflight(idem_entry)
+        if verdict == "conflict":
+            return self._idem_conflict()
+
         # ``input`` may be a plain string or an OpenAI messages-style array.
         raw = body.get("input", "")
         content = raw if isinstance(raw, str) else _extract_text(raw)
-        session = self._session_for(agent_id, self._caller_key(request))
-        reply = await self._dispatch(session, agent, content)
+        caller = self._caller_key(request)
+        session = self._session_for(agent_id, caller)
+
+        # Async/background submission: when the caller opts in via ``background``
+        # or ``store`` (per the OpenAI Responses API), return immediately with a
+        # persisted, retrievable id instead of blocking for the whole turn. The
+        # synchronous path below is unchanged and stays the default (Issue
+        # #5335), so existing clients see no behaviour change.
+        if body.get("background") or body.get("store"):
+            try:
+                resp, response_id = self._start_background_response(
+                    agent_id, agent, session, content, caller, idem_key, body
+                )
+            except BaseException:
+                self._idem_release(idem_key)
+                raise
+            self._idem_record(idem_key, body, response_id, _body_of(resp), 202)
+            return resp
+
+        try:
+            reply, usage = await self._dispatch(session, agent, content)
+        except BaseException:
+            self._idem_release(idem_key)
+            raise
+        obj = self._response_object(agent_id, "completed", reply, usage)
+        self._idem_record(idem_key, body, obj.get("id", ""), obj, 200)
+        return JSONResponse(obj)
+
+    @staticmethod
+    def _response_object(
+        agent_id: str,
+        status: str,
+        reply: str,
+        usage: dict,
+        *,
+        response_id: Optional[str] = None,
+        created_at: Optional[int] = None,
+        error: Optional[str] = None,
+        message_id: Optional[str] = None,
+    ) -> dict:
+        """Build a spec-shaped ``response`` object shared by sync + async paths.
+
+        A ``completed`` response always carries an assistant message — even when
+        the text is empty — so clients that read ``output[0]`` for a successful
+        answer keep working (Greptile P1: empty-output shape). Non-terminal
+        statuses (``queued``/``in_progress``) have no message yet. ``message_id``
+        lets a caller pin a stable id across repeated retrievals so polling a
+        completed response returns the same message identity each time
+        (Greptile P2: stable output message id).
+        """
+        output: List[dict] = []
+        if reply or status == "completed":
+            output.append(
+                {
+                    "id": message_id or ("msg-" + uuid.uuid4().hex),
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": reply}],
+                }
+            )
+        obj = {
+            "id": response_id or ("resp-" + uuid.uuid4().hex),
+            "object": "response",
+            "created_at": created_at if created_at is not None else _now(),
+            "model": agent_id,
+            "status": status,
+            "output": output,
+            "output_text": reply,
+            "usage": {
+                "input_tokens": usage["prompt_tokens"],
+                "output_tokens": usage["completion_tokens"],
+                "total_tokens": usage["total_tokens"],
+            },
+        }
+        if error is not None:
+            obj["error"] = {"message": error}
+        return obj
+
+    def _evict_if_full(self) -> None:
+        """Drop the oldest *terminal* entry when the store is at capacity.
+
+        In-flight runs (``queued``/``in_progress``) are never evicted so a
+        client can always retrieve a run it just submitted; only finished runs
+        (whose controller/task are done) are reclaimed (Greptile P1).
+        """
+        while len(self._responses) >= self._responses_max:
+            terminal = [
+                rid
+                for rid, e in self._responses.items()
+                if e.get("status") in ("completed", "cancelled", "failed")
+            ]
+            if not terminal:
+                break  # all in-flight: do not evict live work.
+            # Insertion order == submission order (dict preserves it): oldest first.
+            del self._responses[terminal[0]]
+
+    def _start_background_response(
+        self, agent_id, agent, session, content, caller, idem_key=None, idem_body=None
+    ):
+        """Spawn a background turn, persist a Response object, return ``queued``.
+
+        The run is driven on the event loop as an ``asyncio.Task``; its
+        status/output are recorded in ``self._responses`` so a later
+        ``GET /v1/responses/{id}`` can retrieve them. A per-run
+        ``InterruptController`` is stored so ``.../cancel`` can stop it
+        cooperatively via the same seam the WebSocket/``/stop`` path uses.
+
+        The entry records the submitting ``caller`` so retrieval/cancel can be
+        scoped to the owner, and a stable ``message_id`` so repeated retrievals
+        of a completed run return the same output-message identity.
+
+        When an ``idem_key`` is supplied, the background turn refreshes that
+        key's committed idempotency payload to the *terminal* response once it
+        finishes. This guarantees that if the run is later evicted from
+        ``_responses`` (e.g. by a flood of unkeyed submissions), a retry of the
+        key still replays the final result instead of the stale ``queued``
+        snapshot that was recorded at submission time (Greptile P1).
+
+        Returns ``(response, response_id)`` so the caller can record the minted
+        id against a client ``Idempotency-Key`` (Issue #5726).
+        """
+        from starlette.responses import JSONResponse
+
+        self._evict_if_full()
+
+        response_id = "resp-" + uuid.uuid4().hex
+        created_at = _now()
+        controller = None
+        try:
+            from praisonaiagents.agent.interrupt import InterruptController
+            controller = InterruptController()
+        except Exception:
+            controller = None
+
+        entry: dict = {
+            "id": response_id,
+            "agent_id": agent_id,
+            "owner": caller,
+            "message_id": "msg-" + uuid.uuid4().hex,
+            "status": "in_progress",
+            "reply": "",
+            "usage": self._zero_usage(),
+            "created_at": created_at,
+            "error": None,
+            "controller": controller,
+            "task": None,
+        }
+        self._responses[response_id] = entry
+
+        def _refresh_idem() -> None:
+            # Once the background run reaches a terminal state, overwrite the
+            # idempotency key's committed fallback payload with the final
+            # response so a retry replays the real result even if the run is
+            # later evicted from ``_responses`` (Greptile P1).
+            if not idem_key:
+                return
+            stored = self._idem.get(idem_key)
+            if stored is None or stored.get("response_id") != response_id:
+                return
+            stored["payload"] = self._response_object(
+                entry["agent_id"],
+                entry["status"],
+                entry["reply"],
+                entry["usage"],
+                response_id=entry["id"],
+                created_at=entry["created_at"],
+                error=entry["error"],
+                message_id=entry.get("message_id"),
+            )
+            stored["status_code"] = 200
+
+        async def _run() -> None:
+            rejected: dict = {}
+            try:
+                reply, usage = await self._dispatch(
+                    session, agent, content, interrupt=controller, rejected=rejected
+                )
+                if rejected.get("rejected"):
+                    # Capacity rejection: the agent never ran. Report ``failed``
+                    # with the busy message so a poller never mistakes it for a
+                    # successful result (Greptile P1).
+                    entry["status"] = "failed"
+                    entry["error"] = rejected.get("message") or "rejected"
+                    return
+                entry["reply"] = reply
+                entry["usage"] = usage
+                cancelled = False
+                if controller is not None:
+                    try:
+                        cancelled = bool(controller.is_set())
+                    except Exception:
+                        cancelled = False
+                entry["status"] = "cancelled" if cancelled else "completed"
+            except asyncio.CancelledError:
+                entry["status"] = "cancelled"
+                raise
+            except Exception as exc:  # noqa: BLE001 - surface as failed status
+                entry["status"] = "failed"
+                entry["error"] = str(exc)
+            finally:
+                _refresh_idem()
+
+        try:
+            entry["task"] = asyncio.ensure_future(_run())
+        except RuntimeError:
+            # No running loop (e.g. called outside an event loop): run inline so
+            # the submission never silently drops the turn.
+            entry["status"] = "queued"
+
+        return (
+            JSONResponse(
+                self._response_object(
+                    agent_id,
+                    "queued",
+                    "",
+                    self._zero_usage(),
+                    response_id=response_id,
+                    created_at=created_at,
+                ),
+                status_code=202,
+            ),
+            response_id,
+        )
+
+    def _lookup_owned(self, request) -> tuple:
+        """Resolve a stored response scoped to the requesting caller.
+
+        Returns ``(response_id, entry)`` where ``entry`` is ``None`` when the id
+        is unknown *or* belongs to a different caller. Retrieval/cancel authorize
+        by caller-ownership — not by id alone — so one client cannot read or
+        cancel another client's background run on a shared gateway (Greptile
+        P1 security). To avoid leaking existence, an ownership mismatch is
+        reported as a 404 (same as an unknown id), not a 403.
+
+        Ownership is enforced only for *stable* caller identities — a session
+        header or bearer token, i.e. the same keys that pin a conversation.
+        Anonymous callers (auth disabled, no session header) get a fresh unique
+        key per request and are stateless by design, so they cannot re-identify
+        themselves on a later request; enforcing a match there would make every
+        such run permanently unretrievable. Those runs carry an ``anon:`` owner
+        and are looked up by id alone — the same open posture the no-auth
+        transport already grants every ``/v1/*`` route.
+        """
+        response_id = request.path_params.get("id")
+        entry = self._responses.get(response_id)
+        if entry is None:
+            return response_id, None
+        owner = entry.get("owner")
+        if owner and not str(owner).startswith("anon:"):
+            if owner != self._caller_key(request):
+                return response_id, None
+        return response_id, entry
+
+    def _stored_response_json(self, entry):
+        from starlette.responses import JSONResponse
 
         return JSONResponse(
-            {
-                "id": "resp-" + uuid.uuid4().hex,
-                "object": "response",
-                "created_at": _now(),
-                "model": agent_id,
-                "status": "completed",
-                "output": [
-                    {
-                        "id": "msg-" + uuid.uuid4().hex,
-                        "type": "message",
-                        "role": "assistant",
-                        "content": [{"type": "output_text", "text": reply}],
-                    }
-                ],
-                "output_text": reply,
-            }
+            self._response_object(
+                entry["agent_id"],
+                entry["status"],
+                entry["reply"],
+                entry["usage"],
+                response_id=entry["id"],
+                created_at=entry["created_at"],
+                error=entry["error"],
+                message_id=entry.get("message_id"),
+            )
         )
+
+    # ── OpenAI: responses retrieval ────────────────────────────────────
+    async def openai_responses_get(self, request):
+        """``GET /v1/responses/{id}`` — return the caller's stored Response."""
+        response_id, entry = self._lookup_owned(request)
+        if entry is None:
+            return self._openai_error(
+                f"No such response: {response_id}", 404, "invalid_request_error"
+            )
+        return self._stored_response_json(entry)
+
+    # ── OpenAI: responses cancel ───────────────────────────────────────
+    async def openai_responses_cancel(self, request):
+        """``POST /v1/responses/{id}/cancel`` — stop an in-flight background run.
+
+        Cooperative-first via the run's ``InterruptController`` (checked at the
+        agent's checkpoints); falls back to cancelling the driving task so a run
+        that does not yield is still torn down.
+        """
+        response_id, entry = self._lookup_owned(request)
+        if entry is None:
+            return self._openai_error(
+                f"No such response: {response_id}", 404, "invalid_request_error"
+            )
+
+        if entry["status"] in ("in_progress", "queued"):
+            controller = entry.get("controller")
+            if controller is not None:
+                try:
+                    controller.request("cancel")
+                except Exception:
+                    pass
+            task = entry.get("task")
+            if task is not None and not task.done():
+                try:
+                    task.cancel()
+                except Exception:
+                    pass
+            entry["status"] = "cancelled"
+
+        return self._stored_response_json(entry)
 
     # ── MCP: JSON-RPC ──────────────────────────────────────────────────
     async def mcp_jsonrpc(self, request):
@@ -364,10 +1157,14 @@ class GatewayApiEndpoints:
             )
 
         if method == "initialize":
+            from .server import _installed_gateway_version
             return ok(
                 {
                     "protocolVersion": "2024-11-05",
-                    "serverInfo": {"name": "PraisonAI Gateway", "version": "1.0.0"},
+                    "serverInfo": {
+                        "name": "PraisonAI Gateway",
+                        "version": _installed_gateway_version(),
+                    },
                     "capabilities": {"tools": {}},
                 }
             )
@@ -403,7 +1200,7 @@ class GatewayApiEndpoints:
                 return err(-32602, f"Unknown agent/tool: {name}")
             content = str(arguments.get("message", ""))
             session = self._session_for(agent_id, self._caller_key(request))
-            reply = await self._dispatch(session, agent, content)
+            reply, _usage = await self._dispatch(session, agent, content)
             return ok(
                 {
                     "content": [{"type": "text", "text": reply}],

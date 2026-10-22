@@ -1,14 +1,14 @@
 {
-  "version": "1.5.87",
-  "lastUpdated": "2026-08-27",
+  "version": "1.7.6",
+  "lastUpdated": "2026-10-01",
   "generatedBy": "praisonai._dev.parity.generator",
   "sourceOfTruth": "Python SDK (praisonaiagents)",
-  "status": "PARITY_ACHIEVED",
+  "status": "IN_PROGRESS",
   "summary": {
-    "pythonCoreFeatures": 411,
+    "pythonCoreFeatures": 433,
     "rustFeatures": 667,
-    "gapCount": 129,
-    "parityPercentage": 162.3
+    "gapCount": 150,
+    "parityPercentage": 65.4
   },
   "pythonCoreSDK": {
     "exports": [
@@ -95,6 +95,8 @@
       "ContextTraceSinkProtocol",
       "CorpusStats",
       "CustomToolUseEvent",
+      "DecisionRoutePlan",
+      "DecisionTriageRouter",
       "DeepResearchAgent",
       "DeepResearchResponse",
       "DefaultsConfig",
@@ -140,6 +142,7 @@
       "GuardrailAction",
       "GuardrailConfig",
       "GuardrailResult",
+      "GuardrailRetry",
       "Handoff",
       "HandoffConfig",
       "HandoffCycleError",
@@ -189,6 +192,7 @@
       "MemoryConfig",
       "MessageType",
       "MinimalTelemetry",
+      "ModelRequestBlocked",
       "MultiAgentExecutionConfig",
       "MultiAgentHooksConfig",
       "MultiAgentMemoryConfig",
@@ -255,11 +259,14 @@
       "RulesConfig",
       "RunOutcome",
       "RunStatus",
+      "RunTerminal",
       "SandboxConfig",
       "SandboxProtocol",
       "SandboxResult",
       "SandboxStatus",
       "ScopeRequiredError",
+      "ScriptExhausted",
+      "ScriptedModel",
       "SecurityPolicy",
       "SendResult",
       "Session",
@@ -276,6 +283,7 @@
       "StopReason",
       "StructuredFormatter",
       "SuccessCriterion",
+      "SystemOneResult",
       "Task",
       "TaskOutput",
       "TelemetryCollector",
@@ -314,13 +322,18 @@
       "aembed",
       "aembedding",
       "aembeddings",
+      "allow_model_requests",
       "apply_config_defaults",
       "async_display_callbacks",
+      "asystem_one",
+      "choice_question",
       "clean_triple_backticks",
       "cleanup_telemetry_resources",
+      "collapse",
       "config",
       "configure_structured_logging",
       "create_context_agent",
+      "default_ticket_triage_questions",
       "detect_url_scheme",
       "disable_performance_mode",
       "disable_telemetry",
@@ -364,8 +377,10 @@
       "has_toolset",
       "if_",
       "include",
+      "is_decision_model",
       "is_path_like",
       "is_policy_string",
+      "is_sticky",
       "list_memory_adapters",
       "list_runtimes",
       "list_toolsets",
@@ -373,6 +388,9 @@
       "load_skill",
       "loop",
       "memory",
+      "merge_run_terminal",
+      "no_model_requests",
+      "noul_question",
       "parallel",
       "parallel_handoffs",
       "parse_plugin_header",
@@ -408,13 +426,17 @@
       "resolve_toolsets",
       "resolve_web",
       "route",
+      "score_question",
       "suggest_similar",
       "sync_display_callbacks",
+      "system_one",
       "termination_to_run_status",
       "tool",
       "tools",
       "trace_context",
       "track_workflow",
+      "triage_decision",
+      "triaged_start",
       "unregister_toolset",
       "validate",
       "validate_config",
@@ -426,7 +448,7 @@
     ]
   },
   "rustSDK": {
-    "path": "/home/runner/work/PraisonAI/PraisonAI/src/praisonai-rust",
+    "path": "src/praisonai-rust",
     "exports": [
       "A2A",
       "A2AAgentCapabilities",
@@ -1181,6 +1203,7 @@
         "WebSearchProvider"
       ],
       "config_loader": [
+        "AutoRagConfig",
         "SessionConfig"
       ],
       "context": [
@@ -1816,9 +1839,6 @@
       "sandbox": [],
       "session": [],
       "skills": [],
-      "specialized": [
-        "AutoRagConfig"
-      ],
       "specialized_agents": [],
       "streaming": [],
       "task": [],
@@ -2528,11 +2548,12 @@
       {
         "feature": "loop",
         "python": true,
-        "rust": false,
+        "rust": true,
         "priority": "P1",
         "effort": "low",
-        "status": "TODO",
-        "category": "workflows"
+        "status": "DONE",
+        "category": "workflows",
+        "rustName": "loop_step"
       },
       {
         "feature": "parallel",
@@ -2669,6 +2690,15 @@
         "priority": "P2",
         "effort": "low",
         "status": "DONE",
+        "category": "guardrails"
+      },
+      {
+        "feature": "GuardrailRetry",
+        "python": true,
+        "rust": false,
+        "priority": "P2",
+        "effort": "high",
+        "status": "TODO",
         "category": "guardrails"
       },
       {
@@ -3592,6 +3622,24 @@
         "category": "other"
       },
       {
+        "feature": "DecisionRoutePlan",
+        "python": true,
+        "rust": false,
+        "priority": "P3",
+        "effort": "high",
+        "status": "TODO",
+        "category": "other"
+      },
+      {
+        "feature": "DecisionTriageRouter",
+        "python": true,
+        "rust": false,
+        "priority": "P3",
+        "effort": "high",
+        "status": "TODO",
+        "category": "other"
+      },
+      {
         "feature": "DefaultsConfig",
         "python": true,
         "rust": true,
@@ -4159,6 +4207,15 @@
         "category": "bots"
       },
       {
+        "feature": "ModelRequestBlocked",
+        "python": true,
+        "rust": false,
+        "priority": "P3",
+        "effort": "high",
+        "status": "TODO",
+        "category": "other"
+      },
+      {
         "feature": "MultiAgentExecutionConfig",
         "python": true,
         "rust": true,
@@ -4501,6 +4558,15 @@
         "category": "other"
       },
       {
+        "feature": "RunTerminal",
+        "python": true,
+        "rust": false,
+        "priority": "P3",
+        "effort": "high",
+        "status": "TODO",
+        "category": "other"
+      },
+      {
         "feature": "SandboxConfig",
         "python": true,
         "rust": true,
@@ -4543,6 +4609,24 @@
         "priority": "P3",
         "effort": "low",
         "status": "DONE",
+        "category": "other"
+      },
+      {
+        "feature": "ScriptExhausted",
+        "python": true,
+        "rust": false,
+        "priority": "P3",
+        "effort": "high",
+        "status": "TODO",
+        "category": "other"
+      },
+      {
+        "feature": "ScriptedModel",
+        "python": true,
+        "rust": false,
+        "priority": "P3",
+        "effort": "high",
+        "status": "TODO",
         "category": "other"
       },
       {
@@ -4623,6 +4707,15 @@
         "rust": false,
         "priority": "P3",
         "effort": "high",
+        "status": "TODO",
+        "category": "other"
+      },
+      {
+        "feature": "SystemOneResult",
+        "python": true,
+        "rust": false,
+        "priority": "P3",
+        "effort": "low",
         "status": "TODO",
         "category": "other"
       },
@@ -4825,6 +4918,15 @@
         "category": "embedding"
       },
       {
+        "feature": "allow_model_requests",
+        "python": true,
+        "rust": false,
+        "priority": "P3",
+        "effort": "low",
+        "status": "TODO",
+        "category": "other"
+      },
+      {
         "feature": "apply_config_defaults",
         "python": true,
         "rust": true,
@@ -4843,6 +4945,24 @@
         "category": "main"
       },
       {
+        "feature": "asystem_one",
+        "python": true,
+        "rust": false,
+        "priority": "P3",
+        "effort": "low",
+        "status": "TODO",
+        "category": "other"
+      },
+      {
+        "feature": "choice_question",
+        "python": true,
+        "rust": false,
+        "priority": "P3",
+        "effort": "low",
+        "status": "TODO",
+        "category": "other"
+      },
+      {
         "feature": "clean_triple_backticks",
         "python": true,
         "rust": true,
@@ -4850,6 +4970,15 @@
         "effort": "low",
         "status": "DONE",
         "category": "main"
+      },
+      {
+        "feature": "collapse",
+        "python": true,
+        "rust": false,
+        "priority": "P3",
+        "effort": "low",
+        "status": "TODO",
+        "category": "other"
       },
       {
         "feature": "config",
@@ -4862,6 +4991,15 @@
       },
       {
         "feature": "configure_structured_logging",
+        "python": true,
+        "rust": false,
+        "priority": "P3",
+        "effort": "low",
+        "status": "TODO",
+        "category": "other"
+      },
+      {
+        "feature": "default_ticket_triage_questions",
         "python": true,
         "rust": false,
         "priority": "P3",
@@ -5149,6 +5287,15 @@
         "category": "other"
       },
       {
+        "feature": "is_decision_model",
+        "python": true,
+        "rust": false,
+        "priority": "P3",
+        "effort": "low",
+        "status": "TODO",
+        "category": "other"
+      },
+      {
         "feature": "is_path_like",
         "python": true,
         "rust": true,
@@ -5165,6 +5312,15 @@
         "effort": "low",
         "status": "DONE",
         "category": "config"
+      },
+      {
+        "feature": "is_sticky",
+        "python": true,
+        "rust": false,
+        "priority": "P3",
+        "effort": "low",
+        "status": "TODO",
+        "category": "other"
       },
       {
         "feature": "list_memory_adapters",
@@ -5204,6 +5360,33 @@
       },
       {
         "feature": "memory",
+        "python": true,
+        "rust": false,
+        "priority": "P3",
+        "effort": "low",
+        "status": "TODO",
+        "category": "other"
+      },
+      {
+        "feature": "merge_run_terminal",
+        "python": true,
+        "rust": false,
+        "priority": "P3",
+        "effort": "low",
+        "status": "TODO",
+        "category": "other"
+      },
+      {
+        "feature": "no_model_requests",
+        "python": true,
+        "rust": false,
+        "priority": "P3",
+        "effort": "low",
+        "status": "TODO",
+        "category": "other"
+      },
+      {
+        "feature": "noul_question",
         "python": true,
         "rust": false,
         "priority": "P3",
@@ -5473,6 +5656,15 @@
         "category": "config"
       },
       {
+        "feature": "score_question",
+        "python": true,
+        "rust": false,
+        "priority": "P3",
+        "effort": "low",
+        "status": "TODO",
+        "category": "other"
+      },
+      {
         "feature": "suggest_similar",
         "python": true,
         "rust": true,
@@ -5489,6 +5681,15 @@
         "effort": "low",
         "status": "DONE",
         "category": "main"
+      },
+      {
+        "feature": "system_one",
+        "python": true,
+        "rust": false,
+        "priority": "P3",
+        "effort": "low",
+        "status": "TODO",
+        "category": "other"
       },
       {
         "feature": "termination_to_run_status",
@@ -5525,6 +5726,24 @@
         "effort": "low",
         "status": "DONE",
         "category": "flow_display"
+      },
+      {
+        "feature": "triage_decision",
+        "python": true,
+        "rust": false,
+        "priority": "P3",
+        "effort": "low",
+        "status": "TODO",
+        "category": "other"
+      },
+      {
+        "feature": "triaged_start",
+        "python": true,
+        "rust": false,
+        "priority": "P3",
+        "effort": "low",
+        "status": "TODO",
+        "category": "other"
       },
       {
         "feature": "unregister_toolset",

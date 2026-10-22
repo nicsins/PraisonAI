@@ -4,6 +4,7 @@
 //! the webview a validated port. After that the webview talks to the engine
 //! directly over loopback and nothing streams through Tauri IPC.
 
+use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
@@ -106,11 +107,24 @@ pub fn read_lines_lossy(stream: impl std::io::Read) -> impl Iterator<Item = Stri
 ///
 /// Output is captured from the instant of spawn -- attaching a reader later is
 /// how a first-run failure ends up reported as an exit code with no explanation.
-pub fn start(python: &str, script: &str, timeout: Duration) -> Result<Engine, StartError> {
+pub fn start(
+    python: &str,
+    script: &str,
+    timeout: Duration,
+    shell_version: &str,
+    env: &BTreeMap<String, String>,
+) -> Result<Engine, StartError> {
     let mut command = Command::new(python);
     command
         .arg("-u") // unbuffered, or the announcement sits in a pipe buffer
         .arg(script)
+        // The resolved environment, not the inherited one. An exported
+        // PYTHONHOME or PYTHONPATH points the engine at another interpreter's
+        // stdlib or site-packages, so the venv the resolver just proved is
+        // discarded at spawn -- the module written to prevent exactly that
+        // never ran. Clear first, then apply what `spawn_env` produced.
+        .env_clear()
+        .envs(env)
         // Force UTF-8 on both sides of the pipe. Python encodes redirected
         // streams with the locale code page on Windows -- cp1252, or cp932 on
         // a Japanese install -- and those bytes are not valid UTF-8. One of
@@ -119,6 +133,7 @@ pub fn start(python: &str, script: &str, timeout: Duration) -> Result<Engine, St
         // is a lie about what happened and depends on the user's locale.
         .env("PYTHONUTF8", "1")
         .env("PYTHONIOENCODING", "utf-8")
+        .env("PRAISONAI_DESKTOP_VERSION", shell_version)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     // No console window, and its own process group so stopping the engine also
@@ -171,7 +186,7 @@ pub fn start(python: &str, script: &str, timeout: Duration) -> Result<Engine, St
                     // A port parsed from a log line is a claim. Confirm it before
                     // handing it to the UI, or the first message goes to whatever
                     // else happens to be listening.
-                    if let Some(port) = announced.confirm(probe_health) {
+                    if let Some(port) = announced.confirm(|port| probe_health(port, shell_version)) {
                         return Ok(Engine { port, child });
                     }
                 }
@@ -197,8 +212,8 @@ pub fn start(python: &str, script: &str, timeout: Duration) -> Result<Engine, St
     }
 }
 
-/// Confirm the engine answers on `port` with the shape we expect.
-pub fn probe_health(port: u16) -> bool {
+/// Confirm the engine answers on `port` with the shape and shell version we expect.
+pub fn probe_health(port: u16, expected_shell_version: &str) -> bool {
     use std::io::{Read, Write};
     use std::net::TcpStream;
 
@@ -228,6 +243,7 @@ pub fn probe_health(port: u16) -> bool {
         crate::health::EXPECTED_VERSION,
     )
     .is_ok()
+        && crate::health::shell_version_matches(payload, expected_shell_version)
 }
 
 fn tail(buffer: &str) -> String {

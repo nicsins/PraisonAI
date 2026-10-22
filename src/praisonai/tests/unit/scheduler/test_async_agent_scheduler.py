@@ -65,6 +65,34 @@ class TestAsyncAgentSchedulerInit:
 
 
 # ---------------------------------------------------------------------------
+# get_stats_sync – dict-shape parity with _build_stats (Issue #5321)
+# ---------------------------------------------------------------------------
+
+class TestGetStatsSyncShapeParity:
+    """get_stats_sync must return the same keys as the base _build_stats."""
+
+    def test_get_stats_sync_includes_runtime_and_cost_per_execution(self):
+        scheduler = _make_scheduler()
+        stats = scheduler.get_stats_sync()
+        # Previously the async twin's get_stats_sync omitted these two keys.
+        assert "runtime_seconds" in stats
+        assert "cost_per_execution" in stats
+
+    def test_get_stats_sync_matches_build_stats_keys(self):
+        scheduler = _make_scheduler()
+        sync_stats = scheduler.get_stats_sync()
+        built = scheduler._build_stats(
+            execs=scheduler._execution_count,
+            success=scheduler._success_count,
+            failed=scheduler._failure_count,
+            total_cost=scheduler._total_cost,
+        )
+        assert set(sync_stats.keys()) == set(built.keys())
+        assert "delivered_deliveries" in sync_stats
+        assert "undelivered_deliveries" in sync_stats
+
+
+# ---------------------------------------------------------------------------
 # stop() – finally always clears is_running
 # ---------------------------------------------------------------------------
 
@@ -317,3 +345,74 @@ class TestAsyncAgentSchedulerLifecycle:
         scheduler = AsyncAgentScheduler(mock_agent, "task")
         with pytest.raises(RuntimeError, match="boom"):
             await scheduler.execute_once()
+
+
+class TestAsyncDeliveryOutcomeAccounting:
+    """A failed async scheduled delivery is truthful, not a silent success."""
+
+    @pytest.mark.asyncio
+    async def test_undelivered_fires_on_failure_not_on_success(self):
+        on_success = Mock()
+        on_failure = Mock()
+        mock_agent = Mock()
+        mock_agent.astart = AsyncMock(return_value="Daily summary")
+        scheduler = AsyncAgentScheduler(
+            mock_agent, "task", deliver="telegram:123",
+            on_success=on_success, on_failure=on_failure,
+        )
+        scheduler._delivery = Mock()
+        scheduler._delivery.deliver = Mock(return_value=False)
+        await scheduler._execute_with_retry(max_retries=1)
+        on_success.assert_not_called()
+        on_failure.assert_called_once()
+        assert scheduler._undelivered_count == 1
+        stats = scheduler.get_stats_sync()
+        assert stats["undelivered_deliveries"] == 1
+        assert stats["delivered_deliveries"] == 0
+
+    @pytest.mark.asyncio
+    async def test_delivered_fires_on_success(self):
+        on_success = Mock()
+        on_failure = Mock()
+        mock_agent = Mock()
+        mock_agent.astart = AsyncMock(return_value="Daily summary")
+        scheduler = AsyncAgentScheduler(
+            mock_agent, "task", deliver="telegram:123",
+            on_success=on_success, on_failure=on_failure,
+        )
+        scheduler._delivery = Mock()
+        scheduler._delivery.deliver = Mock(return_value=True)
+        await scheduler._execute_with_retry(max_retries=1)
+        on_success.assert_called_once()
+        on_failure.assert_not_called()
+        assert scheduler._undelivered_count == 0
+        assert scheduler._delivered_count == 1
+        assert scheduler.get_stats_sync()["delivered_deliveries"] == 1
+
+    @pytest.mark.asyncio
+    async def test_not_configured_run_reports_zero_delivered(self):
+        on_success = Mock()
+        mock_agent = Mock()
+        mock_agent.astart = AsyncMock(return_value="Daily summary")
+        scheduler = AsyncAgentScheduler(mock_agent, "task", on_success=on_success)
+        await scheduler._execute_with_retry(max_retries=1)
+        on_success.assert_called_once()
+        assert scheduler._delivered_count == 0
+        stats = scheduler.get_stats_sync()
+        assert stats["delivered_deliveries"] == 0
+        assert stats["undelivered_deliveries"] == 0
+
+    @pytest.mark.asyncio
+    async def test_suppressed_run_reports_zero_delivered(self):
+        on_success = Mock()
+        mock_agent = Mock()
+        mock_agent.astart = AsyncMock(return_value="NO_REPLY")
+        scheduler = AsyncAgentScheduler(
+            mock_agent, "task", deliver="telegram:123", on_success=on_success,
+        )
+        scheduler._delivery = Mock()
+        scheduler._delivery.deliver = Mock(return_value=True)
+        await scheduler._execute_with_retry(max_retries=1)
+        on_success.assert_called_once()
+        assert scheduler._delivered_count == 0
+        assert scheduler.get_stats_sync()["delivered_deliveries"] == 0

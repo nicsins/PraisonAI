@@ -53,9 +53,11 @@ Methods:
 * <code title="class Agent">Agent.<a href="./src/praisonai-agents/praisonaiagents/agent/agent.py">get_recommended_stage</a>(prompt: str) -> str</code>
 * <code title="class Agent">Agent.<a href="./src/praisonai-agents/praisonaiagents/agent/agent.py">get_rules_context</a>(file_path: Optional[str] = None, include_manual: Optional[List[str]] = None) -> str</code>
 * <code title="class Agent">Agent.<a href="./src/praisonai-agents/praisonaiagents/agent/agent.py">get_skills_prompt</a>() -> str</code>
+* <code title="class Agent">Agent.<a href="./src/praisonai-agents/praisonaiagents/agent/agent.py">guardrail_retry_count</a>() -> int</code>
 * <code title="class Agent">Agent.<a href="./src/praisonai-agents/praisonaiagents/agent/agent.py">handoff_to</a>(target_agent: 'Agent', prompt: str, context: Optional[Dict[str, Any]] = None, config: Optional['HandoffConfig'] = None) -> 'HandoffResult'</code>
 * <code title="class Agent">Agent.<a href="./src/praisonai-agents/praisonaiagents/agent/agent.py">handoff_to_async</a>(target_agent: 'Agent', prompt: str, context: Optional[Dict[str, Any]] = None, config: Optional['HandoffConfig'] = None) -> 'HandoffResult'</code>
 * <code title="class Agent">Agent.<a href="./src/praisonai-agents/praisonaiagents/agent/agent.py">is_closed</a>() -> bool</code>
+* <code title="class Agent">Agent.<a href="./src/praisonai-agents/praisonaiagents/agent/agent.py">last_guardrail_error</a>()</code>
 * <code title="class Agent">Agent.<a href="./src/praisonai-agents/praisonaiagents/agent/agent.py">last_stop_reason</a>() -> str</code>
 * <code title="class Agent">Agent.<a href="./src/praisonai-agents/praisonaiagents/agent/agent.py">list_mcp_servers</a>() -> List[str]</code>
 * <code title="class Agent">Agent.<a href="./src/praisonai-agents/praisonaiagents/agent/agent.py">llm_instance</a>()</code>
@@ -68,6 +70,8 @@ Methods:
 * <code title="class Agent">Agent.<a href="./src/praisonai-agents/praisonaiagents/agent/agent.py">query</a>(question: str, **kwargs) -> 'RAGResult'</code>
 * <code title="class Agent">Agent.<a href="./src/praisonai-agents/praisonaiagents/agent/agent.py">rag</a>() -> Optional[Any]</code>
 * <code title="class Agent">Agent.<a href="./src/praisonai-agents/praisonaiagents/agent/agent.py">rag_query</a>(question: str, **kwargs) -> 'RAGResult'</code>
+* <code title="class Agent">Agent.<a href="./src/praisonai-agents/praisonaiagents/agent/agent.py">reasoning_effort</a>() -> Optional[str]</code>
+* <code title="class Agent">Agent.<a href="./src/praisonai-agents/praisonaiagents/agent/agent.py">reasoning_effort</a>(value: Optional[str]) -> None</code>
 * <code title="class Agent">Agent.<a href="./src/praisonai-agents/praisonaiagents/agent/agent.py">redo</a>() -> bool</code>
 * <code title="class Agent">Agent.<a href="./src/praisonai-agents/praisonaiagents/agent/agent.py">refresh_tools</a>() -> List[Any]</code>
 * <code title="class Agent">Agent.<a href="./src/praisonai-agents/praisonaiagents/agent/agent.py">remove_mcp_server</a>(name: str) -> bool</code>
@@ -191,6 +195,7 @@ Methods:
 * <code title="class ToolRegistry">ToolRegistry.<a href="./src/praisonai-agents/praisonaiagents/tools/registry.py">discover_single_file_plugins</a>() -> int</code>
 * <code title="class ToolRegistry">ToolRegistry.<a href="./src/praisonai-agents/praisonaiagents/tools/registry.py">get</a>(name: str) -> Optional[Union[BaseTool, Callable]]</code>
 * <code title="class ToolRegistry">ToolRegistry.<a href="./src/praisonai-agents/praisonaiagents/tools/registry.py">get_all</a>() -> Dict[str, Union[BaseTool, Callable]]</code>
+* <code title="class ToolRegistry">ToolRegistry.<a href="./src/praisonai-agents/praisonaiagents/tools/registry.py">get_tool_definition</a>(name: str) -> Optional[Dict[str, Any]]</code>
 * <code title="class ToolRegistry">ToolRegistry.<a href="./src/praisonai-agents/praisonaiagents/tools/registry.py">get_tool_definitions</a>(permission_resolver: Optional[Callable[[str], bool]] = None) -> List[Dict[str, Any]]</code>
 * <code title="class ToolRegistry">ToolRegistry.<a href="./src/praisonai-agents/praisonaiagents/tools/registry.py">get_trust_level</a>(name: str) -> Optional[str]</code>
 * <code title="class ToolRegistry">ToolRegistry.<a href="./src/praisonai-agents/praisonaiagents/tools/registry.py">list_available_tools</a>(context: Optional[Dict[str, Any]] = None, ttl_seconds: Optional[float] = None) -> List[Union[BaseTool, Callable]]</code>
@@ -226,8 +231,8 @@ Methods:
 * <code title="class Task">Task.<a href="./src/praisonai-agents/praisonaiagents/task/task.py">set_status</a>(new_status: str) -> None</code>
 * <code title="class Task">Task.<a href="./src/praisonai-agents/praisonaiagents/task/task.py">store_in_memory</a>(content: str, agent_name: str = None, task_id: str = None)</code>
 * <code title="class Task">Task.<a href="./src/praisonai-agents/praisonaiagents/task/task.py">to_dict</a>() -> Dict[str, Any]</code>
-* <code title="function">praisonaiagents.<a href="./src/praisonai-agents/praisonaiagents/workflows/workflows.py">loop</a>(step: Any = None, steps: Optional[List[Any]] = None, over: Optional[str] = None, from_csv: Optional[str] = None, from_file: Optional[str] = None, var_name: str = 'item', parallel: bool = False, max_workers: Optional[int] = None, output_variable: Optional[str] = None) -> Loop</code>
-* <code title="function">praisonaiagents.<a href="./src/praisonai-agents/praisonaiagents/workflows/workflows.py">parallel</a>(steps: List, max_workers: Optional[int] = None, on_failure: str = 'partial_ok') -> Parallel</code>
+* <code title="function">praisonaiagents.<a href="./src/praisonai-agents/praisonaiagents/workflows/workflows.py">loop</a>(step: Any = None, steps: Optional[List[Any]] = None, over: Optional[str] = None, from_csv: Optional[str] = None, from_file: Optional[str] = None, var_name: str = 'item', parallel: bool = False, max_workers: Optional[int] = None, output_variable: Optional[str] = None, context: str = 'full') -> Loop</code>
+* <code title="function">praisonaiagents.<a href="./src/praisonai-agents/praisonaiagents/workflows/workflows.py">parallel</a>(steps: List, max_workers: Optional[int] = None, on_failure: str = 'partial_ok', timeout: Optional[float] = None, context: str = 'full') -> Parallel</code>
 * <code title="function">praisonaiagents.<a href="./src/praisonai-agents/praisonaiagents/workflows/workflows.py">repeat</a>(step: Any, until: Optional[Callable[[WorkflowContext], bool]] = None, max_iterations: int = 10) -> Repeat</code>
 * <code title="function">praisonaiagents.<a href="./src/praisonai-agents/praisonaiagents/workflows/workflows.py">route</a>(routes: Dict[str, List], default: Optional[List] = None) -> Route</code>
 
@@ -267,14 +272,14 @@ Methods:
 * <code title="class Memory">Memory.<a href="./src/praisonai-agents/praisonaiagents/memory/memory.py">reset_user_memory</a>()</code>
 * <code title="class Memory">Memory.<a href="./src/praisonai-agents/praisonaiagents/memory/memory.py">search</a>(query: str, user_id: Optional[str] = None, agent_id: Optional[str] = None, run_id: Optional[str] = None, limit: int = 5, rerank: bool = False, **kwargs) -> List[Dict[str, Any]]</code>
 * <code title="class Memory">Memory.<a href="./src/praisonai-agents/praisonaiagents/memory/memory.py">search_entity</a>(query: str, limit: int = 5) -> List[Dict[str, Any]]</code>
-* <code title="class Memory">Memory.<a href="./src/praisonai-agents/praisonaiagents/memory/memory.py">search_long_term</a>(query: str, limit: int = 5, relevance_cutoff: float = 0.0, min_quality: float = 0.0, rerank: bool = False, metadata_filter: Optional[Dict[str, Any]] = None, user_id: Optional[str] = None, **kwargs) -> List[Dict[str, Any]]</code>
-* <code title="class Memory">Memory.<a href="./src/praisonai-agents/praisonaiagents/memory/memory.py">search_short_term</a>(query: str, limit: int = 5, min_quality: float = 0.0, relevance_cutoff: float = 0.0, rerank: bool = False, metadata_filter: Optional[Dict[str, Any]] = None, user_id: Optional[str] = None, **kwargs) -> List[Dict[str, Any]]</code>
+* <code title="class Memory">Memory.<a href="./src/praisonai-agents/praisonaiagents/memory/memory.py">search_long_term</a>(query: str, limit: int = 5, relevance_cutoff: float = 0.0, min_quality: float = 0.0, rerank: bool = False, metadata_filter: Optional[Dict[str, Any]] = None, user_id: Optional[str] = None, min_trust = None, **kwargs) -> List[Dict[str, Any]]</code>
+* <code title="class Memory">Memory.<a href="./src/praisonai-agents/praisonaiagents/memory/memory.py">search_short_term</a>(query: str, limit: int = 5, min_quality: float = 0.0, relevance_cutoff: float = 0.0, rerank: bool = False, metadata_filter: Optional[Dict[str, Any]] = None, user_id: Optional[str] = None, min_trust = None, **kwargs) -> List[Dict[str, Any]]</code>
 * <code title="class Memory">Memory.<a href="./src/praisonai-agents/praisonaiagents/memory/memory.py">search_user_memory</a>(user_id: str, query: str, limit: int = 5, rerank: bool = False, **kwargs) -> List[Dict[str, Any]]</code>
 * <code title="class Memory">Memory.<a href="./src/praisonai-agents/praisonaiagents/memory/memory.py">search_with_quality</a>(query: str, min_quality: float = 0.0, memory_type: Literal['short', 'long'] = 'long', limit: int = 5) -> List[Dict[str, Any]]</code>
 * <code title="class Memory">Memory.<a href="./src/praisonai-agents/praisonaiagents/memory/memory.py">store_entity</a>(name: str, type_: str, desc: str, relations: str)</code>
-* <code title="class Memory">Memory.<a href="./src/praisonai-agents/praisonaiagents/memory/memory.py">store_long_term</a>(text: str, metadata: Dict[str, Any] = None, completeness: float = None, relevance: float = None, clarity: float = None, accuracy: float = None, weights: Dict[str, float] = None, evaluator_quality: float = None)</code>
+* <code title="class Memory">Memory.<a href="./src/praisonai-agents/praisonaiagents/memory/memory.py">store_long_term</a>(text: str, metadata: Dict[str, Any] = None, completeness: float = None, relevance: float = None, clarity: float = None, accuracy: float = None, weights: Dict[str, float] = None, evaluator_quality: float = None, trust = None, origin: Optional[str] = None)</code>
 * <code title="class Memory">Memory.<a href="./src/praisonai-agents/praisonaiagents/memory/memory.py">store_quality</a>(text: str, quality_score: float, task_id: Optional[str] = None, iteration: Optional[int] = None, metrics: Optional[Dict[str, float]] = None, memory_type: Literal['short', 'long'] = 'long') -> None</code>
-* <code title="class Memory">Memory.<a href="./src/praisonai-agents/praisonaiagents/memory/memory.py">store_short_term</a>(text: str, metadata: Dict[str, Any] = None, completeness: float = None, relevance: float = None, clarity: float = None, accuracy: float = None, weights: Dict[str, float] = None, evaluator_quality: float = None)</code>
+* <code title="class Memory">Memory.<a href="./src/praisonai-agents/praisonaiagents/memory/memory.py">store_short_term</a>(text: str, metadata: Dict[str, Any] = None, completeness: float = None, relevance: float = None, clarity: float = None, accuracy: float = None, weights: Dict[str, float] = None, evaluator_quality: float = None, trust = None, origin: Optional[str] = None)</code>
 * <code title="class Memory">Memory.<a href="./src/praisonai-agents/praisonaiagents/memory/memory.py">store_user_memory</a>(user_id: str, text: str, extra: Dict[str, Any] = None)</code>
 * <code title="class MemoryConfig">MemoryConfig.<a href="./src/praisonai-agents/praisonaiagents/config/feature_configs.py">to_dict</a>() -> Dict[str, Any]</code>
 
@@ -305,9 +310,9 @@ Methods:
 * <code title="class Knowledge">Knowledge.<a href="./src/praisonai-agents/praisonaiagents/knowledge/knowledge.py">markdown</a>()</code>
 * <code title="class Knowledge">Knowledge.<a href="./src/praisonai-agents/praisonaiagents/knowledge/knowledge.py">memory</a>()</code>
 * <code title="class Knowledge">Knowledge.<a href="./src/praisonai-agents/praisonaiagents/knowledge/knowledge.py">normalize_content</a>(content)</code>
-* <code title="class Knowledge">Knowledge.<a href="./src/praisonai-agents/praisonaiagents/knowledge/knowledge.py">reset</a>()</code>
+* <code title="class Knowledge">Knowledge.<a href="./src/praisonai-agents/praisonaiagents/knowledge/knowledge.py">reset</a>() -> bool</code>
 * <code title="class Knowledge">Knowledge.<a href="./src/praisonai-agents/praisonaiagents/knowledge/knowledge.py">search</a>(query, user_id = None, agent_id = None, run_id = None, rerank = None, **kwargs)</code>
-* <code title="class Knowledge">Knowledge.<a href="./src/praisonai-agents/praisonaiagents/knowledge/knowledge.py">store</a>(content, user_id = None, agent_id = None, run_id = None, metadata = None)</code>
+* <code title="class Knowledge">Knowledge.<a href="./src/praisonai-agents/praisonaiagents/knowledge/knowledge.py">store</a>(content, user_id = None, agent_id = None, run_id = None, metadata = None, is_content = False)</code>
 * <code title="class Knowledge">Knowledge.<a href="./src/praisonai-agents/praisonaiagents/knowledge/knowledge.py">update</a>(memory_id, data)</code>
 * <code title="class KnowledgeConfig">KnowledgeConfig.<a href="./src/praisonai-agents/praisonaiagents/config/feature_configs.py">to_dict</a>() -> Dict[str, Any]</code>
 
@@ -385,6 +390,7 @@ Methods:
 * <code title="class LLMGuardrail">LLMGuardrail.<a href="./src/praisonai-agents/praisonaiagents/guardrails/llm_guardrail.py">validate_input</a>(content: str, **kwargs) -> Tuple[bool, str]</code>
 * <code title="class LLMGuardrail">LLMGuardrail.<a href="./src/praisonai-agents/praisonaiagents/guardrails/llm_guardrail.py">validate_output</a>(content: str, **kwargs) -> Tuple[bool, str]</code>
 * <code title="class LLMGuardrail">LLMGuardrail.<a href="./src/praisonai-agents/praisonaiagents/guardrails/llm_guardrail.py">validate_tool_call</a>(tool_name: str, arguments: Dict[str, Any], **kwargs) -> Tuple[bool, Dict[str, Any]]</code>
+* <code title="class LLMGuardrail">LLMGuardrail.<a href="./src/praisonai-agents/praisonaiagents/guardrails/llm_guardrail.py">validate_tool_result</a>(tool_name: str, result: Any, **kwargs) -> Tuple[bool, Any]</code>
 
 # Planning
 
@@ -708,8 +714,11 @@ Methods:
 * <code title="class AgentFlow">AgentFlow.<a href="./src/praisonai-agents/praisonaiagents/workflows/workflows.py">reasoning</a>() -> bool</code>
 * <code title="class AgentFlow">AgentFlow.<a href="./src/praisonai-agents/praisonaiagents/workflows/workflows.py">run</a>(input: str = '', llm: Optional[str] = None, verbose: bool = False, stream: bool = None) -> Dict[str, Any]</code>
 * <code title="class AgentFlow">AgentFlow.<a href="./src/praisonai-agents/praisonaiagents/workflows/workflows.py">start</a>(input: str = '', **kwargs) -> Dict[str, Any]</code>
+* <code title="class AgentFlow">AgentFlow.<a href="./src/praisonai-agents/praisonaiagents/workflows/workflows.py">state</a>()</code>
 * <code title="class AgentFlow">AgentFlow.<a href="./src/praisonai-agents/praisonaiagents/workflows/workflows.py">stream</a>() -> bool</code>
 * <code title="class AgentFlow">AgentFlow.<a href="./src/praisonai-agents/praisonaiagents/workflows/workflows.py">to_dict</a>() -> Dict[str, Any]</code>
+* <code title="class AgentFlow">AgentFlow.<a href="./src/praisonai-agents/praisonaiagents/workflows/workflows.py">to_mermaid</a>() -> str</code>
+* <code title="class AgentFlow">AgentFlow.<a href="./src/praisonai-agents/praisonaiagents/workflows/workflows.py">validate_variables</a>() -> None</code>
 * <code title="class AgentFlow">AgentFlow.<a href="./src/praisonai-agents/praisonaiagents/workflows/workflows.py">verbose</a>() -> bool</code>
 * <code title="class AgentFlow">AgentFlow.<a href="./src/praisonai-agents/praisonaiagents/workflows/workflows.py">verbose</a>(value: bool)</code>
 * <code title="class AgentFlow">AgentFlow.<a href="./src/praisonai-agents/praisonaiagents/workflows/workflows.py">where_does_it_run</a>() -> str</code>
@@ -743,7 +752,7 @@ Methods:
 * <code title="class AgentTeam">AgentTeam.<a href="./src/praisonai-agents/praisonaiagents/agents/agents.py">get_spawned_agents</a>() -> List[SpawnedSubAgent]</code>
 * <code title="class AgentTeam">AgentTeam.<a href="./src/praisonai-agents/praisonaiagents/agents/agents.py">get_state</a>(key: str, default: Any = None) -> Any</code>
 * <code title="class AgentTeam">AgentTeam.<a href="./src/praisonai-agents/praisonaiagents/agents/agents.py">get_task_details</a>(task_id)</code>
-* <code title="class AgentTeam">AgentTeam.<a href="./src/praisonai-agents/praisonaiagents/agents/agents.py">get_task_result</a>(task_id)</code>
+* <code title="class AgentTeam">AgentTeam.<a href="./src/praisonai-agents/praisonaiagents/agents/agents.py">get_task_result</a>(task_id, tasks = None)</code>
 * <code title="class AgentTeam">AgentTeam.<a href="./src/praisonai-agents/praisonaiagents/agents/agents.py">get_task_status</a>(task_id)</code>
 * <code title="class AgentTeam">AgentTeam.<a href="./src/praisonai-agents/praisonaiagents/agents/agents.py">get_todo_markdown</a>() -> str</code>
 * <code title="class AgentTeam">AgentTeam.<a href="./src/praisonai-agents/praisonaiagents/agents/agents.py">get_token_usage_summary</a>() -> Dict[str, Any]</code>
@@ -767,7 +776,7 @@ Methods:
 * <code title="class AgentTeam">AgentTeam.<a href="./src/praisonai-agents/praisonaiagents/agents/agents.py">wait_for_completions</a>(timeout: Optional[float] = None, agent_ids: Optional[List[str]] = None) -> List[SubAgentCompletionEvent]</code>
 * <code title="class AgentTeam">AgentTeam.<a href="./src/praisonai-agents/praisonaiagents/agents/agents.py">where_does_it_run</a>() -> str</code>
 * <code title="class AutoApproveBackend">AutoApproveBackend.<a href="./src/praisonai-agents/praisonaiagents/approval/backends.py">request_approval</a>(request: ApprovalRequest) -> ApprovalDecision</code>
-* <code title="class AutoApproveBackend">AutoApproveBackend.<a href="./src/praisonai-agents/praisonaiagents/approval/backends.py">request_approval_sync</a>(request: ApprovalRequest) -> ApprovalDecision</code>
+* <code title="class AutoApproveBackend">AutoApproveBackend.<a href="./src/praisonai-agents/praisonaiagents/approval/backends.py">request_approval_sync</a>(request: ApprovalRequest, timeout: Optional[float] = None) -> ApprovalDecision</code>
 * <code title="class RunOutcome">RunOutcome.<a href="./src/praisonai-agents/praisonaiagents/agent/run_outcome.py">completed</a>(output: Optional[str] = None) -> 'RunOutcome'</code>
 * <code title="class RunOutcome">RunOutcome.<a href="./src/praisonai-agents/praisonaiagents/agent/run_outcome.py">from_exception</a>(exc: BaseException, output: Optional[str] = None) -> 'RunOutcome'</code>
 * <code title="class RunOutcome">RunOutcome.<a href="./src/praisonai-agents/praisonaiagents/agent/run_outcome.py">succeeded</a>() -> bool</code>
@@ -779,7 +788,7 @@ Methods:
 
 Types:
 ```python
-from praisonai import Agent, AgentApp, AgentOS, AnthropicManagedAgent, DB, HostedAgent, HostedAgentConfig, LocalAgent, LocalAgentConfig, LocalManagedAgent, LocalManagedConfig, ManagedAgent, ManagedConfig, __version__, arun, run
+from praisonai import Agent, AgentApp, AgentOS, AnthropicManagedAgent, HostedAgent, HostedAgentConfig, LocalAgent, LocalAgentConfig, LocalManagedAgent, LocalManagedConfig, ManagedAgent, ManagedConfig, __version__, arun, run
 ```
 
 # CLI
@@ -904,6 +913,7 @@ Methods:
 * <code title="cli">praisonai schedule remove <a href="./src/praisonai/praisonai/cli/commands/schedule.py">--help</a></code>
 * <code title="cli">praisonai schedule restart <a href="./src/praisonai/praisonai/cli/commands/schedule.py">--help</a></code>
 * <code title="cli">praisonai schedule resume <a href="./src/praisonai/praisonai/cli/commands/schedule.py">--help</a></code>
+* <code title="cli">praisonai schedule run <a href="./src/praisonai/praisonai/cli/commands/schedule.py">--help</a></code>
 * <code title="cli">praisonai schedule runs <a href="./src/praisonai/praisonai/cli/commands/schedule.py">--help</a></code>
 * <code title="cli">praisonai schedule schedule-callback <a href="./src/praisonai/praisonai/cli/commands/schedule.py">--help</a></code>
 * <code title="cli">praisonai schedule start <a href="./src/praisonai/praisonai/cli/commands/schedule.py">--help</a></code>
@@ -922,17 +932,25 @@ Methods:
 
 Types/Exports:
 ```ts
-export { Agent, AgentTeam, Agents, PraisonAIAgents, Router } from "./agent";
-export type { AgentEvent, AgentStreamOptions, AgentTeamConfig, PraisonAIAgentsConfig, SimpleAgentConfig, SimpleRouteConfig, SimpleRouterConfig, StopReason } from "./agent";
+export { Agent, AgentTeam, Agents, CodeAgent, EmbeddingAgent, OCRAgent, PraisonAIAgents, RealtimeAgent, Router, TASK_STATUS, VideoAgent, VisionAgent, createCodeAgent, createEmbeddingAgent, createOCRAgent, createRealtimeAgent, createSubprocessExecutor, createVideoAgent, createVisionAgent } from "./agent";
+export type { AgentChatCallOptions, AgentChatOptions, AgentEvent, AgentExecuteTask, AgentGuardrailEntry, AgentGuardrailFunction, AgentGuardrailInput, AgentHooksInput, AgentMemoryStore, AgentMessage, AgentRetryConfig, AgentStreamOptions, AgentTaskLike, AgentTeamConfig, AgentTeamProcess, AgentTeamStartDictOptions, AgentTeamStartOptions, AgentTeamStartOptionsInput, AgentWebConfig, PraisonAIAgentsConfig, SimpleAgentConfig, SimpleRouteConfig, SimpleRouterConfig, StopReason, TaskCallback, TaskGuardrail, TaskOnError } from "./agent";
 export { AudioAgent, createAudioAgent } from "./agent/audio";
-export type { AudioAgentConfig, AudioProvider, AudioSpeakOptions, AudioSpeakResult, AudioTranscribeOptions, AudioTranscribeResult } from "./agent/audio";
-export { ContextAgent, createContextAgent } from "./agent/context";
-export { ContextPolicy, Handoff, HandoffCycleError, HandoffDepthError, HandoffError, HandoffTimeoutError, RECOMMENDED_PROMPT_PREFIX, handoff, handoffFilters, promptWithHandoffInstructions } from "./agent/handoff";
+export type { AudioAgentConfig, AudioConfig, AudioProvider, AudioSpeakOptions, AudioSpeakResult, AudioTranscribeOptions, AudioTranscribeResult } from "./agent/audio";
+export { ContextAgent, createContextAgent, create_context_agent } from "./agent/context";
+export { ContextPolicy, DEFAULT_HANDOFF_TOOL_POLICY, Handoff, HandoffCycleError, HandoffDepthError, HandoffError, HandoffTimeoutError, HandoffToolPolicyMode, RECOMMENDED_PROMPT_PREFIX, handoff, handoffFilters, handoffToolName, handoff_filters, listAgentTools, parallelHandoffs, parallel_handoffs, promptWithHandoffInstructions, prompt_with_handoff_instructions, resolveHandoffToolPolicy } from "./agent/handoff";
+export { Heartbeat, HeartbeatConfig, parseHeartbeatSchedule } from "./agent/heartbeat";
+export type { HeartbeatAgent, HeartbeatOnError, HeartbeatOptions } from "./agent/heartbeat";
 export { ImageAgent, createImageAgent } from "./agent/image";
 export { PromptExpanderAgent, createPromptExpanderAgent } from "./agent/prompt-expander";
 export { QueryRewriterAgent, createQueryRewriterAgent } from "./agent/query-rewriter";
-export { DeepResearchAgent, createDeepResearchAgent } from "./agent/research";
+export { DeepResearchAgent, Provider, createDeepResearchAgent } from "./agent/research";
+export { RetryBackoffConfig, interruptibleSleep, jitteredBackoff } from "./agent/retry-utils";
+export type { JitteredBackoffOptions, RetryBackoffConfigOptions } from "./agent/retry-utils";
 export { RouterAgent, createRouter, routeConditions } from "./agent/router";
+export { // Canonical terminal-outcome contract (praisonaiagents/run_outcome.py)
+  RunTerminal, AGENT_RUN_STATUSES, AgentRunOutcome, PROVIDER_BLOCK_REASONS, RunOutcome, TERMINAL_REASON_PRECEDENCE, TERMINATION_TO_RUN_STATUS, TerminationReason, classifyFinishReason, collapse, isSticky, is_sticky, mergeRunTerminal, merge_run_terminal, terminationToRunStatus, termination_to_run_status, validateDecisionString, validate_decision_string } from "./agent/run-outcome";
+export type { AgentRunOutcomeFailureOptions, AgentRunOutcomeInit, AgentRunOutcomeOptions, AgentRunStatus, RunOutcomeInit, RunTerminalInit, TerminalKind, TerminalReason, TerminalSource } from "./agent/run-outcome";
+export { reviewTaskOutput } from "./agent/task-review";
 export { // Agent loop
   createAgentLoop, // DevTools
   enableDevTools, // MCP
@@ -949,6 +967,7 @@ export { // Agent loop
   defineTool, // UI Message (AI SDK v6 parity)
   convertToModelMessages, AIAgentStep, AIEmbedManyResult, AIEmbedOptions, AIEmbedResult, AIFilePart, AIGenerateImageOptions, AIGenerateImageResult, AIGenerateObjectOptions, AIGenerateObjectResult, AIGenerateTextOptions, AIGenerateTextResult, AIImagePart, AIMiddleware, AIMiddlewareConfig, AIModelMessage, AISpan, AISpanKind, AISpanOptions, AISpanStatus, AIStreamObjectOptions, AIStreamObjectResult, AIStreamTextOptions, AIStreamTextResult, AITelemetryEvent, AITelemetrySettings, AITextPart, AIToolDefinition, AITracer, AgentLoop, DANGEROUS_PATTERNS, MCPClientType, MODEL_ALIASES, SPEECH_MODELS, TRANSCRIPTION_MODELS, ToolApprovalDeniedError, ToolApprovalTimeoutError, aiEmbed, aiEmbedMany, aiGenerateImage, aiGenerateObject, aiGenerateText, aiStreamObject, aiStreamText, applyMiddleware, autoEnableDevTools, base64ToUint8Array, clearAICache, clearEvents, closeAllMCPClients, closeMCPClient, convertToUIMessages, createAILoggingMiddleware, createAISpan, createApprovalResponse, createDangerousPatternChecker, createDevToolsMiddleware, createExpressHandler, createFastifyHandler, createFilePart, createHonoHandler, createMultimodalMessage, createNestHandler, createPagesHandler, createPdfPart, createSystemMessage, createTelemetryMiddleware, createTelemetrySettings, createTextMessage, createTextPart, createToolSet, disableAITelemetry, disableDevTools, enableAITelemetry, functionToTool, getAICacheStats, getApprovalManager, getDevToolsState, getDevToolsUrl, getEvents, getMCPClient, getModel, getTelemetrySettings, getToolsNeedingApproval, getTracer, hasModelAlias, hasPendingApprovals, initOpenTelemetry, isDangerous, isDataUrl, isDevToolsEnabled, isTelemetryEnabled, isUrl, listModelAliases, mcpToolsToAITools, parseModel, pipeUIMessageStreamToResponse, recordEvent, resolveModelAlias, safeValidateUIMessages, setApprovalManager, stopAfterSteps, stopWhen, stopWhenNoToolCalls, toMessageContent, toUIMessageStreamResponse, transcribe, uint8ArrayToBase64, validateUIMessages, withApproval, withSpan, wrapModel } from "./ai";
 export { AutoAgents, AutoTaskConfig, createAutoAgents } from "./auto";
+export { BotRunStatus } from "./bots/protocols";
 export { BaseCache, FileCache, MemoryCache, createFileCache, createMemoryCache } from "./cache";
 export { CLI_SPEC_VERSION, executeCommand, parseArgs } from "./cli";
 export { // Autonomy Mode
@@ -967,26 +986,33 @@ export { // Autonomy Mode
   SandboxExecutor, // Scheduler
   Scheduler, // Slash Commands
   SlashCommandHandler, AiderAgent, ClaudeCodeAgent, CodexCliAgent, CommandValidator, CostTokenUsage, DEFAULT_BLOCKED_COMMANDS, DEFAULT_BLOCKED_PATHS, DEFAULT_IGNORE_PATTERNS, DiffViewer, FileCheckpointStorage, FileJobStorage, GeminiCliAgent, GenericExternalAgent, HistoryManager, MODEL_PRICING, MODE_POLICIES, MemoryCheckpointStorage, MemoryJobStorage, StatusDisplay, addLineRangeToFileMatch, cliApprovalPrompt, createAutonomyManager, createCheckpointManager, createCostTracker, createDiffViewer, createExternalAgent, createFastContext, createFileCheckpointStorage, createFileJobStorage, createFileMatch, createFlowDisplay, createGitManager, createHistoryManager, createInteractiveTUI, createJobQueue, createLineRange, createN8NIntegration, createRepoMap, createSandboxExecutor, createScheduler, createSlashCommandHandler, createStatusDisplay, cronExpressions, estimateTokens, executeSlashCommand, externalAgentAsTool, formatCost, getExternalAgentRegistry, getLineCount, getQuickContext, getRepoTree, getTotalLines, isSlashCommand, mergeRanges, parseSlashCommand, rangesOverlap, registerCommand, renderWorkflow, sandboxExec, triggerN8NWebhook } from "./cli/features";
+export { ComputeError, DockerCompute, LocalCompute, listComputeProviders, registerComputeProvider, resolveComputeProvider } from "./compute";
 export { // Classes
   DictCondition, // Functions
   evaluateCondition, // Types
-  type ConditionProtocol, ExpressionCondition, FunctionCondition, andConditions, createCondition, notCondition, orConditions } from "./conditions";
+  type ConditionProtocol, ExpressionCondition, FunctionCondition, andConditions, createCondition, evaluate_condition, notCondition, orConditions } from "./conditions";
 export { // Enums
   MemoryBackend, // Errors
   ConfigValidationError, // Parse utilities
   detect_url_scheme, // Presets
   MEMORY_PRESETS, // Resolver functions
-  resolve, AUTONOMY_PRESETS, ArrayMode, CACHING_PRESETS, CONTEXT_PRESETS, ChunkingStrategy, EXECUTION_PRESETS, ExecutionPreset, FeatureMemoryConfig, GUARDRAIL_PRESETS, GuardrailAction, KNOWLEDGE_PRESETS, MEMORY_URL_SCHEMES, MULTI_AGENT_EXECUTION_PRESETS, MULTI_AGENT_OUTPUT_PRESETS, OUTPUT_PRESETS, OutputPreset, PLANNING_PRESETS, REFLECTION_PRESETS, WEB_PRESETS, WebSearchProvider, apply_config_defaults, clean_triple_backticks, get_config, get_config_path, get_default, get_defaults_config, get_plugins_config, is_path_like, is_policy_string, parse_policy_string, resolve_autonomy, resolve_caching, resolve_context, resolve_execution, resolve_guardrails, resolve_hooks, resolve_knowledge, resolve_memory, resolve_output, resolve_planning, resolve_reflection, resolve_routing, resolve_skills, resolve_web, suggest_similar, validate_config } from "./config";
+  resolve, AUTONOMY_PRESETS, ArrayMode, CACHING_PRESETS, CONTEXT_PRESETS, ChunkingStrategy, EXECUTION_PRESETS, ExecutionPreset, FeatureMemoryConfig, GUARDRAIL_PRESETS, GuardrailAction, KNOWLEDGE_PRESETS, LearnBackend, LearnMode, LearnScope, MEMORY_URL_SCHEMES, MULTI_AGENT_EXECUTION_PRESETS, MULTI_AGENT_OUTPUT_PRESETS, OUTPUT_PRESETS, OutputPreset, PLANNING_PRESETS, PreCompactionMemoryFlushConfig, REFLECTION_PRESETS, RulesConfig, ToolSearchConfig, WEB_PRESETS, WebSearchProvider, apply_config_defaults, clean_triple_backticks, get_config, get_config_path, get_default, get_defaults_config, get_plugins_config, is_path_like, is_policy_string, parse_policy_string, resolve_autonomy, resolve_caching, resolve_context, resolve_execution, resolve_guardrails, resolve_hooks, resolve_knowledge, resolve_memory, resolve_output, resolve_planning, resolve_reflection, resolve_routing, resolve_skills, resolve_web, suggest_similar, validate_config } from "./config";
 export { createDbAdapter, db, getDefaultDbAdapter, setDefaultDbAdapter } from "./db";
 export type { DbAdapter, DbConfig, DbMessage, DbRun, DbTrace } from "./db";
 export { MemoryPostgresAdapter, NeonPostgresAdapter, PostgresSessionStorage, createMemoryPostgres, createNeonPostgres, createPostgresSessionStorage } from "./db/postgres";
 export { MemoryRedisAdapter, UpstashRedisAdapter, createMemoryRedis, createUpstashRedis } from "./db/redis";
 export { SQLiteAdapter, createSQLiteAdapter } from "./db/sqlite";
-export { // Types
-  type DisplayCallback, DisplayFlow, DisplayFlowConfig, asyncDisplayCallbacks, clearDisplayCallbacks, clearErrorLogs, displayError, displayGenerating, displayInstruction, displayInteraction, displaySelfReflection, displayToolCall, errorLogs, logError, registerDisplay, syncDisplayCallbacks } from "./display";
+export { KNOWN_DECISION_MODELS, choiceQuestion, defaultTicketTriageQuestions, getChoice, getNoul, getScore, isDecisionModel, noulQuestion, resolveSystemOneBaseUrl, scoreQuestion, systemOne, triagedStart } from "./decisions";
+export type { DecisionAgentLike, DecisionRoutePlan, QuestionSpec, RouteTarget, SystemOneAnswer, SystemOneOptions, SystemOneResult } from "./decisions";
+export { // Functions
+  // NB: the unaliased registerDisplayCallback name belongs to the per-type
+  // callback registry (callbacks module, // Types
+  type DisplayCallback, DisplayFlow, DisplayFlowConfig, asyncDisplayCallbacks, async_display_callbacks, clearDisplayCallbacks, clearErrorLogs, displayError, displayGenerating, displayInstruction, displayInteraction, displaySelfReflection, displayToolCall, display_error, display_generating, display_instruction, display_interaction, display_self_reflection, display_tool_call, errorLogs, error_logs, logError, registerDisplay, register_display_callback, syncDisplayCallbacks, sync_display_callbacks } from "./display";
 export { // Functions
   embed, // Types
-  type EmbeddingResult, aembed, aembedding, aembeddings, cosineSimilarity, embedding, embeddings, euclideanDistance, getDimensions, normalizeEmbedding, setEmbeddingConfig } from "./embeddings";
+  type EmbeddingResult, aembed, aembedding, aembeddings, cosineSimilarity, embedding, embeddings, euclideanDistance, getDimensions, get_dimensions, normalizeEmbedding, setEmbeddingConfig } from "./embeddings";
+export { AGENT_ERROR_KINDS, FailoverDecision, IdleTimeoutBreaker, LEGACY_ERROR_CATEGORY_MAP, LLMError, NetworkError, PraisonAIConfigError, PraisonAIError, ToolExecutionError, ValidationError, isAgentErrorKind, isErrorContext, resolveErrorCategory } from "./errors";
+export type { AgentErrorKind, ErrorContextProtocol, FailoverAction, FailoverDecisionOptions, LLMErrorOptions, LegacyErrorCategory, NetworkErrorOptions, PraisonAIConfigErrorOptions, PraisonAIErrorOptions, ToolExecutionErrorOptions, ValidationErrorOptions } from "./errors";
 export { // LLM-as-Judge
   Judge, AccuracyJudge, CriteriaJudge, EvalResults, EvalSuite, Evaluator, RecipeJudge, accuracyEval, addJudge, addOptimizationRule, containsKeywordsCriterion, createDefaultEvaluator, createEvalResults, createEvaluator, getJudge, getOptimizationRule, lengthCriterion, listJudges, listOptimizationRules, noHarmfulContentCriterion, parseJudgeResponse, performanceEval, relevanceCriterion, reliabilityEval, removeJudge, removeOptimizationRule } from "./eval";
 export { AgentEventBus, AgentEvents, EventEmitterPubSub, PubSub, createEventBus, createPubSub } from "./events";
@@ -995,7 +1021,8 @@ export { // Bot types
   FailoverManager, // Enums
   SandboxStatus, // Gateway types
   type GatewayConfig, // Other types
-  type ProviderStatus, AutonomyLevel, RagRetrievalPolicy } from "./gateway";
+  type ProviderStatus, // Session-projection reducer (Issue #5324)
+  SessionProjection, AutonomyLevel, GatewayEventType, RagRetrievalPolicy } from "./gateway";
 export { LLMGuardrail, createLLMGuardrail } from "./guardrails/llm-guardrail";
 export { DisplayTypes, HooksManager, WorkflowHooksExecutor, clearAllCallbacks, clearApprovalCallback, createHooksManager, createLoggingOperationHooks, createLoggingWorkflowHooks, createTimingWorkflowHooks, createValidationOperationHooks, createWorkflowHooks, executeCallback, executeSyncCallback, getRegisteredDisplayTypes, hasApprovalCallback, registerApprovalCallback, registerDisplayCallback, requestApproval, unregisterDisplayCallback } from "./hooks";
 export { // Computer Use
@@ -1007,7 +1034,11 @@ export { // Slack
   createSlackBot, SlackBot, parseSlackMessage, verifySlackSignature } from "./integrations/slack";
 export { BaseVectorStore, ChromaVectorStore, MemoryVectorStore, PineconeVectorStore, QdrantVectorStore, VectorQueryResult, WeaviateVectorStore, createChromaStore, createMemoryVectorStore, createPineconeStore, createQdrantStore, createWeaviateStore } from "./integrations/vector";
 export { BaseVoiceProvider, ElevenLabsVoiceProvider, OpenAIVoiceProvider, createElevenLabsVoice, createOpenAIVoice } from "./integrations/voice";
+export type { KnowledgeRecord } from "./knowledge";
 export { GraphRAG, GraphStore, createGraphRAG } from "./knowledge/graph-rag";
+export { Knowledge } from "./knowledge/knowledge";
+export type { KnowledgeIndexOptions, KnowledgeSearchCallOptions, KnowledgeStoreConfig, KnowledgeStoreOptions } from "./knowledge/knowledge";
+export { KnowledgeBase, KnowledgeDocument, KnowledgeSearchResult, createKnowledgeBase } from "./knowledge/rag";
 export { BaseReranker, CohereReranker, CrossEncoderReranker, LLMReranker, createCohereReranker, createCrossEncoderReranker, createLLMReranker } from "./knowledge/reranker";
 export { // Provider classes
   OpenAIProvider, // Provider factory and utilities
@@ -1015,14 +1046,22 @@ export { // Provider classes
   ProviderRegistry, // Types
   type LLMProvider, AnthropicProvider, BaseProvider, GoogleProvider, ProviderMessage, ProviderToolDefinition, createProviderRegistry, getAvailableProviders, getDefaultProvider, getDefaultRegistry, hasProvider, isProviderAvailable, listProviders, parseModelString, registerBuiltinProviders, registerProvider, unregisterProvider } from "./llm/providers";
 export { ADAPTERS, AISDK_PROVIDERS, COMMUNITY_PROVIDERS, PROVIDER_ALIASES } from "./llm/providers/ai-sdk/types";
+export { AgentMessageEvent, CustomToolUseEvent, ManagedEvent, SessionErrorEvent, SessionIdleEvent, SessionRunningEvent, ToolConfirmationEvent, ToolUseEvent, UsageEvent, isManagedBackend } from "./managed";
+export type { AgentMessageEventInit, CustomToolUseEventInit, ManagedBackendKwargs, ManagedBackendProtocol, ManagedContentBlock, ManagedEventInit, ManagedEventType, ManagedStopReason, SessionErrorEventInit, SessionIdleEventInit, ToolConfirmationEventInit, ToolUseEventInit, UsageEventInit } from "./managed";
 export { MCPClient, MCPSecurity, MCPServer, MCPSessionManager, createApiKeyPolicy, createMCPClient, createMCPSecurity, createMCPServer, createMCPSession, createRateLimitPolicy, getMCPTools } from "./mcp";
+export { ChromaMemory, InMemoryAdapter, MEMORY_PROVIDER_ALIASES, MemoryAdapterRegistry, addMemoryAdapter, addMemoryFactory, add_memory_adapter, add_memory_factory, createChromaMemoryAdapter, createDakeraMemoryAdapter, createMem0MemoryAdapter, createMongodbMemoryAdapter, createSqliteMemoryAdapter, getDefaultMemoryRegistry, getFirstAvailableMemoryAdapter, getMemoryAdapter, get_memory_adapter, hasMemoryAdapter, has_memory_adapter, listMemoryAdapters, list_memory_adapters, registerMemoryAdapter, registerMemoryFactory, register_memory_adapter, register_memory_factory, resetDefaultMemoryRegistry, resolveMemoryAdapterName, sanitizeChromaMetadata } from "./memory/adapters";
+export type { ChromaMemoryConfig, MaybePromise, MemoryEmbedder, MemoryProtocol, MemoryRecord } from "./memory/adapters";
 export { AutoMemory, AutoMemoryKnowledgeBase, AutoMemoryVectorStore, DEFAULT_POLICIES, createAutoMemory, createLLMSummarizer } from "./memory/auto-memory";
 export { DocsManager, createDocsManager } from "./memory/docs-manager";
 export { FileMemory, createFileMemory } from "./memory/file-memory";
 export { MemoryHooks, createEncryptionHooks, createLoggingHooks, createMemoryHooks, createValidationHooks } from "./memory/hooks";
+export { BaseStore, DecisionStore, FeedbackStore, ImprovementStore, InsightStore, LearnBackendNotAvailableError, LearnEntry, LearnError, LearnManager, LearnManagerMode, MongoDBLearnBackend, PatternStore, PersonaStore, RedisLearnBackend, SQLiteLearnBackend, ThreadStore, getDataDir, getLearnDir, resolveLearnConfig, toLearnEntryDict } from "./memory/learn";
+export type { AsyncLearnProtocol, BaseStoreOptions, LearnEntryConvertible, LearnEntryData, LearnEntryInit, LearnEntryLike, LearnExtractor, LearnManagerConfig, LearnManagerProtocol, LearnMessage, LearnProtocol, LearnStorageBackend, LearnStore, ProcessConversationResult, ResolvedLearnConfig } from "./memory/learn";
 export { Memory, createMemory } from "./memory/memory";
 export type { MemoryConfig, MemoryEntry } from "./memory/memory";
 export { RulesManager, createRulesManager, createSafetyRules } from "./memory/rules-manager";
+export { DEFAULT_PROFILE, HarnessProfile, ModelRequestBlocked, ScriptExhausted, ScriptedModel, allowModelRequests, listHarnessProfiles, modelRequestsAllowed, noModelRequests, registerProfile, register_profile, resetHarnessRegistry, resolveHarness, resolve_harness } from "./model-harness";
+export type { HarnessProfileConfig, HarnessRegistryEntry, HarnessResolverProtocol } from "./model-harness";
 export { // Adapters
   NoopObservabilityAdapter, // Constants
   OBSERVABILITY_TOOLS, // Global adapter management
@@ -1030,15 +1069,6 @@ export { // Adapters
   type SpanKind, ConsoleObservabilityAdapter, MemoryObservabilityAdapter, clearAdapterCache, createConsoleAdapter, createMemoryAdapter, createObservabilityAdapter, getObservabilityAdapter, getObservabilityToolInfo, hasObservabilityToolEnvVar, listObservabilityTools, noopAdapter, resetObservabilityAdapter, trace } from "./observability";
 export { AgentApp, AgentAppConfig, AgentAppProtocol, AgentOS, AgentOSConfig, AgentOSProtocol, DEFAULT_AGENTOS_CONFIG, mergeConfig } from "./os";
 export type { AgentAppOptions, AgentOSOptions } from "./os";
-export { // P0: Call Types (new)
-  type MCPCall, // P0: Specialized Agent Configs (new)
-  type AudioConfig, // P0: Specialized Agents (new)
-  CodeAgent, // P1: Workflow Patterns (new)
-  Chunking, // P2: Context Types (new - only items not already exported)
-  ContextManager, // P3: Display callbacks (snake_case for Python parity)
-  register_display_callback, // P3: Plugin functions
-  get_plugin_manager, // P3: Trace & condition functions
-  evaluate_condition, EmbeddingAgent, If, Knowledge, MCP, OCRAgent, Parallel, RealtimeAgent, Route, Session, VideoAgent, VisionAgent, async_display_callbacks, cleanup_telemetry_resources, create_context_agent, disable_performance_mode, disable_telemetry, discover_and_load_plugins, discover_plugins, display_error, display_generating, display_instruction, display_interaction, display_self_reflection, display_tool_call, enable_performance_mode, enable_telemetry, ensure_plugin_dir, error_logs, get_default_plugin_dirs, get_dimensions, get_plugin_template, get_telemetry, handoff_filters, load_plugin, parse_plugin_header, parse_plugin_header_from_file, prompt_with_handoff_instructions, resolve_guardrail_policies, sync_display_callbacks, trace_context, track_workflow, when } from "./parity";
 export { // Core classes
   Plan, // Python parity additions
   ApprovalCallback, PlanStep, PlanStorage, PlanningAgent, READ_ONLY_TOOLS, RESEARCH_TOOLS, RESTRICTED_TOOLS, TaskAgent, TodoItem, TodoList, createApprovalCallback, createPlan, createPlanStorage, createPlanningAgent, createTaskAgent, createTodoList } from "./planning";
@@ -1046,36 +1076,51 @@ export { // Classes
   Plugin, // Enums
   PluginHook, // Functions
   getPluginManager, // Interfaces
-  type PluginMetadata, FunctionPlugin, PluginManager, PluginParseError, PluginType, disablePlugins, discoverAndLoadPlugins, discoverPlugins, enablePlugins, ensurePluginDir, getDefaultPluginDirs, getPluginTemplate, isPluginEnabled, listPlugins, loadPlugin, parsePluginHeader, parsePluginHeaderFromFile } from "./plugins";
+  type PluginMetadata, FunctionPlugin, PluginManager, PluginParseError, PluginType, disablePlugins, discoverAndLoadPlugins, discoverPlugins, discover_and_load_plugins, discover_plugins, enablePlugins, ensurePluginDir, ensure_plugin_dir, getDefaultPluginDirs, getPluginTemplate, get_default_plugin_dirs, get_plugin_manager, get_plugin_template, isPluginEnabled, listPlugins, loadPlugin, load_plugin, parsePluginHeader, parsePluginHeaderFromFile, parse_plugin_header, parse_plugin_header_from_file } from "./plugins";
 export { // A2A Protocol
   A2ATaskState, // AGUI Protocol
   AGUI, // AgentManager alias type
   type AgentManager, // Global singletons
   config, // Guardrail policies
   type GuardrailPolicy, // Tools class
-  type ToolDefinition, A2A, A2ARole, AutoRagAgent, AutoRetrievalPolicy, DEFAULT_AUTO_KEYWORDS, GUARDRAIL_POLICY_PRESETS, Tools, memory, obs, resolveGuardrailPolicies, workflows } from "./protocols";
+  type ToolDefinition, A2A, A2ARole, AutoRagAgent, AutoRetrievalPolicy, DEFAULT_AUTO_KEYWORDS, GUARDRAIL_POLICY_PRESETS, Tools, memory, obs, resolveGuardrailPolicies, resolve_guardrail_policies, workflows } from "./protocols";
 export { CitationsMode, DEFAULT_RAG_TEMPLATE, RAG, RAGCitation, RAGContextPack, RetrievalPolicy, RetrievalStrategy, createCitation, createContextPack, createRAG, createRAGConfig, createRAGResult, createRetrievalConfig, createSimpleRetrievalConfig, createSmartRetrievalConfig, formatAnswerWithCitations, formatCitation, formatContextPackForPrompt, hasCitations } from "./rag";
+export { PraisonAIRuntime, RuntimeRegistry, RuntimeRegistryEntry, RuntimeRegistryError, addRuntimeAlias, getRuntimeRegistry, isAgentRuntime, isRuntimeAvailable, listRuntimes, list_runtimes, registerRuntime, register_runtime, resolveRuntime, resolve_runtime, unregisterRuntime } from "./runtime";
+export type { AgentRuntimeProtocol, RunTurnOptions, RuntimeCapabilityMatrix, RuntimeConfig, RuntimeDelta, RuntimeDeltaType, RuntimeFactory, RuntimeMode, RuntimeRegistryEntryInit, RuntimeRegistryProtocol, RuntimeResult, TurnContextBuilderProtocol, TurnRuntimeProtocol } from "./runtime";
+export type { RunStatus } from "./session";
+export { Session } from "./session/session";
 export { // Python parity additions
-  SkillLoader, SkillManager, createSkillLoader, createSkillManager, createSkillProperties, parseSkillFile } from "./skills";
+  SkillLoader, EnforcementLevel, SkillManager, SkillParseError, SkillState, createSkillLoader, createSkillManager, createSkillProperties, discoverSkill, discoverSkills, discover_skills, findSkillMd, getDefaultSkillDirs, loadSkill, load_skill, parseFrontmatter, parseSkillFile, validate, validateMetadata, validateSkill, validate_metadata } from "./skills";
+export type { RemoteSkillSource } from "./skills";
 export { AgentTask, AgentTaskConfig, BaseTask, createTaskOutput } from "./task";
 export { // Python parity additions
-  MinimalTelemetry, AgentTelemetry, PerformanceMonitor, TelemetryCollector, TelemetryIntegration, cleanupTelemetry, cleanupTelemetryResources, createAgentTelemetry, createConsoleSink, createHTTPSink, createPerformanceMonitor, createTelemetryIntegration, disablePerformanceMode, disableTelemetry, enablePerformanceMode, enableTelemetry, getMinimalTelemetry, getTelemetry } from "./telemetry";
+  MinimalTelemetry, AgentTelemetry, PerformanceMonitor, TelemetryCollector, TelemetryIntegration, cleanupTelemetry, cleanupTelemetryResources, cleanup_telemetry_resources, createAgentTelemetry, createConsoleSink, createHTTPSink, createPerformanceMonitor, createTelemetryIntegration, disablePerformanceMode, disableTelemetry, disable_performance_mode, disable_telemetry, enablePerformanceMode, enableTelemetry, enable_performance_mode, enable_telemetry, getMinimalTelemetry, getTelemetry, get_telemetry } from "./telemetry";
 export { // Subagent Tool (agent-as-tool pattern)
-  SubagentTool, BaseTool, FunctionTool, ToolRegistry, ToolResult, ToolValidationError, createDelegator, createSubagentTool, createSubagentTools, createTool, getRegistry, getTool, registerTool, tool, validateTool } from "./tools";
+  SubagentTool, BaseTool, FunctionTool, TOOL_TRUST_LEVELS, ToolRegistry, ToolResult, ToolValidationError, add_tool, createDelegator, createSubagentTool, createSubagentTools, createTool, getRegistry, getTool, getToolDefinitions, get_registry, get_tool, get_tool_definitions, hasTool, has_tool, listTools, list_tools, registerTool, register_tool, removeTool, remove_tool, tool, validateTool, validate_tool } from "./tools";
 export { airweaveSearch, bedrockBrowserClick, bedrockBrowserFill, bedrockBrowserNavigate, bedrockCodeInterpreter, codeExecution, codeMode, createCustomTool, crwCrawl, crwScrape, exaSearch, firecrawlCrawl, firecrawlScrape, parallelSearch, perplexitySearch, registerCustomTool, registerLocalTool, registerNpmTool, superagentGuard, superagentRedact, superagentVerify, tavilyCrawl, tavilyExtract, tavilySearch, valyuBioSearch, valyuCompanyResearch, valyuEconomicsSearch, valyuFinanceSearch, valyuPaperSearch, valyuPatentSearch, valyuSecSearch, valyuWebSearch } from "./tools/builtins";
-export { BudgetExceededError, MissingDependencyError, MissingEnvVarError, ToolsRegistry, composeMiddleware, createLoggingMiddleware, createRateLimitMiddleware, createRedactionMiddleware, createRetryMiddleware, createTimeoutMiddleware, createToolsRegistry, createTracingMiddleware, createValidationMiddleware, getToolsRegistry, get_registry, get_tool, register_tool, resetToolsRegistry, validate_tool } from "./tools/registry";
+export { MCP, MCPToolTransportType } from "./tools/mcp";
+export { BudgetExceededError, MissingDependencyError, MissingEnvVarError, ToolConstructionError, ToolNotRegisteredError, ToolsRegistry, composeMiddleware, createLoggingMiddleware, createRateLimitMiddleware, createRedactionMiddleware, createRetryMiddleware, createTimeoutMiddleware, createToolInstance, createToolsRegistry, createTracingMiddleware, createValidationMiddleware, getToolsRegistry, registerToolFactory, resetToolsRegistry, tryCreateToolInstance, validateToolInstall } from "./tools/registry";
 export type { InstallHints, PraisonTool, RedactionHooks, RegisteredTool, ToolCapabilities, ToolExecutionContext, ToolExecutionResult, ToolFactory, ToolHooks, ToolInstallStatus, ToolLimits, ToolLogger, ToolMetadata, ToolMiddleware, ToolParameterProperty, ToolParameterSchema } from "./tools/registry";
 export { registerBuiltinTools, tools } from "./tools/tools";
+export { TOOLSET_TOOL_ID_MAP, ToolsetRegistry, ToolsetSpec, getToolset, getToolsetRegistry, get_toolset, get_toolset_registry, hasToolset, has_toolset, listToolsets, list_toolsets, registerToolset, register_toolset, resolveToolset, resolveToolsetBuiltinIds, resolveToolsets, resolveToolsetsForModel, resolve_toolset, resolve_toolsets, resolve_toolsets_for_model, toolsetToolId, unregisterToolset, unregister_toolset } from "./toolsets";
+export type { ToolsetSpecConfig } from "./toolsets";
 export { // Classes
   TraceSink, // Enums
   ContextEventType, // Functions
   createContextEvent, // Types
-  type ContextEvent, ContextListSink, ContextNoOpSink, ContextTraceEmitter, ContextTraceSink, EventType, MessageType, TraceCtx, traceContext, trackWorkflow } from "./trace";
+  type ContextEvent, ContextListSink, ContextNoOpSink, ContextTraceEmitter, ContextTraceSink, EventType, MessageType, TraceCtx, traceContext, trace_context, trackWorkflow, track_workflow } from "./trace";
+export { A2UI, A2UINotInstalledError, A2UI_MIME_TYPE, createA2uiPart, getSchemaManager, isA2uiPart, parseA2uiResponse } from "./ui/a2ui";
+export type { A2UIAdapter, A2UISystemPromptOptions, A2UIToolResultProtocol } from "./ui/a2ui";
+export { AdapterBackendNotAvailableError, AdapterCreationError, AdapterRegistry, isBackendUnavailableError } from "./utils/adapter-registry";
+export type { AdapterClass, AdapterFactory, AdapterKwargs } from "./utils/adapter-registry";
+export { Logger, PraisonLogger, ROOT_LOGGER_NAME, StructuredFormatter, configureStructuredLogging, configure_structured_logging, getLogger, get_logger, normalizeLoggerName } from "./utils/logger";
+export type { GetLoggerOptions, LogFormatter, LogLevelName, LogRecord, StructuredFormatterOptions } from "./utils/logger";
+export { VERSION, __version__, getVersion } from "./version";
 export { // New: Python-parity Loop and Repeat classes
   Loop, // Task class
-  Task, AgentFlow, Pipeline, Repeat, Workflow, loop, loopPattern, parallel, repeat, repeatPattern, route } from "./workflows";
-export type { LoopConfig, LoopResult, RepeatConfig, RepeatContext, RepeatResult, StepContextConfig, StepExecutionConfig, StepOutputConfig, StepResult, StepRoutingConfig, TaskConfig, WorkflowContext } from "./workflows";
-export { createWorkflowFromYAML, loadWorkflowFromFile, parseYAMLWorkflow, validateWorkflowDefinition } from "./workflows/yaml-parser";
+  Task, AgentFlow, DEFAULT_MAX_PARALLEL_WORKERS, If, Include, MAX_NESTING_DEPTH, NestingDepthError, PARALLEL_ON_FAILURE_MODES, Parallel, Pipeline, Repeat, Route, Workflow, WorkflowStepError, evaluateWorkflowCondition, getRecipeResolver, ifStep, if_, include, isControlFlowPattern, loop, loopPattern, parallel, parallelPattern, repeat, repeatPattern, route, routePattern, setRecipeResolver, substituteWorkflowVariables, when } from "./workflows";
+export type { AgentLikeStep, FlowStep, IncludableWorkflow, LoopConfig, LoopResult, ParallelBranchError, ParallelOnFailure, RecipeResolver, RepeatConfig, RepeatContext, RepeatResult, StepContextConfig, StepExecutionConfig, StepOutputConfig, StepResult, StepRoutingConfig, TaskConfig, WorkflowContext } from "./workflows";
+export { YAMLWorkflowParser, createWorkflowFromYAML, loadWorkflowFromFile, parseYAMLWorkflow, validateWorkflowDefinition } from "./workflows/yaml-parser";
 ```
 
 # Optional Plugins

@@ -13,6 +13,7 @@ import uuid
 import json
 import time
 import logging
+from copy import deepcopy
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 logger = logging.getLogger(__name__)
@@ -85,7 +86,19 @@ class Session:
             timeout: HTTP timeout for remote agent calls (default: 30 seconds)
             session_ttl: Time-to-live in seconds after which session expires
         """
-        self.session_id = session_id or str(uuid.uuid4())[:8]
+        # An explicit session_id is adopted as-is (needed to resume a prior
+        # session). An auto-generated one uses 16 hex chars / 64 bits (vs the
+        # old 8 chars / 32 bits, which hit a 50% birthday collision at ~77k IDs)
+        # and, since its directory is a security boundary between sessions, is
+        # regenerated if a directory already exists for it - mirroring the
+        # retry-on-collision loop the endpoint-path generator already uses.
+        if session_id is not None:
+            self.session_id = session_id
+        else:
+            self.session_id = uuid.uuid4().hex[:16]
+            if agent_url is None:
+                while self._get_session_dir().exists():
+                    self.session_id = uuid.uuid4().hex[:16]
         self.user_id = user_id or "default_user"
         self.agent_url = agent_url
         self.timeout = timeout
@@ -320,7 +333,9 @@ class Session:
         histories = (getattr(data, "metadata", None) or {}).get(AGENT_HISTORY_KEY)
         if not isinstance(histories, dict):
             return {}
-        return {k: v for k, v in histories.items() if isinstance(v, list) and v}
+        # An empty list is an explicit clear, not a missing transcript. Keep
+        # it so current records override legacy and Memory fallback history.
+        return {k: v for k, v in histories.items() if isinstance(v, list)}
 
     def _merged_agent_histories(self, session_store) -> Dict[str, List[Dict[str, Any]]]:
         """All known sub-agent transcripts: legacy records under current ones.
@@ -490,6 +505,10 @@ class Session:
     ) -> bool:
         """Persist one sub-agent transcript onto this session's own record.
 
+        Built-in stores merge the entry under their session file lock. Older
+        custom stores retain the bounded read/write verification fallback below;
+        that fallback cannot guarantee atomic preservation of concurrent entries.
+
         The store replaces the whole ``AGENT_HISTORY_KEY`` map per write, so a
         naive read-then-replace would let a concurrent writer (another agent
         under the same parent) clobber this agent's entry, or vice versa. We
@@ -497,6 +516,14 @@ class Session:
         *other* key changed underneath us, retrying a bounded number of times.
         Legacy per-agent records are always merged in (they stay on disk).
         """
+        merge_map = getattr(session_store, "merge_session_metadata_map", None)
+        if callable(merge_map):
+            # Built-in stores merge inside their locked read/modify/write path.
+            # A post-write comparison cannot detect entries lost to a stale map.
+            return merge_map(
+                self.session_id, AGENT_HISTORY_KEY, {agent_key: messages},
+                defaults=self._legacy_agent_histories(session_store),
+            )
         update_meta = getattr(session_store, "update_session_metadata", None)
         if not callable(update_meta):
             return False
@@ -512,7 +539,7 @@ class Session:
             # read and write; if the persisted map matches what we wrote, we win.
             persisted = self._stored_agent_histories(session_store)
             if persisted.get(agent_key) == messages and all(
-                persisted.get(k) == v for k, v in current.items()
+                persisted.get(k) == v for k, v in current.items() if k != agent_key
             ):
                 return True
         logger.warning(
@@ -552,16 +579,12 @@ class Session:
                         {
                             "role": msg.get("role", "user"),
                             "content": msg.get("content", ""),
+                            **deepcopy(msg),
                         }
                         for msg in chat_history
                         if isinstance(msg, dict)
                     ]
-                    if not messages:
-                        logging.debug(
-                            f"No chat history to persist for agent {agent_key} "
-                            f"in session {self.session_id}"
-                        )
-                    elif not self._store_agent_history(
+                    if not self._store_agent_history(
                         session_store, agent_key, messages
                     ):
                         logging.warning(

@@ -12,6 +12,7 @@ Provides session management:
 
 import hashlib
 import os
+import sys
 import tempfile
 from pathlib import Path
 from typing import Optional
@@ -22,6 +23,76 @@ from ..output.console import get_output_controller
 from ..state.sessions import get_session_manager, set_session_backend
 
 app = typer.Typer(help="Session management")
+
+
+def _pick_session(output) -> Optional[str]:
+    """Interactively select a recent project-scoped session id.
+
+    Selection front-end only: rows come from the same ``list_project_sessions``
+    data ``session list`` shows (most-recently-updated first) and the returned
+    id flows into the existing ``rehydrate_session`` path. Returns ``None`` when
+    no sessions exist or the user cancels.
+
+    Guarded by the callers to a TTY, non-``--json`` context so scripts/CI keep
+    today's "id required" behaviour untouched.
+    """
+    from rich.prompt import IntPrompt
+
+    from ..state.project_sessions import list_project_sessions
+
+    try:
+        rows = list_project_sessions(limit=20)
+    except (OSError, ValueError, KeyError) as exc:
+        # Only expected storage/parse failures degrade to "couldn't list";
+        # keep them distinct from a genuinely empty store so the message isn't
+        # misleading, and let unexpected exceptions surface for diagnostics.
+        output.print_error(
+            f"Could not list sessions: {exc}",
+            remediation="Use 'praisonai session list' to inspect the session store",
+        )
+        return None
+
+    if not rows:
+        output.print_info("No sessions found")
+        return None
+
+    headers = ["#", "Title", "Updated", "Messages", "Tokens", "Cost"]
+    table_rows = []
+    for idx, row in enumerate(rows, start=1):
+        title = row.get("title") or row.get("agent_name") or "-"
+        updated = (row.get("updated_at") or "-")[:19]
+        messages = str(row.get("message_count", 0) or 0)
+        usage = row.get("usage") if isinstance(row.get("usage"), dict) else {}
+        total_tokens = (usage.get("total_tokens") if usage else None) or row.get("total_tokens") or 0
+        cost = (usage.get("cost") if usage else None) or row.get("cost") or 0.0
+        table_rows.append([
+            str(idx),
+            str(title)[:40],
+            updated,
+            messages,
+            f"{int(total_tokens):,}" if total_tokens else "-",
+            f"${float(cost):.4f}" if cost else "-",
+        ])
+
+    output.print_table(headers, table_rows, title="Select a session to resume")
+
+    try:
+        choice = IntPrompt.ask(
+            "Session number (0 to cancel)",
+            default=1,
+            choices=[str(i) for i in range(0, len(rows) + 1)],
+            show_choices=False,
+        )
+    except (EOFError, KeyboardInterrupt):
+        output.print_info("Cancelled")
+        return None
+
+    if choice <= 0:
+        output.print_info("Cancelled")
+        return None
+
+    selected = rows[choice - 1]
+    return selected.get("session_id") or selected.get("id")
 
 
 def _create_backend(backend_type: str, storage_path: Optional[str]):
@@ -239,9 +310,96 @@ def session_list(
     output.print_table(headers, rows, title="Sessions")
 
 
+@app.command("search")
+def session_search(
+    query: str = typer.Argument(..., help="Free-text query to search transcripts"),
+    limit: int = typer.Option(
+        5,
+        "--limit",
+        "-n",
+        help="Maximum number of matching sessions to return",
+    ),
+    window: int = typer.Option(
+        5,
+        "--window",
+        "-w",
+        help="Number of messages to include around each hit",
+    ),
+):
+    """Ranked full-text search across session transcripts.
+
+    Delegates to :class:`SqliteSessionStore` so results are ranked by FTS5/bm25
+    with snippets and lineage dedup, reusing the same engine as the
+    ``session_search`` agent tool instead of a substring scan.
+    """
+    output = get_output_controller()
+
+    from praisonaiagents.session import SqliteSessionStore
+
+    from ..state.project_sessions import canonical_cli_stores
+
+    seen_dirs = set()
+    hits = []
+    for store in canonical_cli_stores():
+        session_dir = getattr(store, "session_dir", None)
+        if not session_dir or session_dir in seen_dirs:
+            continue
+        seen_dirs.add(session_dir)
+        try:
+            indexed = SqliteSessionStore(session_dir=session_dir)
+            hits.extend(indexed.search(query, limit=limit, window=window))
+        except Exception:
+            continue
+
+    # A session resumed from the global default store keeps a project-side
+    # shadow, so the *same* id can match in both canonical stores. Without
+    # dedup those duplicate rows each consume a slot of the small ``limit`` and
+    # crowd out distinct sessions (Issue #4701). Collapse by session id, keeping
+    # the higher-scoring copy, mirroring the lineage dedup the store already
+    # applies within a single directory.
+    best_by_id = {}
+    for h in hits:
+        sid = getattr(h, "session_id", None)
+        if sid is None:
+            continue
+        existing = best_by_id.get(sid)
+        if existing is None or getattr(h, "score", 0.0) > getattr(existing, "score", 0.0):
+            best_by_id[sid] = h
+    hits = list(best_by_id.values())
+
+    hits.sort(key=lambda h: (getattr(h, "score", 0.0), getattr(h, "when", "") or ""), reverse=True)
+    hits = hits[:limit]
+
+    if output.is_json_mode:
+        output.print_json(
+            {"query": query, "results": [h.as_dict() for h in hits]}
+        )
+        return
+
+    if not hits:
+        output.print_info(f"No sessions matched: {query}")
+        return
+
+    headers = ["ID", "Title", "Score", "Snippet", "When"]
+    rows = []
+    for h in hits:
+        sid = h.session_id
+        rows.append([
+            sid[:20] + "..." if len(sid) > 20 else sid,
+            (h.title or "-")[:40],
+            f"{h.score:.1f}",
+            (h.snippet or "-")[:60],
+            (h.when or "-")[:19],
+        ])
+    output.print_table(headers, rows, title=f"Search: {query}")
+
+
 @app.command("resume")
 def session_resume(
-    session_id: str = typer.Argument(..., help="Session ID to resume"),
+    session_id: Optional[str] = typer.Argument(
+        None,
+        help="Session ID to resume (omit on a TTY to pick interactively)",
+    ),
     prompt: Optional[str] = typer.Argument(
         None,
         help="Optional prompt to continue the session with",
@@ -252,8 +410,26 @@ def session_resume(
         help="Only show the session transcript instead of restoring state",
     ),
 ):
-    """Resume a session with full conversational state restored."""
+    """Resume a session with full conversational state restored.
+
+    With no id on an interactive TTY (and not ``--json``), open a picker of
+    recent project-scoped sessions and resume the chosen one. Non-interactive,
+    ``--json`` and non-TTY invocations keep the id-required behaviour so scripts
+    and CI are unaffected.
+    """
     output = get_output_controller()
+
+    # No id supplied: offer an interactive picker on a TTY (never in --json or
+    # a non-TTY, so pipelines/CI still see today's "id required" error).
+    if session_id is None:
+        if not output.is_json_mode and sys.stdin.isatty() and sys.stdout.isatty():
+            session_id = _pick_session(output)
+        if session_id is None:
+            output.print_error(
+                "Missing session id",
+                remediation="Pass a session id, or run interactively to pick one",
+            )
+            raise typer.Exit(1)
 
     # Transcript-only path (opt-in for the old behaviour).
     if transcript:

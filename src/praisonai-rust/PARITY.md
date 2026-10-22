@@ -1,6 +1,6 @@
 # Rust Feature Parity Tracker
 
-> **Python Features:** 411 | **Rust Features:** 667 | **Parity:** 69.8%
+> **Python Features:** 433 | **Rust Features:** 667 | **Parity:** 66.3%
 
 > [!IMPORTANT]
 > **What this measures:** whether a matching *exported symbol name* exists in the
@@ -14,11 +14,11 @@
 
 | Metric | Count |
 |--------|-------|
-| Python Core Features | 411 |
+| Python Core Features | 433 |
 | Rust Features | 667 |
-| **Actual Gap Count** | **124** |
+| **Actual Gap Count** | **146** |
 | Language Limitations (N/A) | 4 |
-| **Parity** | **69.8%** |
+| **Parity** | **66.3%** |
 
 ## Implemented Features
 
@@ -732,6 +732,8 @@ These Python features cannot be directly implemented in Rust due to reserved key
 - ❌ `ContextCompactionPolicyProtocol`
 - ❌ `CorpusStats`
 - ❌ `CustomToolUseEvent`
+- ❌ `DecisionRoutePlan`
+- ❌ `DecisionTriageRouter`
 - ❌ `DoomLoopDetector`
 - ❌ `EnforcementLevel`
 - ❌ `ErrorContextProtocol`
@@ -743,6 +745,7 @@ These Python features cannot be directly implemented in Rust due to reserved key
 - ❌ `GoalConfig`
 - ❌ `GoalEngineer`
 - ❌ `GoalVerificationResult`
+- ❌ `GuardrailRetry`
 - ❌ `HandoffToolPolicy`
 - ❌ `HarnessProfile`
 - ❌ `Heartbeat`
@@ -760,6 +763,7 @@ These Python features cannot be directly implemented in Rust due to reserved key
 - ❌ `MAX_NESTING_DEPTH`
 - ❌ `ManagedBackendProtocol`
 - ❌ `ManagedEvent`
+- ❌ `ModelRequestBlocked`
 - ❌ `NetworkError`
 - ❌ `ObservabilityEventType`
 - ❌ `ObservabilityHooks`
@@ -772,6 +776,9 @@ These Python features cannot be directly implemented in Rust due to reserved key
 - ❌ `RulesConfig`
 - ❌ `RunOutcome`
 - ❌ `RunStatus`
+- ❌ `RunTerminal`
+- ❌ `ScriptExhausted`
+- ❌ `ScriptedModel`
 - ❌ `SendResult`
 - ❌ `SessionErrorEvent`
 - ❌ `SessionIdleEvent`
@@ -779,6 +786,7 @@ These Python features cannot be directly implemented in Rust due to reserved key
 - ❌ `StopReason`
 - ❌ `StructuredFormatter`
 - ❌ `SuccessCriterion`
+- ❌ `SystemOneResult`
 - ❌ `TerminationReason`
 - ❌ `ToolExecutionError`
 - ❌ `ToolSearchConfig`
@@ -791,7 +799,12 @@ These Python features cannot be directly implemented in Rust due to reserved key
 - ❌ `__version__`
 - ❌ `add_memory_adapter`
 - ❌ `add_memory_factory`
+- ❌ `allow_model_requests`
+- ❌ `asystem_one`
+- ❌ `choice_question`
+- ❌ `collapse`
 - ❌ `configure_structured_logging`
+- ❌ `default_ticket_triage_questions`
 - ❌ `discover_skills`
 - ❌ `get_default_policy`
 - ❌ `get_logger`
@@ -804,10 +817,15 @@ These Python features cannot be directly implemented in Rust due to reserved key
 - ❌ `has_toolset`
 - ❌ `if_`
 - ❌ `include`
+- ❌ `is_decision_model`
+- ❌ `is_sticky`
 - ❌ `list_memory_adapters`
 - ❌ `list_runtimes`
 - ❌ `list_toolsets`
 - ❌ `load_skill`
+- ❌ `merge_run_terminal`
+- ❌ `no_model_requests`
+- ❌ `noul_question`
 - ❌ `parallel_handoffs`
 - ❌ `register_memory_adapter`
 - ❌ `register_memory_factory`
@@ -819,7 +837,11 @@ These Python features cannot be directly implemented in Rust due to reserved key
 - ❌ `resolve_runtime`
 - ❌ `resolve_toolset`
 - ❌ `resolve_toolsets`
+- ❌ `score_question`
+- ❌ `system_one`
 - ❌ `termination_to_run_status`
+- ❌ `triage_decision`
+- ❌ `triaged_start`
 - ❌ `unregister_toolset`
 - ❌ `validate`
 - ❌ `validate_decision_string`

@@ -29,6 +29,104 @@ logger = logging.getLogger(__name__)
 # timeouts so they cannot exhaust process resources.
 _MAX_ORPHANED_TOOL_EXECUTORS = 4
 
+# Effective cancel token of the turn running in *this* context, as
+# ``(agent, token)``. ``self._active_turn_token`` is a single slot overwritten by
+# whichever concurrent turn started last; this ContextVar (copied into tool
+# executor threads and asyncio tasks) lets each turn's tools/approvals see their
+# own token. Set/reset by ``chat``/``achat``.
+_active_turn_cancel: "contextvars.ContextVar[Optional[tuple]]" = contextvars.ContextVar(
+    "praisonai_active_turn_cancel", default=None
+)
+
+# Worker count for the per-agent tool ThreadPoolExecutor. Used both when the
+# pool is created and to decide (with the per-executor in-flight counter)
+# whether a fresh call would have to queue behind hung workers.
+_TOOL_POOL_MAX_WORKERS = 2
+
+# Sentinel returned as the "arguments" value when a tool call's argument string
+# cannot be parsed (e.g. truncated by max_tokens or a dropped connection).
+# It is distinct from {} ("no arguments"): {} would silently execute the tool
+# with the WRONG arguments and report success. Callers must detect this sentinel
+# and surface a tool-error so the model can re-emit the call instead.
+# Lives here (agent-side, lightweight) so both chat_mixin.py and llm.py share
+# one identity — an `is` check only works against the same object.
+_TOOL_ARGUMENTS_PARSE_FAILED = object()
+
+
+class _CallableGuardrailAdapter:
+    """Expose a plain callable guardrail as a chainable guardrail object.
+
+    A user ``guardrail`` may be a bare callable returning ``(bool, output)``
+    (the Agent's final-output contract). To let it run *inside* a
+    ``GuardrailChain`` alongside a plugin guardrail — so composing the two never
+    silently drops either — this wraps the callable with a ``validate_output``
+    (and passthrough ``validate_input``) the chain understands. Any
+    ``validate_tool_call`` / ``validate_tool_result`` the underlying object
+    already exposes is forwarded so tool-surface behaviour is preserved.
+    """
+
+    __slots__ = ("_fn",)
+
+    def __init__(self, fn):
+        self._fn = fn
+
+    def validate_output(self, content, **kwargs):
+        result = self._fn(content)
+        if isinstance(result, tuple) and len(result) == 2:
+            is_valid, processed = result
+            if is_valid:
+                # Normalise the passthrough value to a string so the chain can
+                # keep threading ``content`` through subsequent guardrails.
+                if isinstance(processed, str):
+                    return True, processed
+                return True, content
+            return False, processed if isinstance(processed, str) else str(processed)
+        # A callable that does not follow the (bool, output) contract is treated
+        # as a no-op passthrough rather than blocking.
+        return True, content
+
+    def validate_input(self, content, **kwargs):
+        inner = getattr(self._fn, "validate_input", None)
+        if callable(inner):
+            return inner(content, **kwargs)
+        return True, content
+
+    def validate_tool_call(self, tool_name, arguments, **kwargs):
+        inner = getattr(self._fn, "validate_tool_call", None)
+        if callable(inner):
+            return inner(tool_name, arguments, **kwargs)
+        return True, arguments
+
+    def validate_tool_result(self, tool_name, result, **kwargs):
+        inner = getattr(self._fn, "validate_tool_result", None)
+        if callable(inner):
+            return inner(tool_name, result, **kwargs)
+        return True, result
+
+
+def tool_arguments_parse_failed(arguments) -> bool:
+    """True when tool-call arguments could not be parsed (vs. legitimately empty)."""
+    return arguments is _TOOL_ARGUMENTS_PARSE_FAILED
+
+
+def tool_parse_error_message(function_name: str, tool_call_id: str) -> Dict[str, str]:
+    """Build a tool-role message telling the model its arguments were lost.
+
+    Surfacing this instead of dispatching with {} converts a silent
+    wrong-action-reported-as-success into a visible, retryable error.
+    """
+    return {
+        "role": "tool",
+        "tool_call_id": tool_call_id,
+        "content": (
+            f"Error: arguments for tool '{function_name}' could not be parsed "
+            f"(the argument string was invalid or truncated). "
+            f"The tool was NOT executed. Please re-emit the tool call with "
+            f"complete, valid JSON arguments."
+        ),
+    }
+
+
 if TYPE_CHECKING:
     pass
 
@@ -54,12 +152,24 @@ class BackoffPolicy:
         # Cap the base delay to prevent excessively long waits
         base = min(base, max_delay)
         jitter_amount = random.uniform(0, jitter * base)
-        return base + jitter_amount
+        # Re-clamp after jitter so max_delay is a hard ceiling
+        return min(base + jitter_amount, max_delay)
 
 
 # Cap on encoded image bytes injected back into the conversation to avoid
 # blowing up the context window. ~5MB of base64 (~3.75MB raw) by default.
 MULTIMODAL_IMAGE_BYTE_LIMIT = 5_000_000
+
+
+def _memory_prompt_text(prompt: Any) -> str:
+    """Match text-only conversation history without retaining attachment parts."""
+    if isinstance(prompt, list):
+        return "\n".join(
+            part["text"] for part in prompt
+            if isinstance(part, dict) and part.get("type") == "text"
+            and isinstance(part.get("text"), str)
+        )
+    return prompt if isinstance(prompt, str) else str(prompt)
 
 
 def _content_part_to_data_uri(part: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -380,6 +490,376 @@ class ToolExecutionMixin:
 
         return resolve_tools_list(tools)
 
+    @staticmethod
+    def _tool_name_for_plugin_merge(tool):
+        """Return the runtime name for a plugin-provided tool, if available."""
+        if isinstance(tool, dict):
+            function = tool.get("function")
+            if isinstance(function, dict):
+                return function.get("name")
+            return tool.get("name")
+        return getattr(tool, "name", None) or getattr(tool, "__name__", None)
+
+    @staticmethod
+    def _is_supported_plugin_tool(tool):
+        """Return whether a plugin tool has a local execution boundary."""
+        if callable(tool):
+            return True
+        if not isinstance(tool, dict):
+            return False
+
+        # Provider-hosted tools are intentionally non-callable: the provider
+        # owns their execution. A plain ``type: function`` dictionary only
+        # describes a schema and must not be advertised without a callable.
+        try:
+            from ..tools.hosted import is_hosted_tool
+
+            return is_hosted_tool(tool)
+        except Exception:
+            return False
+
+    def _is_plugin_tool_active(self, tool):
+        """Return whether the plugin owning ``tool`` is still enabled."""
+        owners = getattr(self, "_plugin_tool_owners", None)
+        if not owners:
+            return True
+        owner = owners.get(id(tool))
+        if owner is None:
+            return True
+
+        try:
+            from ..plugins import get_plugin_manager
+
+            # Revocation tracks the OWNING plugin's per-manager enabled state
+            # (and identity, to catch unregister/re-register). It deliberately
+            # does NOT gate on the package-wide ``plugins.enable()`` flag, which
+            # governs background hook/metric plugins — tool plugins are live on
+            # registration, matching how they were attached in ``_merge_plugin_tools``.
+            manager = get_plugin_manager()
+            owner_entries = owner if isinstance(owner, list) else [owner]
+            get_plugin = getattr(manager, "get_plugin", None)
+            for owner_entry in owner_entries:
+                owner_name = owner_entry
+                owner_plugin = None
+                if isinstance(owner_entry, tuple):
+                    owner_name, owner_plugin = owner_entry
+                    current_plugin = (
+                        get_plugin(owner_name) if callable(get_plugin) else None
+                    )
+                    # Revocation tracks plugin identity as well as enabled state,
+                    # so unregister/re-register cannot revive a stale tool.
+                    if current_plugin is not owner_plugin:
+                        continue
+                if manager.is_enabled(owner_name):
+                    return True
+            return False
+        except Exception as exc:  # pragma: no cover - defensive plugin boundary
+            logging.warning("Failed to check plugin tool state: %s", exc)
+            return False
+
+    def _merge_plugin_tools(self):
+        """Attach tools from enabled protocol-driven plugins to this Agent.
+
+        Plugin tools stay on the Agent rather than the process-global
+        ``ToolRegistry``. This preserves declared-tool isolation while
+        allowing the normal formatter and execution pipeline to handle plugin
+        callables exactly like ``tools=`` values. Plugin ownership is recorded
+        so disabling or unregistering a plugin revokes its tools from this
+        agent's discovery and execution paths.
+        """
+        # Hot-path fast exit: when no plugins are registered (the common case)
+        # skip constructing/scanning the manager entirely on every Agent init.
+        try:
+            from ..plugins.manager import has_registered_plugins
+
+            if not has_registered_plugins():
+                return
+        except Exception:  # pragma: no cover - defensive plugin boundary
+            pass
+        try:
+            from ..plugins import get_plugin_manager
+
+            # NOTE: do NOT gate on the package-wide ``plugins.enable()`` flag.
+            # ``get_all_tools_with_sources()`` already filters to individually
+            # manager-enabled plugins, and registering a tool plugin marks it
+            # enabled. The plugin docs state tools work WITHOUT calling
+            # ``enable()`` (only background hook/metric plugins need it), so a
+            # merely-registered tool plugin must still reach the agent.
+            manager = get_plugin_manager()
+            get_tools_with_sources = getattr(
+                manager, "get_all_tools_with_sources", None
+            )
+            if callable(get_tools_with_sources):
+                plugin_entries = get_tools_with_sources()
+            else:  # pragma: no cover - compatibility with custom managers
+                plugin_entries = [(None, tool) for tool in manager.get_all_tools()]
+        except Exception as exc:  # pragma: no cover - defensive plugin boundary
+            logging.warning("Failed to attach plugin tools: %s", exc)
+            return
+
+        current_tools = self.tools if isinstance(self.tools, list) else [self.tools]
+        existing_ids = {id(tool) for tool in current_tools}
+        existing_names = {
+            name
+            for tool in current_tools
+            if (name := self._tool_name_for_plugin_merge(tool))
+        } | {name for name, _tool in self._iter_active_named_tools()}
+        for owner, tool in plugin_entries:
+            if id(tool) in existing_ids:
+                # Multiple enabled plugins may intentionally expose the same
+                # callable or hosted-tool object. Keep every owner so disabling
+                # one provider does not revoke a capability still supplied by
+                # another provider.
+                plugin_owners = getattr(self, "_plugin_tool_owners", None)
+                if plugin_owners is not None and id(tool) in plugin_owners and owner:
+                    get_plugin = getattr(manager, "get_plugin", None)
+                    owner_entry = (
+                        owner,
+                        get_plugin(owner) if callable(get_plugin) else None,
+                    )
+                    existing_owner = plugin_owners[id(tool)]
+                    owner_entries = (
+                        existing_owner
+                        if isinstance(existing_owner, list)
+                        else [existing_owner]
+                    )
+                    if not any(
+                        isinstance(entry, tuple)
+                        and entry[0] == owner_entry[0]
+                        and entry[1] is owner_entry[1]
+                        for entry in owner_entries
+                    ):
+                        owner_entries.append(owner_entry)
+                        plugin_owners[id(tool)] = owner_entries
+                continue
+            name = self._tool_name_for_plugin_merge(tool)
+            function = tool.get("function") if isinstance(tool, dict) else None
+            if (
+                isinstance(tool, dict)
+                and tool.get("type") == "function"
+                and isinstance(function, dict)
+                and isinstance(function.get("name"), str)
+                and function["name"]
+            ):
+                logging.warning(
+                    "Skipping plugin function tool %r: function schemas are not "
+                    "executable without a callable implementation",
+                    name,
+                )
+                continue
+            if not self._is_supported_plugin_tool(tool) or (
+                name is not None and not isinstance(name, str)
+            ) or (callable(tool) and not name):
+                logging.warning(
+                    "Skipping plugin tool %r: expected a named callable or valid tool spec",
+                    name or tool,
+                )
+                continue
+            if name and name in existing_names:
+                logging.warning(
+                    "Skipping plugin tool %r because Agent already has a tool with that name",
+                    name,
+                )
+                continue
+
+            # Only normalize a non-list declared tool source when there is a
+            # valid, non-conflicting plugin tool to append. Enabling plugins
+            # must not otherwise change the public shape of ``self.tools``.
+            if not isinstance(self.tools, list):
+                self.tools = [self.tools] if self.tools else []
+            self.tools.append(tool)
+            existing_ids.add(id(tool))
+            if name:
+                existing_names.add(name)
+            if owner:
+                if not hasattr(self, "_plugin_tool_owners"):
+                    self._plugin_tool_owners = {}
+                get_plugin = getattr(manager, "get_plugin", None)
+                plugin = get_plugin(owner) if callable(get_plugin) else None
+                self._plugin_tool_owners[id(tool)] = (owner, plugin)
+            display_name = name
+            if not display_name and isinstance(tool, dict):
+                display_name = tool.get("type", "spec")
+            logging.debug("Added plugin tool to Agent: %s", display_name or tool)
+
+    def _merge_plugin_subsystems(self):
+        """Route enabled GUARDRAIL/POLICY/SKILL plugins into their subsystems.
+
+        Complements ``_merge_plugin_tools``: instead of contributing tools, a
+        plugin declared ``PluginType.GUARDRAIL``/``POLICY``/``SKILL`` now
+        participates in the typed subsystem its category promises —
+
+        * GUARDRAIL: ``as_guardrail()`` objects are folded into ``self.guardrail``
+          so ``_setup_guardrail()`` (which runs after this) wires them into the
+          same ``GuardrailChain`` the Agent already runs — including
+          ``validate_tool_call`` / ``validate_tool_result``.
+        * POLICY: ``get_policies()`` rules are added to ``self._policy``
+          (a ``PolicyEngine``) so they gate tool calls.
+        * SKILL: ``get_skills()`` entries are appended to ``self._skills`` so the
+          lazy ``SkillManager`` discovers them as real, loadable skills.
+
+        Best-effort and fail-open on plugin errors: a broken plugin must never
+        prevent the Agent from constructing. Zero overhead when no such plugin
+        is enabled (each collector returns an empty list).
+        """
+        # Hot-path fast exit: when no plugins are registered (the common case)
+        # skip constructing/scanning the manager entirely on every Agent init.
+        try:
+            from ..plugins.manager import has_registered_plugins
+
+            if not has_registered_plugins():
+                return
+        except Exception:  # pragma: no cover - defensive plugin boundary
+            pass
+        try:
+            from ..plugins import get_plugin_manager
+
+            manager = get_plugin_manager()
+        except Exception as exc:  # pragma: no cover - defensive plugin boundary
+            logging.warning("Failed to access plugin manager for subsystems: %s", exc)
+            return
+
+        # --- GUARDRAIL plugins -> self.guardrail (GuardrailChain) -------------
+        get_guardrails = getattr(manager, "get_all_guardrails", None)
+        if callable(get_guardrails):
+            try:
+                plugin_guardrails = get_guardrails() or []
+            except Exception as exc:  # pragma: no cover - defensive boundary
+                logging.warning("Failed to collect plugin guardrails: %s", exc)
+                plugin_guardrails = []
+            if plugin_guardrails:
+                try:
+                    from ..guardrails import GuardrailChain
+                    from ..guardrails.protocols import is_guardrail_object
+
+                    chain_items = [
+                        g for g in plugin_guardrails if is_guardrail_object(g)
+                    ]
+                    if chain_items:
+                        chain = GuardrailChain(chain_items)
+                        # Register the plugin guardrails' tool-call/result
+                        # surface on the runtime lists ``_check_tool_policy_and_
+                        # guardrails`` / ``_apply_tool_result_guardrails`` read,
+                        # so a guardrail plugin finally sees tool calls and raw
+                        # tool results — the blind spot ``after_llm`` never
+                        # covered. Runs after ``_setup_guardrail()`` so we append
+                        # rather than replace any user-supplied guardrail surface.
+                        calls = getattr(self, "_tool_call_guardrails", None)
+                        if isinstance(calls, list):
+                            calls.append(chain)
+                        else:
+                            self._tool_call_guardrails = [chain]
+                        results = getattr(self, "_tool_result_guardrails", None)
+                        if isinstance(results, list):
+                            results.append(chain)
+                        else:
+                            self._tool_result_guardrails = [chain]
+                        # Also make the chain participate in the Agent's
+                        # input/output validation (not just the tool surface).
+                        existing_fn = getattr(self, "_guardrail_fn", None)
+                        if existing_fn is None:
+                            # No user guardrail: the plugin chain becomes the
+                            # Agent's output/input validator directly.
+                            self.guardrail = chain
+                            self._guardrail_fn = chain
+                        elif existing_fn is not chain:
+                            # User already supplied a guardrail. Compose rather
+                            # than replace so BOTH run on the final response:
+                            # wrap the user's callable in an adapter exposing
+                            # validate_output/validate_input, then chain it with
+                            # the plugin chain. The user's guardrail runs first;
+                            # a plugin guardrail can no longer be silently
+                            # skipped just because a user guardrail exists.
+                            adapter = _CallableGuardrailAdapter(existing_fn)
+                            combined = GuardrailChain([adapter, chain])
+                            self.guardrail = combined
+                            self._guardrail_fn = combined
+                except Exception as exc:  # pragma: no cover - defensive boundary
+                    logging.warning("Failed to wire plugin guardrails: %s", exc)
+
+        # --- POLICY plugins -> self._policy (PolicyEngine) -------------------
+        get_policies = getattr(manager, "get_all_policies", None)
+        if callable(get_policies):
+            try:
+                plugin_policies = get_policies() or []
+            except Exception as exc:  # pragma: no cover - defensive boundary
+                logging.warning("Failed to collect plugin policies: %s", exc)
+                plugin_policies = []
+            if plugin_policies:
+                try:
+                    policy = getattr(self, "_policy", None)
+                    if policy is None:
+                        from ..policy import PolicyEngine
+
+                        policy = PolicyEngine()
+                        self._policy = policy
+                    add_policy = getattr(policy, "add_policy", None)
+                    if callable(add_policy):
+                        # A user-supplied policy always wins: never let a plugin
+                        # rule silently replace an existing policy of the same
+                        # name (PolicyEngine.add_policy overwrites by name), which
+                        # could otherwise loosen a user-configured restriction.
+                        existing = set()
+                        get_policy = getattr(policy, "get_policy", None)
+                        for rule in plugin_policies:
+                            rule_name = getattr(rule, "name", None)
+                            if rule_name is not None and callable(get_policy):
+                                try:
+                                    if get_policy(rule_name) is not None:
+                                        logging.warning(
+                                            "Skipping plugin policy %r: a policy "
+                                            "with that name already exists.",
+                                            rule_name,
+                                        )
+                                        continue
+                                except Exception:  # pragma: no cover
+                                    pass
+                            if rule_name is not None and rule_name in existing:
+                                logging.warning(
+                                    "Skipping duplicate plugin policy %r.",
+                                    rule_name,
+                                )
+                                continue
+                            try:
+                                add_policy(rule)
+                                if rule_name is not None:
+                                    existing.add(rule_name)
+                            except Exception as exc:  # pragma: no cover
+                                logging.warning(
+                                    "Failed to add plugin policy %r: %s", rule, exc
+                                )
+                except Exception as exc:  # pragma: no cover - defensive boundary
+                    logging.warning("Failed to wire plugin policies: %s", exc)
+
+        # --- SKILL plugins -> self._skills (SkillManager discovers them) -----
+        get_skills = getattr(manager, "get_all_skills", None)
+        if callable(get_skills):
+            try:
+                plugin_skills = get_skills() or []
+            except Exception as exc:  # pragma: no cover - defensive boundary
+                logging.warning("Failed to collect plugin skills: %s", exc)
+                plugin_skills = []
+            if plugin_skills:
+                current = getattr(self, "_skills", None)
+                if not isinstance(current, list):
+                    current = [current] if current else []
+                for skill in plugin_skills:
+                    # ``self._skills`` feeds ``SkillManager.add_skill(path)``,
+                    # which resolves each entry as a filesystem path. Only
+                    # string path selectors are loadable; a non-string (e.g. a
+                    # source object) would raise inside ``Path()``, so skip it
+                    # with a clear warning rather than corrupt discovery.
+                    if not isinstance(skill, str):
+                        logging.warning(
+                            "Skipping plugin skill %r: get_skills() must return "
+                            "filesystem path strings to skill directories.",
+                            skill,
+                        )
+                        continue
+                    if skill not in current:
+                        current.append(skill)
+                self._skills = current
+
     def _cast_arguments(self, func, arguments):
         """Cast arguments to their expected types based on function signature."""
         if not callable(func) or not arguments:
@@ -436,6 +916,86 @@ class ToolExecutionMixin:
             logging.debug(f"Type casting failed for {getattr(func, '__name__', 'unknown function')}: {e}")
             return arguments
 
+    def _current_cancel_event(self):
+        """Return a cancellation Event a running tool body can observe, or None.
+
+        Sourced from the agent's ``interrupt_controller`` when present. The event
+        is only meaningful while a cancellation is actually in effect for the
+        current turn — the controller clears its underlying flag once an
+        interrupted turn ends (see ``InterruptController._end_turn``), so a stale
+        request from a previous turn does not abort newly started tool bodies.
+        A controller without an ``event`` member yields ``None`` (fully optional).
+        """
+        controller = getattr(self, 'interrupt_controller', None)
+        if controller is None:
+            return None
+        return getattr(controller, 'event', None)
+
+    def _current_turn_liveness(self):
+        """Return a zero-arg predicate that is ``True`` while the turn is live.
+
+        Binds :class:`ApprovalRequest.liveness` to the run's cooperative
+        cancellation signal so an approval that resolves *after* the originating
+        turn was stopped/superseded is dropped fail-closed at the
+        resolution boundary (a stale human ``approve`` never fires an effectful
+        tool nor persists a durable ``session``/``always`` grant for an
+        abandoned turn).
+
+        Prefers the **effective per-turn cancellation token** set by
+        ``chat``/``achat`` (``self._active_turn_token``): that is the authority
+        an explicit ``cancel_token=`` selects, which the agent-level
+        ``interrupt_controller`` does not observe. Its ``is_set()`` reports
+        cancellation whether the source is an explicit token or the interrupt
+        controller, so a ``/stop`` on the real per-turn authority is seen here.
+        Falls back to the interrupt controller's ``event`` when no per-turn
+        token is registered.
+
+        Returns ``None`` when neither is attached, which keeps today's behaviour
+        (the request is treated as always live).
+        """
+        current = _active_turn_cancel.get()
+        if current is not None and current[0] is self:
+            token = current[1]
+        else:
+            token = getattr(self, '_active_turn_token', None)
+        if token is not None:
+            is_set = getattr(token, 'is_set', None)
+            if callable(is_set):
+                return lambda: not is_set()
+        event = self._current_cancel_event()
+        if event is None:
+            return None
+        return lambda: not event.is_set()
+
+    def _build_agent_state(self):
+        """Construct the AgentState injected into tools for the current call.
+
+        Shared by the sync (``execute_tool``) and async
+        (``_execute_tool_async_impl``) paths so both establish an identical
+        injection context — including the cooperative ``cancel_event`` — avoiding
+        drift where one path silently omits injected state.
+        """
+        from ..tools.injected import AgentState
+        try:
+            from .durable import get_durable_idempotency_key
+
+            idempotency_key = get_durable_idempotency_key()
+        except ImportError:
+            idempotency_key = None
+        state_metadata = {'agent_name': self.name}
+        if idempotency_key:
+            state_metadata['idempotency_key'] = idempotency_key
+        return AgentState(
+            agent_id=self.name,
+            run_id=getattr(self, '_current_run_id', 'unknown'),
+            session_id=getattr(self, '_session_id', None) or 'default',
+            last_user_message=self.chat_history[-1].get('content') if self.chat_history else None,
+            memory=getattr(self, '_memory_instance', None),
+            learn_manager=getattr(getattr(self, '_memory_instance', None), 'learn', None),
+            metadata=state_metadata,
+            cancel_event=self._current_cancel_event(),
+        )
+
     def execute_tool(self, function_name: str, arguments: Dict[str, Any], tool_call_id: Optional[str] = None) -> Any:
         """
         Execute a tool dynamically based on the function name and arguments.
@@ -459,25 +1019,8 @@ class ToolExecutionMixin:
         # Do NOT call it here to avoid duplicate output
         
         # Set up injection context for tools with Injected parameters
-        from ..tools.injected import AgentState
-        try:
-            from .durable import get_durable_idempotency_key
-
-            idempotency_key = get_durable_idempotency_key()
-        except ImportError:
-            idempotency_key = None
-        state_metadata = {'agent_name': self.name}
-        if idempotency_key:
-            state_metadata['idempotency_key'] = idempotency_key
-        state = AgentState(
-            agent_id=self.name,
-            run_id=getattr(self, '_current_run_id', 'unknown'),
-            session_id=getattr(self, '_session_id', None) or 'default',
-            last_user_message=self.chat_history[-1].get('content') if self.chat_history else None,
-            memory=getattr(self, '_memory_instance', None),
-            learn_manager=getattr(getattr(self, '_memory_instance', None), 'learn', None),
-            metadata=state_metadata,
-        )
+        state = self._build_agent_state()
+        cancel_event = state.cancel_event
         
         # Route through user-supplied tool middleware (Agent(hooks=[...])) when
         # present. Zero overhead when no hooks: the fast path calls straight
@@ -496,6 +1039,7 @@ class ToolExecutionMixin:
                 session_id=getattr(self, '_session_id', None) or 'default',
                 tool_name=function_name,
                 metadata={"tool_call_id": tool_call_id},
+                cancel_event=cancel_event,
             ),
         )
 
@@ -524,6 +1068,14 @@ class ToolExecutionMixin:
             manager = MiddlewareManager(hooks)
             self._middleware_manager = manager
         return manager if manager.has_tool_hooks else None
+
+    def _get_tool_executor_lock(self):
+        """Return the per-instance lock, including for standalone mixin users."""
+        try:
+            return self._tool_executor_lock
+        except AttributeError:
+            from .async_safety import DualLock
+            return self.__dict__.setdefault("_tool_executor_lock", DualLock())
 
     def _get_turn_tools_lock(self):
         """Return the DualLock guarding the per-turn tool buffer.
@@ -796,12 +1348,72 @@ class ToolExecutionMixin:
                                         return self._execute_tool_with_circuit_breaker(function_name, arguments)
 
                                 # Use reusable executor to prevent resource leaks
-                                if not hasattr(self, '_tool_executor') or self._tool_executor is None:
-                                    self._tool_executor = concurrent.futures.ThreadPoolExecutor(
-                                        max_workers=2, thread_name_prefix=f"tool-{self.name}"
-                                    )
+                                pool_exhausted = False
+                                with self._get_tool_executor_lock().sync():
+                                    if not hasattr(self, '_tool_executor') or self._tool_executor is None:
+                                        self._tool_executor = concurrent.futures.ThreadPoolExecutor(
+                                            max_workers=_TOOL_POOL_MAX_WORKERS,
+                                            thread_name_prefix=f"tool-{self.name}"
+                                        )
+                                        # Per-executor in-flight counter so a
+                                        # retired pool's late-finishing future can
+                                        # never corrupt the *new* pool's count.
+                                        self._tool_executor._inflight = 0
+                                    executor = self._tool_executor
+                                    orphaned = getattr(self, '_tool_executor_orphaned', 0)
+                                    inflight = getattr(executor, '_inflight', 0)
+                                    # Once the orphan cap is hit we can no longer
+                                    # retire a stuck pool, so we would otherwise
+                                    # queue behind hung workers and time out a
+                                    # healthy tool that never got to start. Refuse
+                                    # fast and visibly instead when no worker is
+                                    # free, and let the pool self-heal (the orphan
+                                    # count drops as hung threads finish).
+                                    if orphaned >= _MAX_ORPHANED_TOOL_EXECUTORS and inflight >= _TOOL_POOL_MAX_WORKERS:
+                                        pool_exhausted = True
+                                    else:
+                                        executor._inflight = inflight + 1
+                                        future = executor.submit(ctx.run, execute_with_context)
 
-                                future = self._tool_executor.submit(ctx.run, execute_with_context)
+                                        def _on_tool_done(_f, _agent=self, _executor=executor):  # noqa: ANN001
+                                            with _agent._get_tool_executor_lock().sync():
+                                                _executor._inflight = max(0, getattr(_executor, '_inflight', 1) - 1)
+                                                # Orphan accounting is per-POOL, not
+                                                # per-future: retiring a pool adds
+                                                # exactly one to the orphan count, so
+                                                # a pool may return exactly one slot.
+                                                # Recover it only when this retired
+                                                # pool's LAST in-flight worker exits
+                                                # (``_inflight`` == 0), and guard with
+                                                # a one-shot flag so a multi-worker
+                                                # pool can never decrement more than
+                                                # the single unit it contributed and
+                                                # steal another orphaned pool's slot.
+                                                if (
+                                                    getattr(_agent, '_tool_executor', None) is not _executor
+                                                    and _executor._inflight == 0
+                                                    and not getattr(_executor, '_orphan_recovered', False)
+                                                ):
+                                                    _executor._orphan_recovered = True
+                                                    _agent._tool_executor_orphaned = max(
+                                                        0, getattr(_agent, '_tool_executor_orphaned', 0) - 1
+                                                    )
+
+                                        future.add_done_callback(_on_tool_done)
+                                if pool_exhausted:
+                                    logging.warning(
+                                        f"Tool worker pool exhausted; refusing to queue '{function_name}' "
+                                        f"behind {orphaned} hung tool call(s)."
+                                    )
+                                    result = {
+                                        "error": (
+                                            f"Tool worker pool exhausted: {orphaned} earlier tool call(s) "
+                                            f"are still running past their timeout. Refusing to queue "
+                                            f"'{function_name}'."
+                                        ),
+                                        "tool_pool_exhausted": True,
+                                    }
+                                    break
                                 try:
                                     result = future.result(timeout=tool_timeout)
                                 except concurrent.futures.TimeoutError:
@@ -822,11 +1434,12 @@ class ToolExecutionMixin:
                                     # once the cap is reached we stop recycling and keep reusing
                                     # the existing pool so repeated timeouts can't exhaust process
                                     # resources with an unbounded number of leaked threads.
-                                    orphaned = getattr(self, '_tool_executor_orphaned', 0)
-                                    if orphaned < _MAX_ORPHANED_TOOL_EXECUTORS:
-                                        self._tool_executor.shutdown(wait=False)
-                                        self._tool_executor = None
-                                        self._tool_executor_orphaned = orphaned + 1
+                                    with self._get_tool_executor_lock().sync():
+                                        orphaned = getattr(self, '_tool_executor_orphaned', 0)
+                                        if getattr(self, '_tool_executor', None) is executor and orphaned < _MAX_ORPHANED_TOOL_EXECUTORS:
+                                            executor.shutdown(wait=False)
+                                            self._tool_executor = None
+                                            self._tool_executor_orphaned = orphaned + 1
                         else:
                             with tool_progress_channel(_progress_sink), with_injection_context(state):
                                 result = self._execute_tool_with_circuit_breaker(function_name, arguments)
@@ -883,15 +1496,46 @@ class ToolExecutionMixin:
                                     # the _outer_timeout clause above already does.
                                     and not self._tool_declares_not_idempotent(function_name))
                             )
+                            # A tool that *raised* is flattened into an error dict
+                            # tagged with ``_praison_retryable`` (see
+                            # _execute_tool_impl). A raised exception is a
+                            # framework-level tool FAILURE — it must surface as a
+                            # ToolExecutionError so the run is finalized failed and
+                            # a genuine RuntimeError/SMTP-down/rate-limit-text tool
+                            # is never silently downgraded to a success (parity with
+                            # the base behaviour and test_tool_failure_not_relabelled).
+                            # ``is_retryable`` above decides only whether the outer
+                            # loop retries, not whether it raises.
+                            raised_exception = "_praison_retryable" in result
+                            # NOTE: an unknown tool is deliberately NOT escalated
+                            # here. GHSA-gmjg-hv98-qggq's regression tests in
+                            # tests/unit/agent/test_tool_resolution_boundary.py
+                            # pin the contract that execute_tool returns None or
+                            # an error dict for an unresolved name rather than
+                            # raising, and the self-repair feature depends on it:
+                            # the corrective dict (with its "Did you mean" hint
+                            # and the tool inventory) is fed back so the model
+                            # can retry with a real tool name. Raising would
+                            # abort the run and make repair impossible.
                             # Strip the private control-plane tag before it can reach
                             # the model or be re-surfaced as the tool's payload.
                             result.pop("_praison_retryable", None)
-                            raise ToolExecutionError(
-                                result.get("error", f"Tool '{function_name}' failed"),
-                                tool_name=function_name,
-                                agent_id=self.name,
-                                is_retryable=is_retryable,
-                            )
+                            if is_retryable or raised_exception:
+                                raise ToolExecutionError(
+                                    result.get("error", f"Tool '{function_name}' failed"),
+                                    tool_name=function_name,
+                                    agent_id=self.name,
+                                    is_retryable=is_retryable,
+                                )
+                            # A plain tool-authored {"error": ...} with none of the
+                            # transient/denial markers and no raised-exception tag is
+                            # the tool's own documented way of *returning* a
+                            # recoverable failure (see tools/shell_tools.py and the
+                            # other bundled tools). It is the tool's answer, not a
+                            # framework-level crash — hand it back as a normal tool
+                            # result so the LLM can see it and self-correct, instead
+                            # of aborting the whole run.
+                            break
                         else:
                             # Success path - return the result
                             break
@@ -934,6 +1578,13 @@ class ToolExecutionMixin:
                         )
                         time.sleep(delay)
             
+            # Tool-result guardrail gate (protocol-driven). Runs on the raw
+            # result before any middleware/trust-wrapping/hooks so a guardrail
+            # can inspect or redact unsafe tool output (a leaked secret, a
+            # prompt-injection payload) before it re-enters the LLM context.
+            # Fail-closed. Zero overhead when unset.
+            result = self._apply_tool_result_guardrails(function_name, result)
+
             # Apply runtime-scoped middleware normalization BEFORE hooks fire
             # Plugin harnesses can register middleware to normalize vendor-specific results
             runtime_id = getattr(self, '_runtime_id', 'praisonai')  # Default to native runtime
@@ -1092,8 +1743,18 @@ class ToolExecutionMixin:
                         if isinstance(result, dict):
                             max_field_chars = getattr(self, 'tool_output_limit', DEFAULT_TOOL_OUTPUT_LIMIT) if not self.context_manager else None
                             result = self._truncate_dict_fields(result, function_name, max_field_chars, tool_call_id)
-                            # Add artifact reference to dict result if available
-                            if artifact_ref:
+                            # Per-field truncation only shortens individual fields
+                            # that each exceed the field limit; a dict of many
+                            # medium-sized fields (e.g. 50 search snippets each
+                            # just under the limit) stays unbounded and can still
+                            # overflow the context. Enforce a total-size budget:
+                            # if the serialised dict is still over the limit, fall
+                            # back to the already-computed head/tail string (which
+                            # carries the artifact reference for full retrieval).
+                            if len(str(result)) > limit:
+                                result = truncated
+                            elif artifact_ref:
+                                # Add artifact reference to dict result if available
                                 result["_artifact_ref"] = artifact_ref.to_dict()
                         else:
                             result = truncated
@@ -1295,6 +1956,11 @@ class ToolExecutionMixin:
         ``_atrigger_after_agent_hook`` without any async-safety change.
         """
         from ..hooks import HookEvent, AfterAgentInput
+        # AfterAgentInput.response is typed/serialized as a string (its
+        # to_dict truncates via ``response[:500]``). Structured-output turns
+        # (output_pydantic) return a Pydantic instance, so coerce to str here
+        # to keep string-only hooks (e.g. command hooks) from crashing while
+        # the public chat() return value stays the model.
         return AfterAgentInput(
             session_id=getattr(self, '_session_id', 'default'),
             cwd=os.getcwd(),
@@ -1302,13 +1968,13 @@ class ToolExecutionMixin:
             timestamp=str(time.time()),
             agent_name=self.name,
             prompt=prompt if isinstance(prompt, str) else str(prompt),
-            response=response or "",
+            response=response if isinstance(response, str) else (str(response) if response else ""),
             tools_used=tools_used or [],
             total_tokens=0,
             execution_time_ms=(time.time() - start_time) * 1000
         )
 
-    def _after_agent_side_effects(self, prompt, response):
+    def _after_agent_side_effects(self, prompt, response, *, process_auto_memory=True):
         """Run loop-agnostic after-agent side effects (no ``await`` inside).
 
         Covers auto-memory extraction, auto-learning extraction, and the
@@ -1317,9 +1983,18 @@ class ToolExecutionMixin:
         boundary.
         """
         # Auto-memory extraction (opt-in via MemoryConfig(auto_memory=True))
-        if response:
-            prompt_str = prompt if isinstance(prompt, str) else str(prompt)
-            self._process_auto_memory(prompt_str, str(response))
+        if response and process_auto_memory:
+            prompt_str = _memory_prompt_text(prompt)
+            if getattr(self, "_auto_memory", False):
+                self._process_auto_memory(prompt_str, str(response))
+            # Persist the raw turn whenever memory is enabled so a later Agent
+            # sharing the same store (e.g. memory={"user_id": uid}) can recall it.
+            # Runs even with auto_memory on: the pattern extractor is best-effort
+            # and misses arbitrary facts (e.g. "codename ORANGE-PANDA"), so it
+            # must augment — not replace — durable turn storage. Without this,
+            # cross-instance recall silently returned empty (issues #5595, #5667).
+            # No-op when _memory_instance is None.
+            self._persist_memory_turn(prompt_str, str(response))
 
         # Auto-learning extraction (opt-in via LearnConfig(mode=LearnMode.AGENTIC))
         self._process_auto_learning()
@@ -1416,7 +2091,13 @@ class ToolExecutionMixin:
             after_agent_input = self._build_after_agent_input(prompt, response, start_time, tools_used)
             await self._hook_runner.execute(HookEvent.AFTER_AGENT, after_agent_input)
 
-        self._after_agent_side_effects(prompt, response)
+        if response and getattr(self, '_memory_instance', None):
+            prompt_str = _memory_prompt_text(prompt)
+            if getattr(self, '_auto_memory', False):
+                await asyncio.to_thread(self._process_auto_memory, prompt_str, str(response))
+            else:
+                await asyncio.to_thread(self._persist_memory_turn, prompt_str, str(response))
+        self._after_agent_side_effects(prompt, response, process_auto_memory=False)
 
         # Autonomous skill self-improvement loop (opt-in via self_improve=True).
         # In "background" mode the review runs off the hot path on the core
@@ -1573,6 +2254,30 @@ class ToolExecutionMixin:
         tail = text[-tail_limit:] if tail_limit > 0 else ""
         return f"{head}\n...[{len(text):,} chars, showing first/last portions]...\n{tail}"
 
+    @staticmethod
+    def _approval_backend_accepts_timeout(backend) -> bool:
+        """Return True if ``backend.request_approval_sync`` accepts a ``timeout`` kwarg.
+
+        Determined by signature introspection so the caller can route the
+        per-call timeout without a call-and-catch that would re-invoke a
+        backend whose *own* body raised ``TypeError``. Backends that accept
+        ``**kwargs`` are treated as accepting ``timeout``. On any introspection
+        failure we conservatively return False (call without ``timeout``).
+        """
+        method = getattr(backend, 'request_approval_sync', None)
+        if method is None:
+            return False
+        try:
+            sig = inspect.signature(method)
+        except (TypeError, ValueError):
+            return False
+        params = sig.parameters
+        if 'timeout' in params:
+            return True
+        return any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+        )
+
     def _resolve_approval_decision(self, tool_name: str, tool_args: dict, is_async: bool = False):
         """Shared approval logic for both sync and async paths.
         
@@ -1626,6 +2331,50 @@ class ToolExecutionMixin:
                 or (trust_level == "external")  # External tools need approval
             )
             if needs_approval:
+                # Consult the registry's standing grants before prompting.
+                # This branch used to go straight to the backend, skipping
+                # is_env_auto_approve / is_yaml_approved / is_auto_approved /
+                # is_already_approved entirely -- and it is the DEFAULT branch,
+                # since a bare Agent() on a TTY installs a ConsoleBackend. So
+                # PRAISONAI_AUTO_APPROVE=true still prompted (measured: 3 of 3
+                # identical calls), a YAML approval was ignored, and an
+                # "approve for this session" grant was never remembered.
+                agent_name_for_registry = getattr(self, 'name', None)
+                scope_id = getattr(self, '_approval_scope_id', None) or agent_name_for_registry
+                try:
+                    standing_grant = (
+                        approval_registry.is_env_auto_approve()
+                        or approval_registry.is_yaml_approved(tool_name)
+                        or approval_registry.is_auto_approved(tool_name, scope_id)
+                        or approval_registry.is_already_approved(
+                            tool_name, tool_args, scope_id
+                        )
+                        # A "[s] this session" grant is stored by reusable
+                        # permission target, not by exact arguments, so a later
+                        # call with different args (same target, e.g. the same
+                        # ``bash:git status *`` prefix) is covered too. Without
+                        # this check the attached backend re-prompts for a call
+                        # the user already blessed for the session -- the exact
+                        # re-prompting this PR set out to stop.
+                        or approval_registry._is_session_scoped(
+                            agent_name_for_registry, tool_name, tool_args, scope_id
+                        )
+                    )
+                except Exception:  # noqa: BLE001 - a grant lookup must never
+                    # block the call; fall through and ask, which is the safe
+                    # direction to fail in.
+                    standing_grant = False
+                if standing_grant:
+                    decision = ApprovalDecision(
+                        approved=True,
+                        reason="Approved by a standing registry grant",
+                    )
+                    if is_async:
+                        async def _granted():
+                            return decision
+                        return _granted()
+                    return decision
+
                 # Attach a rendered unified diff for file-mutating tools so the
                 # reviewer approves the actual change rather than a truncated
                 # argument dump. Non-edit tools get no diff (``None``) and keep
@@ -1641,57 +2390,112 @@ class ToolExecutionMixin:
                     ),
                     agent_name=getattr(self, 'name', None),
                     context={"diff": diff_preview} if diff_preview else {},
+                    liveness=self._current_turn_liveness(),
                 )
                 
+                # Record a backend decision back into the registry so a
+                # "[s] this session" (or "always") grant the user gives at the
+                # prompt is remembered -- exactly as the no-backend
+                # registry.approve_* path does via _persist_scoped_decision.
+                # Without this, the fast-path _is_session_scoped check above can
+                # never match, and the user is re-prompted on every matching
+                # call for the rest of the run. Best-effort: a bookkeeping error
+                # must never change or block the returned decision.
+                def _remember(decision):
+                    # Live-authority gate: if the originating turn was stopped or
+                    # superseded while awaiting the human, drop the resolution
+                    # fail-closed. The tool must not run and no durable
+                    # session/always grant may be persisted for an abandoned turn.
+                    live = getattr(request, "liveness", None)
+                    if live is not None:
+                        try:
+                            still_live = live()
+                        except Exception:  # noqa: BLE001 - a liveness probe must
+                            # never crash the approval path; treat a failing probe
+                            # as live so we fall back to today's behaviour.
+                            still_live = True
+                        if not still_live:
+                            return ApprovalDecision(
+                                approved=False,
+                                reason="Turn no longer live (stopped or superseded)",
+                            )
+                    try:
+                        if getattr(decision, "approved", False):
+                            approval_registry.mark_approved(
+                                tool_name, tool_args, agent_name_for_registry, scope_id
+                            )
+                        approval_registry._persist_scoped_decision(
+                            agent_name_for_registry, tool_name, tool_args,
+                            decision, scope_id,
+                        )
+                    except Exception:  # noqa: BLE001 - bookkeeping only
+                        pass
+                    return decision
+
                 if is_async:
                     # Async path - return the coroutine for caller to await
                     cfg_timeout = getattr(self, '_approval_timeout', 0)
-                    if cfg_timeout is None:
-                        return backend.request_approval(request)
-                    elif cfg_timeout > 0:
-                        import asyncio
-                        return asyncio.wait_for(
-                            backend.request_approval(request),
-                            timeout=cfg_timeout,
-                        )
-                    else:
-                        return backend.request_approval(request)
-                else:
-                    # Sync path - handle timeout and sync/async backend compatibility
-                    cfg_timeout = getattr(self, '_approval_timeout', 0)
-                    orig_timeout = None
-                    if cfg_timeout is None:
-                        orig_timeout = getattr(backend, '_timeout', None)
-                        if orig_timeout is not None:
-                            backend._timeout = 86400 * 365
-                    elif cfg_timeout > 0:
-                        orig_timeout = getattr(backend, '_timeout', None)
-                        if orig_timeout is not None:
-                            backend._timeout = cfg_timeout
-                    
-                    try:
-                        if hasattr(backend, 'request_approval_sync'):
-                            return backend.request_approval_sync(request)
-                        else:
-                            # Use the shared utility to avoid code duplication and handle timeout correctly
-                            from ..approval.utils import run_coroutine_safely
-                            
-                            # Compute effective timeout from agent configuration
-                            if cfg_timeout is None:
-                                effective_timeout = None  # indefinite wait
-                            elif cfg_timeout > 0:
-                                effective_timeout = cfg_timeout
-                            else:
-                                # cfg_timeout == 0: use backend default or fallback
-                                effective_timeout = getattr(backend, '_timeout', 60)
-                            
-                            return run_coroutine_safely(
+
+                    async def _ask_backend_async():
+                        if cfg_timeout is None:
+                            decision = await backend.request_approval(request)
+                        elif cfg_timeout > 0:
+                            import asyncio
+                            decision = await asyncio.wait_for(
                                 backend.request_approval(request),
-                                timeout=effective_timeout
+                                timeout=cfg_timeout,
                             )
-                    finally:
-                        if orig_timeout is not None and hasattr(backend, '_timeout'):
-                            backend._timeout = orig_timeout
+                        else:
+                            decision = await backend.request_approval(request)
+                        return _remember(decision)
+
+                    return _ask_backend_async()
+                else:
+                    # Sync path - handle timeout and sync/async backend compatibility.
+                    #
+                    # The per-call timeout is passed explicitly rather than
+                    # mutated onto the (often SHARED) backend object. Mutating
+                    # ``backend._timeout`` here leaked between agents that pass
+                    # one backend instance: an overlapping call captured the
+                    # first agent's temporary value as its "original" and
+                    # restored it, leaving the backend permanently wrong.
+                    cfg_timeout = getattr(self, '_approval_timeout', 0)
+
+                    # Compute effective timeout from agent configuration.
+                    #   None  -> indefinite wait
+                    #   > 0   -> explicit per-call timeout
+                    #   == 0  -> backend default (or 60s fallback)
+                    if cfg_timeout is None:
+                        effective_timeout = None
+                    elif cfg_timeout > 0:
+                        effective_timeout = cfg_timeout
+                    else:
+                        effective_timeout = getattr(backend, '_timeout', 60)
+
+                    if hasattr(backend, 'request_approval_sync'):
+                        # Decide *up front* whether the backend accepts a
+                        # ``timeout`` kwarg by inspecting its signature, rather
+                        # than calling and catching ``TypeError``. A try/except
+                        # would re-invoke the backend when the *user callback*
+                        # inside it raised its own ``TypeError`` — duplicating
+                        # side effects and masking the real error. Signature
+                        # introspection is side-effect free.
+                        if self._approval_backend_accepts_timeout(backend):
+                            return _remember(backend.request_approval_sync(
+                                request, timeout=effective_timeout
+                            ))
+                        # Legacy backend whose request_approval_sync has no
+                        # timeout kwarg: honour its own default, no mutation of
+                        # (often shared) backend state.
+                        return _remember(backend.request_approval_sync(request))
+                    else:
+                        # Use the shared utility to avoid code duplication and handle timeout correctly
+                        from ..approval.utils import run_coroutine_safely
+
+                        return _remember(run_coroutine_safely(
+                            backend.request_approval(request),
+                            timeout=effective_timeout
+                        ))
             else:
                 if is_async:
                     # For async, wrap the decision in a coroutine
@@ -1711,17 +2515,29 @@ class ToolExecutionMixin:
             # "Agent" for every unnamed agent), so a skill grant on one agent
             # can never unlock the tool for an unrelated agent in the process.
             auto_approve_scope = getattr(self, '_approval_scope_id', None)
+            # Pass the per-instance scope id as ``scope_id`` too, so the
+            # in-memory "this session" grant store is keyed per Agent instance
+            # rather than by the display name (every unnamed Agent() defaults to
+            # "Agent"). Without this, one worker's human-granted "[s] this
+            # session" approval silently unlocks the same tool for a distinct
+            # same-named worker. ``self.name`` remains the ``agent_name`` for the
+            # name-keyed lookups (per-agent backend, risk level, ask rules,
+            # durable "always" persistence).
             if is_async:
                 return get_approval_registry().approve_async(
                     getattr(self, 'name', None), tool_name, tool_args,
                     force=manager_forces_approval,
                     auto_approve_scope=auto_approve_scope,
+                    scope_id=auto_approve_scope,
+                    liveness=self._current_turn_liveness(),
                 )
             else:
                 return get_approval_registry().approve_sync(
                     getattr(self, 'name', None), tool_name, tool_args,
                     force=manager_forces_approval,
                     auto_approve_scope=auto_approve_scope,
+                    scope_id=auto_approve_scope,
+                    liveness=self._current_turn_liveness(),
                 )
 
     def _doom_loop_approved(self, function_name, arguments, verdict) -> bool:
@@ -1779,16 +2595,77 @@ class ToolExecutionMixin:
                     function_name, arguments
                 ),
             }
+            # Key the "this session" grant by the per-instance scope id so a
+            # doom-loop continue granted on one worker cannot silently authorise
+            # a same-named sibling worker, matching the per-instance scoping used
+            # for regular tool approvals above. ``self.name`` stays as agent_name
+            # for the name-keyed lookups.
             decision = registry.approve_sync(
                 getattr(self, "name", None),
                 DOOM_LOOP_TARGET,
                 request_args,
                 force=True,
+                scope_id=getattr(self, "_approval_scope_id", None),
             )
             return bool(getattr(decision, "approved", False))
         except Exception as e:  # noqa: BLE001 — fail closed to the block path
             logging.debug(
                 "doom_loop approval routing failed for %s (%s); blocking",
+                function_name, e,
+            )
+            return False
+
+    async def _doom_loop_approved_async(self, function_name, arguments, verdict) -> bool:
+        """Async twin of :meth:`_doom_loop_approved`.
+
+        Identical decision semantics, but routes the backend prompt through the
+        registry's native ``approve_async`` so an async-only or event-loop-bound
+        approval backend runs on the *caller's* loop (preserving loop-bound
+        resources) instead of the sync bridge's throwaway worker-thread loop.
+        Every non-allow outcome — deny, timeout, no backend, or any error —
+        returns ``False`` so the caller falls back to the historical hard-stop.
+        """
+        try:
+            from ..approval import get_approval_registry
+            from ..approval.registry import DOOM_LOOP_TARGET
+
+            manager = getattr(self, "_permission_manager", None)
+            if manager is not None:
+                try:
+                    from ..permissions import PermissionAction
+                    action = manager.resolve_tool_action(
+                        "doom_loop", getattr(self, "name", None)
+                    )
+                    if action == PermissionAction.ALLOW:
+                        return True
+                    if action == PermissionAction.DENY:
+                        return False
+                except Exception as e:  # noqa: BLE001
+                    logging.debug(
+                        "doom_loop permission-manager resolve failed (%s); "
+                        "falling through to backend", e,
+                    )
+
+            registry = get_approval_registry()
+            request_args = {
+                "tool": function_name,
+                "detector": verdict.get("detector"),
+                "count": verdict.get("count"),
+                "args_fingerprint": self._doom_loop_args_fingerprint(
+                    function_name, arguments
+                ),
+            }
+            decision = await registry.approve_async(
+                getattr(self, "name", None),
+                DOOM_LOOP_TARGET,
+                request_args,
+                force=True,
+                scope_id=getattr(self, "_approval_scope_id", None),
+            )
+            return bool(getattr(decision, "approved", False))
+        except Exception as e:  # noqa: BLE001 — fail closed to the block path
+            logging.debug(
+                "doom_loop async approval routing failed for %s (%s); blocking",
                 function_name, e,
             )
             return False
@@ -2027,6 +2904,42 @@ class ToolExecutionMixin:
                 logging.debug("permission manager is_denied failed for %s: %s", target, e)
         return None
 
+    def _check_permission_manager_doom_loop(self, function_name, arguments=None):
+        """Return an error dict if the PermissionManager detects a doom loop.
+
+        Deliver the doom-loop detection the ``PermissionManager`` advertises:
+        record this call in its detector and deny on a genuine loop. Previously
+        ``check_doom_loop()`` was unreachable dead code so a configured manager
+        gave zero doom-loop protection.
+
+        This is intentionally **separate** from :meth:`_check_permission_manager_deny`
+        and invoked exactly **once per approved tool call**, with the final
+        (post-approval, possibly rewritten) arguments. Folding it into the deny
+        gate would record the call on every gate pass — counting a rejected
+        attempt, or counting an approved call twice when its args are rewritten —
+        which could trip the threshold early and deny legitimate repeats.
+        """
+        manager = getattr(self, "_permission_manager", None)
+        if manager is None:
+            return None
+        check_loop = getattr(manager, "check_doom_loop", None)
+        if not callable(check_loop):
+            return None
+        try:
+            loop_result = check_loop(function_name, arguments)
+            if loop_result is not None and getattr(loop_result, "is_loop", False):
+                return {
+                    "error": (
+                        f"Tool '{function_name}' blocked: "
+                        f"{getattr(loop_result, 'reason', 'doom loop detected')}"
+                    ),
+                    "permission_denied": True,
+                    "loop_blocked": True,
+                }
+        except Exception as e:  # noqa: BLE001
+            logging.debug("permission manager doom-loop check failed for %s: %s", function_name, e)
+        return None
+
     def _is_bypass_mode(self) -> bool:
         """Return ``True`` when ``PermissionMode.BYPASS`` is active.
 
@@ -2088,9 +3001,17 @@ class ToolExecutionMixin:
                 if manager_denial is not None:
                     return manager_denial
 
+        # Record the (approved, final-args) call in the doom-loop detector once,
+        # after approval, so rejected attempts and arg rewrites are not counted.
+        if not self._is_bypass_mode():
+            loop_denial = self._check_permission_manager_doom_loop(function_name, arguments)
+            if loop_denial is not None:
+                return loop_denial
+
         from ..approval import get_approval_registry
         get_approval_registry().mark_approved(
-            function_name, arguments, agent_name=getattr(self, "name", None)
+            function_name, arguments, agent_name=getattr(self, "name", None),
+            scope_id=getattr(self, "_approval_scope_id", None),
         )
         return None, arguments
 
@@ -2133,9 +3054,17 @@ class ToolExecutionMixin:
                 if manager_denial is not None:
                     return manager_denial
 
+        # Record the (approved, final-args) call in the doom-loop detector once,
+        # after approval, so rejected attempts and arg rewrites are not counted.
+        if not self._is_bypass_mode():
+            loop_denial = self._check_permission_manager_doom_loop(function_name, arguments)
+            if loop_denial is not None:
+                return loop_denial
+
         from ..approval import get_approval_registry
         get_approval_registry().mark_approved(
-            function_name, arguments, agent_name=getattr(self, "name", None)
+            function_name, arguments, agent_name=getattr(self, "name", None),
+            scope_id=getattr(self, "_approval_scope_id", None),
         )
         return None, arguments
 
@@ -2280,6 +3209,83 @@ class ToolExecutionMixin:
         except Exception:
             pass
 
+    def _get_tool_circuit_breaker(self, function_name):
+        """Return this agent's circuit breaker for *function_name*, or None.
+
+        Shared between the sync tool path (_execute_tool_with_circuit_breaker_impl)
+        and the async tool path (_execute_tool_async_impl) so both engage the
+        same per-agent breaker. Uses the identical instance-scoped key so one
+        agent's failing tool cannot trip another agent's same-named tool.
+        Returns None when the circuit_breaker module is unavailable.
+        """
+        try:
+            from ..tools.circuit_breaker import get_circuit_breaker, CircuitBreakerConfig
+        except ImportError:
+            return None
+        breaker_name = f"tool_{id(self)}_{function_name}"
+        config = CircuitBreakerConfig(
+            failure_threshold=5,
+            recovery_timeout=60.0,
+            timeout=30.0,
+            graceful_degradation=True,
+        )
+        breaker = get_circuit_breaker(breaker_name, config)
+        self._register_breaker_finalizer(breaker_name)
+        return breaker
+
+    def _circuit_breaker_open_result(self, function_name):
+        """Return the standard ``circuit_open`` error dict for *function_name*."""
+        return {
+            "error": f"Tool '{function_name}' circuit breaker open - too many recent failures",
+            "circuit_open": True,
+            "agent_name": getattr(self, "name", None),
+            "session_id": getattr(self, "_session_id", None),
+            "remediation": "Wait for recovery_timeout (60s) or investigate recent tool failures.",
+        }
+
+    def _circuit_breaker_precheck(self, function_name):
+        """Short-circuit an OPEN breaker before running the tool body.
+
+        Mirrors the OPEN-state rejection logic of ``CircuitBreaker.call`` so the
+        async tool path gets the same protection as the sync path without needing
+        to funnel its async ``_invoke`` through the sync ``breaker.call``.
+
+        Returns a ``circuit_open`` error dict when the call must be rejected, or
+        None when the tool is allowed to run (and mutates the breaker into
+        HALF_OPEN when the recovery timeout has elapsed, exactly like ``call``).
+        """
+        breaker = self._get_tool_circuit_breaker(function_name)
+        if breaker is None:
+            return None
+        try:
+            from ..tools.circuit_breaker import CircuitState
+        except ImportError:
+            return None
+        with breaker._lock:
+            breaker._stats.total_requests += 1
+            if breaker._stats.state == CircuitState.OPEN:
+                if not breaker._should_attempt_reset():
+                    breaker._stats.rejected_requests += 1
+                    return self._circuit_breaker_open_result(function_name)
+                breaker._stats.state = CircuitState.HALF_OPEN
+                breaker._stats.success_count = 0
+        return None
+
+    def _circuit_breaker_record(self, function_name, is_success):
+        """Record a tool outcome against this agent's breaker.
+
+        Used by the async path after ``_invoke`` so repeated failures open the
+        breaker just as the sync path's ``breaker.call`` does. Treated as a
+        no-op when the breaker is unavailable.
+        """
+        breaker = self._get_tool_circuit_breaker(function_name)
+        if breaker is None:
+            return
+        if is_success:
+            breaker._on_success()
+        else:
+            breaker._on_failure()
+
     def _execute_tool_with_circuit_breaker_impl(self, function_name, arguments):
         """Execute tool with circuit breaker protection (internal implementation).
         
@@ -2357,7 +3363,126 @@ class ToolExecutionMixin:
                 "remediation": "Wait for recovery_timeout (60s) or investigate recent tool failures.",
             }
 
-    def _check_tool_policy_and_guardrails(self, function_name, arguments):
+    def _find_declared_tool(self, function_name, tools=None):
+        """Return the tool OBJECT named ``function_name``, or ``None``.
+
+        Per-tool guardrails are declared on the tool the user wrote
+        (``@tool(input_guardrails=...)``), so gating them needs the object, not
+        just the name. Searched over the agent's own tools (or the caller's
+        ``tools_override``, so a run-scoped tool list cannot silently bypass its
+        own guardrails). Deliberately does NOT fall back to the global tool
+        registry: a guardrail must come from the tool this agent was actually
+        given, never from a same-named tool registered elsewhere.
+        """
+        candidates = tools if tools is not None else getattr(self, "tools", None)
+        if not isinstance(candidates, (list, tuple)):
+            return None
+        for tool_obj in candidates:
+            if not self._is_plugin_tool_active(tool_obj):
+                continue
+            if getattr(tool_obj, "name", None) == function_name:
+                return tool_obj
+            if getattr(tool_obj, "__name__", None) == function_name:
+                return tool_obj
+        return None
+
+    def _check_per_tool_input_guardrails(self, function_name, arguments, tools=None):
+        """Run the guardrails declared on THIS tool against its arguments.
+
+        ORDERING (deliberate, see also ``_apply_per_tool_output_guardrails``):
+        this runs LAST on the way in - after the human approval gate, after the
+        agent-wide PolicyEngine, and after any agent-wide tool-call guardrail -
+        so it sits immediately before dispatch. That is the safest order for two
+        reasons:
+
+        1. Nothing can rewrite the arguments between this verdict and the call.
+           A guardrail that approved ``send_email(to=alice@corp.com)`` and then
+           had the arguments rewritten underneath it would be a guardrail in
+           name only, and the rewrite is exactly the capability an attacker-
+           steered agent-wide component would reach for. "The tool never runs
+           with arguments its own guardrail did not see" is the whole promise of
+           this feature, so it is the invariant that gets protected.
+        2. Human approval stays *upstream* of every automated rewrite. The human
+           is auditing what the MODEL proposed; if a guardrail could sanitise
+           the arguments first, an approval prompt would show a call the model
+           never made, and a rewriting guardrail could launder a call past human
+           review.
+
+        Returns an error dict when blocked (never raises), or ``(None, arguments)``
+        with the possibly-rewritten arguments when allowed. Zero overhead for
+        tools that declared no guardrail: one attribute read, then out.
+        """
+        tool_obj = self._find_declared_tool(function_name, tools)
+        if tool_obj is None:
+            return None, arguments
+        from ..guardrails.tool_guardrails import get_tool_guardrail_chain, INPUT
+        chain = get_tool_guardrail_chain(tool_obj, INPUT)
+        if chain is None:
+            return None, arguments
+        is_valid, processed = chain.validate_tool_call(function_name, arguments)
+        if not is_valid:
+            # Hand the reason back to the MODEL as this tool's result so it can
+            # react (pick different arguments, choose another tool, explain to
+            # the user). Raising here would abort the run and surface a stack
+            # trace to the user for what is a normal, expected policy outcome.
+            logging.warning(
+                f"Tool '{function_name}' blocked by its input guardrail: {processed}"
+            )
+            return {
+                "error": (
+                    f"Tool '{function_name}' was blocked by an input guardrail: "
+                    f"{processed}"
+                ),
+                "guardrail_denied": True,
+                "tool_guardrail": "input",
+            }
+        if isinstance(processed, dict):
+            arguments = processed
+        return None, arguments
+
+    def _apply_per_tool_output_guardrails(self, function_name, result, tools=None):
+        """Run the guardrails declared on THIS tool against its raw result.
+
+        ORDERING (deliberate): this runs FIRST on the way out - before any
+        agent-wide tool-result guardrail and before the ``trust_level``
+        external-content fence (``tools.trust.wrap_if_external``) and output
+        truncation. Mirroring the input side, the per-tool guardrail is the
+        layer closest to the tool in both directions:
+
+        * It sees the RAW result. If the trust fence ran first, every guardrail
+          would have to parse and strip ``<external_tool_result>`` markers to
+          find the content it cares about, and a guardrail that redacts by
+          rewriting could damage or forge the fence.
+        * The fence therefore stays outermost, wrapping whatever the guardrails
+          finally allow, so a substituted result is fenced exactly like an
+          original one and cannot escape the injection markers.
+
+        Returns the (possibly substituted) result, or an error dict tagged
+        ``guardrail_denied`` when blocked. Never raises.
+        """
+        tool_obj = self._find_declared_tool(function_name, tools)
+        if tool_obj is None:
+            return result
+        from ..guardrails.tool_guardrails import get_tool_guardrail_chain, OUTPUT
+        chain = get_tool_guardrail_chain(tool_obj, OUTPUT)
+        if chain is None:
+            return result
+        is_valid, processed = chain.validate_tool_result(function_name, result)
+        if not is_valid:
+            logging.warning(
+                f"Tool '{function_name}' result blocked by its output guardrail: {processed}"
+            )
+            return {
+                "error": (
+                    f"Tool '{function_name}' result was blocked by an output "
+                    f"guardrail: {processed}"
+                ),
+                "guardrail_denied": True,
+                "tool_guardrail": "output",
+            }
+        return processed
+
+    def _check_tool_policy_and_guardrails(self, function_name, arguments, tools=None):
         """Gate a tool call through the attached PolicyEngine and tool guardrails.
 
         Consults ``self._policy`` (a ``PolicyEngine``) via ``check_tool`` and any
@@ -2417,7 +3542,91 @@ class ToolExecutionMixin:
                 }
             if isinstance(processed, dict):
                 arguments = processed
+
+        # Per-tool guardrails run LAST, immediately before dispatch, so nothing
+        # can rewrite the arguments between the tool's own verdict and the call.
+        # See _check_per_tool_input_guardrails for the full ordering rationale.
+        per_tool = self._check_per_tool_input_guardrails(function_name, arguments, tools)
+        if isinstance(per_tool, dict):
+            return per_tool  # Error dict -> handed back to the model
+        _, arguments = per_tool
+
         return None, arguments
+
+    def _apply_tool_result_guardrails(self, function_name, result, tools=None):
+        """Gate a tool's raw result through any tool-result guardrails.
+
+        Runs after execution and before the result re-enters the LLM context so
+        a guardrail can inspect or redact unsafe tool output (a leaked secret, a
+        prompt-injection payload) that ``validate_output`` never sees. Returns
+        the (possibly rewritten) result when allowed, or an error dict tagged
+        ``guardrail_denied`` when rejected. Fail-closed on guardrail error,
+        mirroring ``_check_tool_policy_and_guardrails``. Zero overhead when no
+        tool-result guardrail is set. Denial error dicts pass straight through
+        untouched so a gated/failed tool is not re-inspected.
+
+        Order: per-tool guardrails (``@tool(output_guardrails=...)``) run first,
+        then agent-wide ones, then - back in the caller - the ``trust_level``
+        external-content fence and truncation. The tool's own validator is
+        therefore closest to the tool and always sees raw, unfenced output.
+        """
+        guardrails = getattr(self, "_tool_result_guardrails", None)
+        # NOTE: the early return here used to be ``if not guardrails: return``.
+        # Per-tool output guardrails are declared on the TOOL, not on the agent,
+        # so an agent with no agent-wide result guardrail must still run them -
+        # bailing out on the agent-wide list alone would make
+        # ``@tool(output_guardrails=...)`` silently dead for the common case.
+        if not guardrails and self._find_declared_tool(function_name, tools) is None:
+            return result
+        # Only skip results the framework itself already gated/denied — those
+        # carry an explicit control marker and were never real tool output. An
+        # ordinary tool-authored ``{"error": ...}`` (a crawl result with both
+        # ``error`` and ``content``, a shell tool's recoverable failure) is still
+        # untrusted content that can carry a secret or an injection payload, so
+        # it MUST be validated like any other result.
+        if isinstance(result, dict) and (
+            result.get("guardrail_denied")
+            or result.get("policy_denied")
+            or result.get("approval_denied")
+            or result.get("permission_denied")
+            or result.get("approval_error")
+        ):
+            return result
+
+        # Per-tool guardrails run FIRST on the way out, so the tool's own
+        # validator sees the raw result before any agent-wide guardrail rewrites
+        # it and before the trust fence wraps it. See
+        # _apply_per_tool_output_guardrails for the full ordering rationale.
+        result = self._apply_per_tool_output_guardrails(function_name, result, tools)
+        if isinstance(result, dict) and result.get("guardrail_denied"):
+            return result
+
+        for guardrail in guardrails or []:
+            validate = getattr(guardrail, "validate_tool_result", None)
+            if validate is None:
+                continue
+            try:
+                is_valid, processed = validate(function_name, result)
+            except Exception as e:  # noqa: BLE001
+                # Fail closed: a guardrail dependency/implementation error must
+                # block, not deliver, the unchecked result.
+                logging.warning(
+                    f"Tool '{function_name}' result denied: guardrail validate_tool_result raised: {e}"
+                )
+                return {
+                    "error": f"Tool '{function_name}' result denied: guardrail check failed ({e})",
+                    "guardrail_denied": True,
+                }
+            if not is_valid:
+                logging.warning(
+                    f"Tool '{function_name}' result rejected by tool-result guardrail"
+                )
+                return {
+                    "error": f"Tool '{function_name}' result rejected by guardrail",
+                    "guardrail_denied": True,
+                }
+            result = processed  # Accept the (possibly redacted) result
+        return result
 
     def _execute_tool_impl(self, function_name, arguments):
         """Internal tool execution implementation."""
@@ -2441,90 +3650,22 @@ class ToolExecutionMixin:
             return policy_result  # Error dict
         _, arguments = policy_result
 
-        # Special handling for MCP tools
-        # Check if tools is an MCP instance with the requested function name
-        MCP = None
-        try:
-            from ..mcp.mcp import MCP
-        except ImportError:
-            pass  # MCP not available
-        
-        # Normalize MCP transport/timeout failures (returned as bare "Error: ..."
-        # strings by MCPClient.call_tool) into the same {"error": ...} dict shape
-        # used by native tools, so they participate in retry, doom-loop detection
-        # and circuit-breaking instead of looking like a successful string result.
-        #
-        # IMPORTANT: a successful MCP tool may legitimately return text that
-        # begins with "Error: " (e.g. a linter/grep/echo tool). To avoid
-        # misclassifying valid output as a failure, we only convert MCP's own
-        # unambiguous internally-generated failure signatures, not any string
-        # that merely starts with the "Error: " prefix.
-        def _normalize_mcp_result(res):
-            if not isinstance(res, str) or not res.startswith("Error: "):
-                return res
-            message = res[len("Error: "):]
-            # MCP-internal timeout messages are unambiguous:
-            #   "MCP tool call timed out after Ns"
-            #   "MCP initialization timed out after Ns"
-            is_mcp_timeout = (
-                message.startswith("MCP tool call timed out after")
-                or message.startswith("MCP initialization timed out after")
-            )
-            if is_mcp_timeout:
-                return {"error": message, "timeout": True}
-            return res
-
-        # Helper function to execute MCP tool
-        def _execute_mcp_tool(mcp_instance, func_name, args):
-            """Execute a tool from an MCP instance."""
-            # Handle SSE MCP client
-            if hasattr(mcp_instance, 'is_sse') and mcp_instance.is_sse:
-                if hasattr(mcp_instance, 'sse_client'):
-                    for tool in mcp_instance.sse_client.tools:
-                        if tool.name == func_name:
-                            logging.debug(f"Found matching SSE MCP tool: {func_name}")
-                            return True, tool(**args)
-            # Handle HTTP Stream MCP client
-            if hasattr(mcp_instance, 'is_http_stream') and mcp_instance.is_http_stream:
-                if hasattr(mcp_instance, 'http_stream_client'):
-                    for tool in mcp_instance.http_stream_client.tools:
-                        if tool.name == func_name:
-                            logging.debug(f"Found matching HTTP Stream MCP tool: {func_name}")
-                            return True, tool(**args)
-            # Handle WebSocket MCP client
-            if hasattr(mcp_instance, 'is_websocket') and mcp_instance.is_websocket:
-                if hasattr(mcp_instance, 'websocket_client'):
-                    for tool in mcp_instance.websocket_client.tools:
-                        if tool.name == func_name:
-                            logging.debug(f"Found matching WebSocket MCP tool: {func_name}")
-                            return True, tool(**args)
-            # Handle stdio MCP client
-            if hasattr(mcp_instance, 'runner'):
-                for mcp_tool in mcp_instance.runner.tools:
-                    if hasattr(mcp_tool, 'name') and mcp_tool.name == func_name:
-                        logging.debug(f"Found matching MCP tool: {func_name}")
-                        return True, mcp_instance.runner.call_tool(func_name, args)
-            return False, None
-        
-        # Check if tools is a single MCP instance
-        if MCP is not None and isinstance(self.tools, MCP):
-            logging.debug(f"Looking for MCP tool {function_name}")
-            found, result = _execute_mcp_tool(self.tools, function_name, arguments)
-            if found:
-                return _normalize_mcp_result(result)
-        
-        # Check if tools is a list that may contain MCP instances
-        if isinstance(self.tools, (list, tuple)):
-            for tool in self.tools:
-                if MCP is not None and isinstance(tool, MCP):
-                    logging.debug(f"Looking for MCP tool {function_name} in MCP instance")
-                    found, result = _execute_mcp_tool(tool, function_name, arguments)
-                    if found:
-                        return _normalize_mcp_result(result)
+        # Resolve MCP-backed tools via the shared helper (also used by the async
+        # path) so chat()/achat() behave identically for MCP tool calls. MCP
+        # transport/timeout failures are normalized (via the shared
+        # _normalize_mcp_result) into a native {"error": ..., "timeout": True}
+        # dict so they participate in retry/doom-loop/circuit handling instead of
+        # looking like a successful string result.
+        found, result = self._resolve_mcp_tool_result(function_name, arguments)
+        if found:
+            return self._normalize_mcp_result(result)
 
         # Try to find the function in the agent's tools list first
         func = None
+        plugin_owners = getattr(self, "_plugin_tool_owners", None)
         for tool in self.tools if isinstance(self.tools, (list, tuple)) else []:
+            if plugin_owners and not self._is_plugin_tool_active(tool):
+                continue
             # Check for BaseTool instances (plugin system)
             from ..tools.base import BaseTool
             if isinstance(tool, BaseTool) and tool.name == function_name:
@@ -2554,21 +3695,10 @@ class ToolExecutionMixin:
         if func is None:
             # Tool not found in declared tools or registry — do not fall back to
             # globals() or __main__ as that allows undeclared callables to execute.
-            # Cheap, deterministic self-repair: the model often emits a name that
-            # only differs by case/separator (e.g. 'WebSearch' -> 'web_search').
-            # Build a normalised index of the agent's active tools and re-match.
-            def _norm(n):
-                return str(n).lower().replace('_', '').replace('-', '').replace(' ', '')
-
-            normalised = {}
-            for name, tool in self._iter_active_named_tools():
-                normalised.setdefault(_norm(name), []).append((name, tool))
-            match = normalised.get(_norm(function_name))
-            if match and len(match) == 1:
-                matched_name, func = match[0]
-                logging.debug(
-                    f"Self-repaired tool name {function_name!r} -> {matched_name!r}"
-                )
+            # Cheap, deterministic self-repair via the shared helper (also used by
+            # the async path): the model often emits a name that only differs by
+            # case/separator (e.g. 'WebSearch' -> 'web_search').
+            func = self._self_repair_tool_name(function_name)
 
         if func:
             bind_target = func
@@ -2598,6 +3728,18 @@ class ToolExecutionMixin:
                     scoped["idempotency_key"] = durable_key
                     return scoped
 
+                # Any of the callables below (BaseTool.run, LangChain .run,
+                # CrewAI ._run, or a plain function) may be `async def`. On this
+                # sync tool-calling path we must await it, otherwise a bare
+                # un-awaited coroutine is handed to the model as the tool result
+                # and the tool body never runs (silent data loss).
+                from .async_safety import run_async_in_sync_context
+
+                def _resolve_result(value):
+                    if inspect.iscoroutine(value):
+                        return run_async_in_sync_context(value)
+                    return value
+
                 # BaseTool instances (plugin system) - call run() method
                 from ..tools.base import BaseTool
                 if isinstance(func, BaseTool):
@@ -2605,7 +3747,7 @@ class ToolExecutionMixin:
                     keyed_arguments = _with_durable_key(func.run, arguments)
                     casted_arguments = self._cast_arguments(func.run, keyed_arguments)
                     bind_arguments = casted_arguments
-                    return func.run(**casted_arguments)
+                    return _resolve_result(func.run(**casted_arguments))
                 
                 # Langchain: If it's a class with run but not _run, instantiate and call run
                 if inspect.isclass(func) and hasattr(func, 'run') and not hasattr(func, '_run'):
@@ -2617,7 +3759,7 @@ class ToolExecutionMixin:
                                   and k != 'self'}
                     casted_params = self._cast_arguments(instance.run, run_params)
                     bind_arguments = casted_params
-                    return instance.run(**casted_params)
+                    return _resolve_result(instance.run(**casted_params))
 
                 # CrewAI: If it's a class with an _run method, instantiate and call _run
                 elif inspect.isclass(func) and hasattr(func, '_run'):
@@ -2629,7 +3771,7 @@ class ToolExecutionMixin:
                                   and k != 'self'}
                     casted_params = self._cast_arguments(instance._run, run_params)
                     bind_arguments = casted_params
-                    return instance._run(**casted_params)
+                    return _resolve_result(instance._run(**casted_params))
 
                 # Otherwise treat as regular function
                 elif callable(func):
@@ -2637,7 +3779,7 @@ class ToolExecutionMixin:
                     keyed_arguments = _with_durable_key(func, arguments)
                     casted_arguments = self._cast_arguments(func, keyed_arguments)
                     bind_arguments = casted_arguments
-                    return func(**casted_arguments)
+                    return _resolve_result(func(**casted_arguments))
             except Exception as e:
                 error_msg = str(e)
                 logging.error(f"Error executing tool {function_name}: {error_msg}")
@@ -2781,12 +3923,111 @@ class ToolExecutionMixin:
             yield from _expand(tools)
             return
         for tool in tools if isinstance(tools, (list, tuple)) else []:
+            if not self._is_plugin_tool_active(tool):
+                continue
             yield from _expand(tool)
 
     def _available_active_tool_names(self):
         """Names of the agent's currently active tools, for corrective feedback."""
         names = [name for name, _tool in self._iter_active_named_tools()]
         return sorted(set(names))
+
+    @staticmethod
+    def _normalize_mcp_result(res):
+        """Normalize MCP transport/timeout failures into a native error dict.
+
+        ``MCPClient.call_tool`` surfaces transport/timeout failures as bare
+        ``"Error: ..."`` strings. Converting MCP's own unambiguous
+        internally-generated timeout signatures into ``{"error": ..., "timeout":
+        True}`` lets them participate in retry, doom-loop detection and circuit
+        breaking instead of looking like a successful string result. Shared by
+        the sync (``_execute_tool_impl``) and async (``_execute_tool_async_impl``)
+        paths so achat()/chat() classify an MCP timeout identically.
+
+        A successful MCP tool may legitimately return text starting with
+        ``"Error: "`` (e.g. a linter/grep/echo tool), so only MCP's own
+        unambiguous timeout messages are converted, never any string that merely
+        starts with the prefix.
+        """
+        if not isinstance(res, str) or not res.startswith("Error: "):
+            return res
+        message = res[len("Error: "):]
+        is_mcp_timeout = (
+            message.startswith("MCP tool call timed out after")
+            or message.startswith("MCP initialization timed out after")
+        )
+        if is_mcp_timeout:
+            return {"error": message, "timeout": True}
+        return res
+
+    def _resolve_mcp_tool_result(self, function_name, arguments):
+        """Resolve an MCP-backed tool and return ``(found, result)``.
+
+        Shared by the sync (``_execute_tool_impl``) and async
+        (``_execute_tool_async_impl``) paths so an MCP tool call behaves
+        identically regardless of chat()/achat(). Returns ``(False, None)``
+        when no MCP tool matches. The ``result`` may be awaitable (the async
+        caller awaits it); the sync caller normalizes/returns it directly.
+        """
+        MCP = None
+        try:
+            from ..mcp.mcp import MCP
+        except ImportError:
+            return False, None
+
+        def _execute_mcp_tool(mcp_instance, func_name, args):
+            if hasattr(mcp_instance, 'is_sse') and mcp_instance.is_sse:
+                if hasattr(mcp_instance, 'sse_client'):
+                    for tool in mcp_instance.sse_client.tools:
+                        if tool.name == func_name:
+                            return True, tool(**args)
+            if hasattr(mcp_instance, 'is_http_stream') and mcp_instance.is_http_stream:
+                if hasattr(mcp_instance, 'http_stream_client'):
+                    for tool in mcp_instance.http_stream_client.tools:
+                        if tool.name == func_name:
+                            return True, tool(**args)
+            if hasattr(mcp_instance, 'is_websocket') and mcp_instance.is_websocket:
+                if hasattr(mcp_instance, 'websocket_client'):
+                    for tool in mcp_instance.websocket_client.tools:
+                        if tool.name == func_name:
+                            return True, tool(**args)
+            if hasattr(mcp_instance, 'runner'):
+                for mcp_tool in mcp_instance.runner.tools:
+                    if hasattr(mcp_tool, 'name') and mcp_tool.name == func_name:
+                        return True, mcp_instance.runner.call_tool(func_name, args)
+            return False, None
+
+        if isinstance(self.tools, MCP):
+            found, result = _execute_mcp_tool(self.tools, function_name, arguments)
+            if found:
+                return True, result
+        if isinstance(self.tools, (list, tuple)):
+            for tool in self.tools:
+                if isinstance(tool, MCP):
+                    found, result = _execute_mcp_tool(tool, function_name, arguments)
+                    if found:
+                        return True, result
+        return False, None
+
+    def _self_repair_tool_name(self, function_name):
+        """Case/separator-insensitive re-match of a hallucinated tool name.
+
+        Returns the matched tool object when exactly one active tool normalizes
+        to the same key (e.g. 'WebSearch' -> 'web_search'), else ``None``.
+        Shared by the sync and async tool-resolution paths.
+        """
+        def _norm(n):
+            return str(n).lower().replace('_', '').replace('-', '').replace(' ', '')
+
+        normalised = {}
+        for name, tool in self._iter_active_named_tools():
+            normalised.setdefault(_norm(name), []).append((name, tool))
+        match = normalised.get(_norm(function_name))
+        if match and len(match) == 1:
+            matched_name, tool = match[0]
+            logging.debug(f"Self-repaired tool name {function_name!r} -> {matched_name!r}")
+            return tool
+        return None
 
     def _resolve_callable_signature_target(self, func):
         """Return the callable whose signature describes ``func``'s arguments."""
@@ -3252,7 +4493,7 @@ class ToolExecutionMixin:
                 return "timeout"
             elif ("rate" in error_msg and "limit" in error_msg) or "too many requests" in error_msg:
                 return "rate_limit"
-            elif "connection" in error_msg or "network" in error_msg:
+            elif "connect" in error_msg or "network" in error_msg:
                 return "connection_error"
         
         # Check exception type
@@ -3264,8 +4505,8 @@ class ToolExecutionMixin:
                 return "timeout"
             elif ("rate" in exc_msg and "limit" in exc_msg) or "too many requests" in exc_msg:
                 return "rate_limit"  
-            elif ("connection" in exc_msg or "network" in exc_msg or 
-                  "connection" in exc_type):
+            elif ("connect" in exc_msg or "network" in exc_msg or
+                  "connect" in exc_type):
                 return "connection_error"
         
         return "unknown"

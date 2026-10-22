@@ -28,10 +28,12 @@ plainly rather than discovering later:
 
 from __future__ import annotations
 
+import atexit
 import json
 import logging
 import os
 import shlex
+import threading
 import uuid
 import weakref
 from typing import Any, Dict, List, Optional
@@ -39,6 +41,18 @@ from typing import Any, Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 _MARKER = "__PRAISON_RESULT__"
+
+# Bounded wait for the cloud teardown when ``_release`` runs at interpreter
+# exit. Long enough for a normal provider ``shutdown`` round-trip, short enough
+# that a hung provider cannot stall process exit indefinitely. Overridable via
+# ``PRAISONAI_COMPUTE_RELEASE_EXIT_TIMEOUT`` (read at import; teardown timing is
+# not a hot path).
+try:
+    _RELEASE_EXIT_TIMEOUT = float(
+        os.environ.get("PRAISONAI_COMPUTE_RELEASE_EXIT_TIMEOUT", "10")
+    )
+except ValueError:
+    _RELEASE_EXIT_TIMEOUT = 10.0
 
 _KEY_VARS = (
     "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY",
@@ -92,6 +106,7 @@ class ComputeManagedAgent:
         self._instance: Optional[str] = None
         self._prepared = False
         self._finalizer = None
+        self._exit_reclaimer = None
 
     @property
     def provider_name(self) -> str:
@@ -155,6 +170,9 @@ class ComputeManagedAgent:
 
     # ── lifecycle ────────────────────────────────────────────────────────────
     async def ashutdown(self) -> None:
+        if self._exit_reclaimer is not None:
+            atexit.unregister(self._exit_reclaimer)
+            self._exit_reclaimer = None
         if self._finalizer is not None:
             self._finalizer.detach()      # shutting down deliberately
             self._finalizer = None
@@ -197,6 +215,12 @@ class ComputeManagedAgent:
         config = ComputeConfig(env=env)
         if self._image:
             config.image = self._image
+        # Start the shared bridge before registering our exit callback. atexit
+        # is LIFO: instance teardown must finish before the bridge shuts down.
+        # A backend may outlive a scoped bridge. Cleanup belongs to the
+        # process-owned bridge, independent of the finalizer's ContextVars.
+        from praisonai._async_bridge import _BG as release_bridge
+        release_bridge.get()
         info = await provider.provision(config)
         self._instance = getattr(info, "instance_id", info)
 
@@ -206,9 +230,51 @@ class ComputeManagedAgent:
         # docker that was a container per script; for a cloud place it is a
         # billed instance whose only other reaper is the provider's own idle
         # timer, which docker and flyio do not have.
-        self._finalizer = weakref.finalize(
-            self, _release, provider, self._instance, self._place
-        )
+        instance_id, place = self._instance, self._place
+        pending_release = []
+        release_lock = threading.Lock()
+        claimed = False
+
+        def reclaim():
+            nonlocal claimed
+            with release_lock:
+                if claimed:
+                    return
+                claimed = True
+                future = _release(provider, instance_id, place, bridge=release_bridge)
+                if future is not None:
+                    pending_release.append(future)
+            if future is None:
+                atexit.unregister(reclaim_at_exit)
+            else:
+                future.add_done_callback(lambda done: atexit.unregister(reclaim_at_exit))
+
+        finalizer = weakref.finalize(self, reclaim)
+        # weakref's own exit hook cannot tell its callback that this is exit;
+        # sys.is_finalizing() is still false while atexit callbacks are running.
+        finalizer.atexit = False
+
+        def reclaim_at_exit():
+            nonlocal claimed
+            with release_lock:
+                if not claimed:
+                    claimed = True
+                    finalizer.detach()
+                    future = _release(provider, instance_id, place, bridge=release_bridge)
+                    if future is not None:
+                        pending_release.append(future)
+                else:
+                    future = pending_release[0] if pending_release else None
+            # The claim and future publication are atomic; even a finalizer
+            # that has fired but not entered reclaim cannot leave a handoff gap.
+            # Wait outside the lock so it never guards a provider round trip.
+            if future is not None:
+                _wait_for_release_at_exit(future, instance_id, place)
+            atexit.unregister(reclaim_at_exit)
+
+        self._finalizer = finalizer
+        self._exit_reclaimer = reclaim_at_exit
+        atexit.register(reclaim_at_exit)
         logger.info("[compute_managed] provisioned %s on %s", self._instance, self._place)
 
         probe = await provider.execute(self._instance, "python -c 'import praisonaiagents'", 180)
@@ -248,7 +314,7 @@ class ComputeManagedAgent:
 
 
 
-def _release(provider, instance_id: str, place: str) -> None:
+def _release(provider, instance_id: str, place: str, *, bridge=None):
     """Reclaim an instance whose backend is gone.
 
     Registered with weakref.finalize, so it runs when the backend is collected
@@ -257,28 +323,52 @@ def _release(provider, instance_id: str, place: str) -> None:
 
     Collection can happen on a thread that already drives an event loop (GC
     inside async workflow code), where a bare ``asyncio.run`` raises before the
-    shutdown ever runs and the instance leaks. Bridge through the same
-    loop-safe helper ``SharedCompute`` uses so teardown survives either case.
-    """
-    import asyncio
+    shutdown ever runs and the instance leaks. Route through the module's shared
+    ``AsyncBridge`` — one long-lived background loop, never a fresh loop per
+    teardown.
 
+    Return the future so the explicit atexit callback can wait for it before
+    the bridge shuts down. During normal GC this submission stays asynchronous
+    so the caller's loop is never pinned for the cloud round trip.
+    """
     async def _shutdown():
         await provider.shutdown(instance_id)
 
+    shutdown = _shutdown()
     try:
-        try:
-            asyncio.get_running_loop()
-        except RuntimeError:
-            asyncio.run(_shutdown())
-        else:
-            import concurrent.futures
-
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                pool.submit(asyncio.run, _shutdown()).result()
-        logger.debug("[compute_managed] released %s on %s", instance_id, place)
-    except Exception as exc:  # pragma: no cover - teardown stays quiet
+        if bridge is None:
+            from praisonai._async_bridge import current_bridge
+            bridge = current_bridge()
+        fut = bridge.submit(shutdown)
+    except Exception as exc:  # pragma: no cover - bridge poisoned / interpreter exit
+        shutdown.close()
         logger.warning(
-            "[compute_managed] could not release %s on %s: %s", instance_id, place, exc
+            "[compute_managed] leaked %s on %s (bridge unavailable: %s)",
+            instance_id, place, exc,
+        )
+        return
+
+    def _log_result(f):
+        try:
+            f.result()
+            logger.debug("[compute_managed] released %s on %s", instance_id, place)
+        except Exception as exc:  # pragma: no cover - teardown stays quiet
+            logger.warning(
+                "[compute_managed] could not release %s on %s: %s", instance_id, place, exc
+            )
+
+    fut.add_done_callback(_log_result)
+    return fut
+
+
+def _wait_for_release_at_exit(fut, instance_id: str, place: str) -> None:
+    try:
+        fut.result(timeout=_RELEASE_EXIT_TIMEOUT)
+        logger.debug("[compute_managed] released %s on %s", instance_id, place)
+    except Exception as exc:  # pragma: no cover - best-effort at exit
+        logger.warning(
+            "[compute_managed] could not release %s on %s at exit: %s",
+            instance_id, place, exc,
         )
 
 

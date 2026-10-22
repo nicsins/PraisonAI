@@ -156,6 +156,32 @@ async def _null_async_context():
     yield
 
 
+def _bind_turn_clarify(asked: List[Any]):
+    """Bind the built-in ``clarify`` tool to this bot turn (Issue #5850).
+
+    A blocking "send and await reply" would deadlock on the per-user turn lock,
+    so the question is delivered with this turn's reply instead: choices become
+    ``MessagePresentation.question()`` reply buttons whose tap feeds the next
+    turn, and the agent is told to stop rather than guess. Returns a reset
+    token, or ``None`` when the core SDK lacks the binding.
+    """
+    try:
+        from praisonaiagents.tools.clarify import ClarifyHandler, set_clarify_handler
+    except ImportError:
+        return None
+
+    def _ask(question: str, choices: Optional[List[str]] = None) -> str:
+        asked.append((question, list(choices or [])))
+        return (
+            "Your question has been delivered to the user. Do not guess an answer: "
+            "end your turn now by restating the question"
+            + (" and its choices" if choices else "")
+            + ". Their answer will arrive as their next message."
+        )
+
+    return set_clarify_handler(ClarifyHandler(ask_callback=_ask))
+
+
 class BotSessionManager:
     """Lightweight per-user session store for bot agents.
 
@@ -194,6 +220,7 @@ class BotSessionManager:
         platform: str = "",
         dlq: Optional[Any] = None,
         identity_resolver: Optional[Any] = None,
+        identity_canonicalizer: Optional[Any] = None,
         ingress_journal: Optional[Any] = None,
         run_control: Optional[Any] = None,
         run_timeout: float = 300.0,  # 5 minutes default timeout
@@ -209,6 +236,7 @@ class BotSessionManager:
         admission_gate: Optional[Any] = None,
         turn_lock_map: Optional["LockMap"] = None,
         surface_completion_reason: bool = False,
+        defer_journal_completion: bool = False,
     ) -> None:
         self._histories: Dict[str, List[Dict[str, Any]]] = {}
         # Issue #3232: the per-turn lock map is keyed on the *resolved* storage
@@ -245,6 +273,16 @@ class BotSessionManager:
         # session key is the resolver-returned unified user id, so the
         # same human pinging from multiple platforms shares one history.
         self._identity_resolver = identity_resolver
+        # Issue #4661: optional identity-canonicalization seam. An
+        # ``IdentityCanonicalizerProtocol`` (``canonicalize(platform,
+        # raw_user_id) -> str`` — typically the active adapter itself, since
+        # ``BasePlatformAdapter`` implements it) consulted on the raw platform
+        # id *before* it enters the session key / resolver lookup, so a
+        # platform-side id change for the *same* human (WhatsApp JID→LID, a
+        # number↔UUID alias flip) collapses to one stable session instead of
+        # silently forking history/memory/run-state. ``None`` (default) is the
+        # identity function — behaviour is byte-for-byte unchanged.
+        self._identity_canonicalizer = identity_canonicalizer
         # Ingress journal: optional durable message processing with dedup.
         # When set, messages are journaled before agent processing for
         # crash recovery and webhook redelivery protection.
@@ -259,6 +297,21 @@ class BotSessionManager:
         # behaviour (the tool returns its "no gateway available" message).
         self._delivery_router = delivery_router
         self._last_journal_key = None  # Store key for delayed completion
+        # Issue #5152: set of inbound journal keys deferred for delayed
+        # completion. Unlike the single ``_last_journal_key`` slot, this holds
+        # *every* in-flight deferred key so two concurrent turns (different
+        # users run under different per-storage-key locks, so ``chat()`` is not
+        # globally serialised) can never clobber one another — settling one
+        # turn must never settle another turn's still-undelivered inbound.
+        self._deferred_journal_keys: set[str] = set()
+        # Issue #5152: when True, chat() does NOT mark the inbound journal
+        # complete on clean exit; instead it stashes the journal key so the
+        # adapter can call complete_last_journal_entry() *after* the reply is
+        # durably delivered. This closes the window where a crash between
+        # "agent finished" and "reply sent" would settle the inbound (no
+        # replay) yet lose the user's reply. Default False keeps the legacy
+        # settle-on-agent-completion behaviour byte-for-byte unchanged.
+        self._defer_journal_completion = defer_journal_completion
         # Run control for in-flight message handling
         self._run_control = run_control
         # Issue #3296: opt-in surfacing of *why* a turn ended. When True, a turn
@@ -409,6 +462,13 @@ class BotSessionManager:
         identity_resolver = getattr(runtime, "identity_resolver", None)
         if identity_resolver is not None:
             self._identity_resolver = identity_resolver
+        # Issue #4661: adopt an identity-canonicalization seam when the runtime
+        # carries one (an ``IdentityCanonicalizerProtocol``, e.g. the active
+        # adapter itself), so a volatile platform id is stabilised before it
+        # keys a session. Absent seam leaves the identity default untouched.
+        identity_canonicalizer = getattr(runtime, "identity_canonicalizer", None)
+        if identity_canonicalizer is not None:
+            self._identity_canonicalizer = identity_canonicalizer
         delivery_router = getattr(runtime, "delivery_router", None)
         if delivery_router is not None:
             self._delivery_router = delivery_router
@@ -578,6 +638,29 @@ class BotSessionManager:
             return "per_user"
         return "per_chat"
 
+    def _canonical_user_id(self, user_id: str) -> str:
+        """Stabilise a volatile raw platform id before it keys a session.
+
+        Applies the optional identity-canonicalization seam (Issue #4661): an
+        ``IdentityCanonicalizerProtocol`` (``canonicalize(platform,
+        raw_user_id) -> str`` — typically the active adapter, since
+        ``BasePlatformAdapter`` implements it) wired in via
+        ``__init__``/``attach_gateway_runtime``. Lets a platform-side id change
+        for the same human (WhatsApp JID→LID, a number↔UUID alias flip) collapse
+        to one stable session key instead of silently forking. No-op (identity)
+        when none is wired, and fail-open: any error falls back to the raw id so
+        a buggy canonicalizer can never break session keying.
+        """
+        canonicalizer = self._identity_canonicalizer
+        if canonicalizer is None:
+            return user_id
+        try:
+            canonical = canonicalizer.canonicalize(self._platform, user_id)
+        except Exception as e:  # pragma: no cover — defensive, never break keying
+            logger.warning("identity canonicalizer failed: %s", e)
+            return user_id
+        return canonical if isinstance(canonical, str) and canonical else user_id
+
     def _storage_key(
         self,
         user_id: str,
@@ -618,14 +701,23 @@ class BotSessionManager:
             prefix = self._platform or "bot"
             account_key = account or "default"
             base = f"{prefix}:acct:{account_key}:chat:{chat_id}:{thread_id}"
-        elif self._identity_resolver is not None and self._platform:
-            try:
-                base = self._identity_resolver.resolve(self._platform, user_id)
-            except Exception as e:  # pragma: no cover — defensive
-                logger.warning("identity resolver failed: %s", e)
-                base = user_id
         else:
-            base = user_id
+            # Issue #4661: canonicalise a volatile platform id to a stable one
+            # BEFORE it enters the session key or the link/pairing resolver, so
+            # a platform-side id change for the same human (WhatsApp JID→LID, a
+            # number↔UUID alias flip) resolves to one session rather than
+            # silently forking. No-op (identity) when no normalizer is wired.
+            canonical_user_id = self._canonical_user_id(user_id)
+            if self._identity_resolver is not None and self._platform:
+                try:
+                    base = self._identity_resolver.resolve(
+                        self._platform, canonical_user_id
+                    )
+                except Exception as e:  # pragma: no cover — defensive
+                    logger.warning("identity resolver failed: %s", e)
+                    base = canonical_user_id
+            else:
+                base = canonical_user_id
         # Per-tenant memory isolation (Issue #4341): when a route resolved to a
         # ``profile``, its namespace is bound turn-locally in ``_ACTIVE_PROFILE_NS``
         # so every storage key is prefixed with the tenant scope. Reading the
@@ -1327,7 +1419,13 @@ class BotSessionManager:
                     # Agent instance never observe each other's chat_history.
                     async with agent_lock:
                         saved_history = agent.chat_history
-                        agent.chat_history = user_history
+                        # #5928: merge mirror-induced same-role runs so
+                        # strict-alternation providers never see them, and fold
+                        # a trailing user mirror into this turn's prompt.
+                        from ._mirror import coalesce_mirror_turns, fold_trailing_user_mirror
+                        agent.chat_history, turn_prompt = fold_trailing_user_mirror(
+                            coalesce_mirror_turns(user_history), prompt
+                        )
 
                         # Per-route toolset scope (Issue #2298): swap the
                         # agent's tools to the policy-allowed subset for this
@@ -1373,6 +1471,11 @@ class BotSessionManager:
                         # below while the turn executes.
                         self.note_run_progress()
 
+                        # Route the built-in ``clarify`` tool to the user for
+                        # this turn instead of its best-guess fallback.
+                        _clarify_asked: List[Any] = []
+                        _clarify_token = _bind_turn_clarify(_clarify_asked)
+
                         bridged_stream_callback = None
                         try:
                             # Choose streaming vs non-streaming path based on callback
@@ -1416,7 +1519,7 @@ class BotSessionManager:
 
                                 try:
                                     response = await asyncio.wait_for(
-                                        agent.astart(prompt, **astart_kwargs),
+                                        agent.astart(turn_prompt, **astart_kwargs),
                                         timeout=self._run_timeout if self._run_timeout > 0 else None,
                                     )
                                     if hasattr(response, "output"):
@@ -1470,7 +1573,7 @@ class BotSessionManager:
                                     )
                                 ):
                                     _chat_kwargs['attachments'] = attachments
-                                chat_call = partial(agent.chat, prompt, **_chat_kwargs)
+                                chat_call = partial(agent.chat, turn_prompt, **_chat_kwargs)
                                 
                                 # Run with timeout and interruption support
                                 try:
@@ -1515,6 +1618,9 @@ class BotSessionManager:
                             raise
                         finally:
                             agent.chat_history = saved_history
+                            if _clarify_token is not None:
+                                from praisonaiagents.tools.clarify import reset_clarify_handler
+                                reset_clarify_handler(_clarify_token)
                             # Restore the agent's original toolset if a
                             # per-route policy scoped it for this turn.
                             if _restore_tools is not None:
@@ -1556,6 +1662,9 @@ class BotSessionManager:
                         )
                         storage_key = self._storage_key(user_id)
                         text, presentation = extract_presentation(response)
+                        if presentation is None and _clarify_asked and _clarify_asked[-1][1]:
+                            from praisonaiagents.bots.presentation import MessagePresentation
+                            presentation = MessagePresentation.question(*_clarify_asked[-1])
                         # Issue #3296: optionally surface *why* the turn ended.
                         # The completion is read from the agent-emitted result
                         # first (AgentReply/dict), falling back to the agent's
@@ -1591,13 +1700,26 @@ class BotSessionManager:
                     await claim_ctx.__aexit__(type(e), e, e.__traceback__)
                 raise
             else:
-                # Clean exit - mark journal complete before releasing claim
+                # Clean exit - settle the inbound journal.
                 if journal_key is not None and self._ingress_journal is not None:
-                    try:
-                        self._ingress_journal.complete(journal_key)
-                        self._last_journal_key = None
-                    except Exception as e:
-                        logger.warning("Failed to complete journal entry: %s", e)
+                    if self._defer_journal_completion:
+                        # Issue #5152: defer completion until the adapter has
+                        # durably delivered the reply. Record the key so the
+                        # adapter calls complete_last_journal_entry(journal_key)
+                        # *after* send; on a crash before delivery the entry
+                        # stays pending and is redeliverable rather than lost.
+                        # The key is added to the per-turn set (race-safe under
+                        # concurrent turns) and also mirrored into the single
+                        # slot for the convenience no-arg completion path.
+                        self._deferred_journal_keys.add(journal_key)
+                        self._last_journal_key = journal_key
+                    else:
+                        # Legacy behaviour: mark complete on agent completion.
+                        try:
+                            self._ingress_journal.complete(journal_key)
+                            self._last_journal_key = None
+                        except Exception as e:
+                            logger.warning("Failed to complete journal entry: %s", e)
                 if claim_ctx is not None:
                     await claim_ctx.__aexit__(None, None, None)
                 return result or ""
@@ -1956,22 +2078,44 @@ class BotSessionManager:
             )
         return evicted
 
-    def complete_last_journal_entry(self) -> bool:
-        """Complete the last journal entry if one exists.
-        
-        Call this after successfully delivering a message to the platform
-        to ensure the journal entry is marked as completed.
-        
-        Returns True if an entry was completed, False if no entry was pending.
+    def complete_last_journal_entry(
+        self, journal_key: Optional[str] = None
+    ) -> bool:
+        """Complete a deferred inbound journal entry after delivery.
+
+        Call this *after* the reply has been durably delivered to the platform
+        so the inbound entry is settled only once the user has actually been
+        answered (Issue #5152).
+
+        Args:
+            journal_key: The exact deferred key to settle. **Prefer passing
+                this** — under concurrent turns (different users run under
+                different per-storage-key locks) the manager-wide "last" slot
+                is ambiguous, so settling a specific key guarantees turn A's
+                acknowledgement never settles turn B's still-undelivered
+                inbound. When ``None`` (single-turn convenience), the most
+                recently deferred key is used.
+
+        Returns True if an entry was completed, False if no matching entry was
+        pending.
         """
-        if self._last_journal_key is not None and self._ingress_journal is not None:
-            try:
-                self._ingress_journal.complete(self._last_journal_key)
-                self._last_journal_key = None
-                return True
-            except Exception as e:
-                logger.warning("Failed to complete journal entry: %s", e)
-        return False
+        if self._ingress_journal is None:
+            return False
+        key = journal_key if journal_key is not None else self._last_journal_key
+        if key is None:
+            return False
+        try:
+            self._ingress_journal.complete(key)
+        except Exception as e:
+            logger.warning("Failed to complete journal entry: %s", e)
+            return False
+        # Settle bookkeeping: drop the key from the deferred set and clear the
+        # convenience slot only when it referred to this key (so a concurrent
+        # turn's slot is never silently cleared out from under it).
+        self._deferred_journal_keys.discard(key)
+        if self._last_journal_key == key:
+            self._last_journal_key = None
+        return True
 
     def _should_reset_session(self, storage_key: str) -> bool:
         """Check if a session should be reset based on the policy.
@@ -2279,6 +2423,61 @@ class BotSessionManager:
     def get_user_ids(self) -> List[str]:
         """List user IDs with active sessions."""
         return list(self._histories.keys())
+
+    def export_history(self, storage_key: str) -> List[Dict[str, Any]]:
+        """Return a copy of the transcript for a resolved *storage_key*.
+
+        Used by the gateway's live-session handoff (Issue #4660) to read the
+        current session's transcript so it can be seeded onto a freshly created
+        thread/DM on another platform. Prefers the durable store (so a
+        soft-evicted but persisted session is still exportable) and falls back
+        to the in-memory cache. Keys are the resolved storage keys reported by
+        :meth:`warm_sessions` / :meth:`get_user_ids` — no user-id resolution is
+        applied here, so the caller controls exactly which session moves.
+        """
+        if self._store is not None:
+            try:
+                history = self._store.get_chat_history(self._persist_key(storage_key))
+                if history:
+                    return list(history)
+            except Exception as e:  # pragma: no cover — defensive
+                logger.warning("export_history store read failed: %s", e)
+        return list(self._histories.get(storage_key, []))
+
+    def seed_history(
+        self, storage_key: str, history: List[Dict[str, Any]]
+    ) -> None:
+        """Seed a resolved *storage_key* session with *history*.
+
+        The counterpart to :meth:`export_history` for live-session handoff
+        (Issue #4660): the destination session on the target platform is
+        primed with the origin transcript so the same conversation continues
+        seamlessly there. Writes both the in-memory cache and the durable
+        store (when configured) under the resolved key, mirroring
+        :meth:`_save_history` but keyed directly (no user-id resolution).
+        """
+        history = list(history)
+        self._histories[storage_key] = history
+        if self._store is not None:
+            key = self._persist_key(storage_key)
+            self._flushed.discard(storage_key)
+            try:
+                if hasattr(self._store, "set_chat_history"):
+                    self._store.set_chat_history(key, history)
+                else:
+                    self._store.clear_session(key)
+                    for msg in history:
+                        self._store.add_message(
+                            key,
+                            msg.get("role", "user"),
+                            msg.get("content", ""),
+                            msg.get("metadata"),
+                        )
+            except Exception as e:  # pragma: no cover — defensive
+                logger.warning("seed_history store write failed: %s", e)
+            else:
+                self._flushed.add(storage_key)
+        self._last_active[storage_key] = time.monotonic()
 
 
 def resolve_durable_store_dir(platform: str = ""):

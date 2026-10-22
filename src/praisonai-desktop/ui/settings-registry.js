@@ -24,12 +24,14 @@ const clampNum = (min, max) => (v) =>
 const SETTINGS = [
   // ---- Models -------------------------------------------------------------
   { key: "model", section: "model", label: "Default model",
-    description: "Any OpenAI-compatible model id. New chats use this.",
+    description: "Any OpenAI-compatible model id. New chats use this. A provider-prefixed id (anthropic/…, gemini/…, ollama/…) routes through litellm to that provider — set its API key in the environment, or run Ollama locally. For an OpenAI-compatible endpoint instead, set a Base URL and use that endpoint’s bare model id.",
     keywords: ["llm", "gpt", "claude", "provider"],
     control: { kind: "combobox", suggestions: [
       "gpt-4o-mini", "gpt-4o", "gpt-4.1-mini", "o4-mini",
-      "claude-sonnet-4-20250514", "claude-opus-4-20250514",
-      "gemini-2.0-flash", "ollama/llama3.2",
+        "anthropic/claude-sonnet-4-20250514", "gemini/gemini-2.0-flash",
+        "ollama/llama3.2",
+        "lm_studio/qwen2.5-7b-instruct", "hosted_vllm/meta-llama/Llama-3.1-8B-Instruct",
+        "huggingface/meta-llama/Llama-3.1-8B-Instruct", "openrouter/qwen/qwen-2.5-72b-instruct",
     ]},
     default: "gpt-4o-mini" },
 
@@ -47,8 +49,23 @@ const SETTINGS = [
     control: { kind: "slider", min: 0, max: 1, step: 0.01 },
     default: 1, validate: clampNum(0, 1) },
 
+  { key: "reasoning_effort", section: "model", label: "Reasoning effort",
+    description: "How hard the model thinks before answering. Off leaves the provider default. Maps to each backend's native knob.",
+    keywords: ["thinking", "reasoning", "effort", "budget", "o1", "o3"],
+    control: { kind: "select", options: [
+      { value: "off", label: "Off" }, { value: "minimal", label: "Minimal" },
+      { value: "low", label: "Low" }, { value: "medium", label: "Medium" },
+      { value: "high", label: "High" }]},
+    default: "off" },
+
+  { key: "framework", section: "model", label: "Agent framework",
+    description: "Which engine runs a turn. PraisonAI is built in; installing praisonai-frameworks adds CrewAI, AutoGen, LangGraph, Agno, Google ADK, OpenAI Agents SDK and Pydantic AI.",
+    keywords: ["crewai", "autogen", "langgraph", "agno", "adk", "pydantic"],
+    control: { kind: "text", placeholder: "praisonai" },
+    default: "praisonai", requiresRestart: true },
+
   { key: "base_url", section: "model", label: "Base URL override",
-    description: "Point at a proxy, Azure, or a local server. Blank uses the provider default.",
+    description: "Point at Ollama, LM Studio, vLLM, a proxy or Azure. Sent to whichever provider the model names. Blank uses the provider default.",
     keywords: ["endpoint", "proxy", "azure", "ollama", "lm studio"],
     control: { kind: "text", placeholder: "https://api.openai.com/v1" },
     default: "", requiresRestart: true },
@@ -172,7 +189,12 @@ const SETTINGS = [
 
   // ---- About --------------------------------------------------------------
   { key: "version", section: "about", label: "PraisonAI Desktop",
-    control: { kind: "readout", value: () => "0.1.0" } },
+    control: { kind: "readout", value: () =>
+      globalThis.__PRAISONAI_DESKTOP_VERSION__ || "unknown" } },
+
+  { key: "agents_version", section: "about", label: "PraisonAI Agents",
+    control: { kind: "readout", value: () =>
+      globalThis.__PRAISONAI_AGENTS_VERSION__ || "unknown" } },
 
   { key: "engine_status", section: "about", label: "Engine",
     description: "The Python process this window is talking to.",
@@ -181,12 +203,16 @@ const SETTINGS = [
   { key: "logs_link", section: "about", label: "Engine log",
     control: { kind: "action", verb: "Open" }, action: "logs" },
 
+  { key: "engine_restart", section: "about", label: "Restart engine",
+    description: "Loads new engine code after an update. Chat may pause briefly.",
+    control: { kind: "action", verb: "Restart" }, action: "engine_restart" },
+
   { key: "check_now", section: "about", label: "Check for updates",
     control: { kind: "action", verb: "Check" }, action: "update" },
 
   // ---- Integrations -------------------------------------------------------
   { key: "mcp_servers", section: "integrations", label: "MCP servers",
-    description: "Tool servers launched over stdio. Each is disabled until you enable it.",
+    description: "Saved for a future release. Servers listed here are stored only \u2014 the engine does not launch them yet, so the model cannot use them.",
     keywords: ["tools", "model context protocol", "stdio", "extensions"],
     control: { kind: "action", verb: "Manage" }, action: "mcp" },
 ];

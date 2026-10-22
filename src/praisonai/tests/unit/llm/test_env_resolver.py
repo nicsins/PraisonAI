@@ -24,6 +24,17 @@ try:
 except ImportError as e:
     pytest.skip(f"Could not import praisonai.llm.env: {e}", allow_module_level=True)
 
+# Sentinel returned by a mocked capability ranking, so tests assert the
+# resolver uses ModelCatalogue.best_available() rather than a fixed literal.
+_RANKED_OPENAI = "gpt-ranked-test"
+
+
+def _patch_best_available():
+    return patch(
+        "praisonai_code.llm.catalogue.ModelCatalogue.best_available",
+        lambda self, provider: _RANKED_OPENAI if provider == "openai" else None,
+    )
+
 
 class TestResolveDefaults:
     """Tests for default values when no env vars are set."""
@@ -134,6 +145,18 @@ class TestLLMEndpointDataclass:
         assert hasattr(ep, "api_key")
 
 
+@pytest.fixture
+def _no_ranking():
+    """Disable capability ranking so the fixed per-provider representative is
+    asserted, independent of the installed litellm catalogue (see #5749)."""
+    with patch(
+        "praisonai_code.llm.catalogue.ModelCatalogue.best_available",
+        return_value=None,
+    ):
+        yield
+
+
+@pytest.mark.usefixtures("_no_ranking")
 class TestProviderAwareDefaultModel:
     """Tests for default_model_for_available_provider() and its use as fallback."""
 
@@ -142,8 +165,9 @@ class TestProviderAwareDefaultModel:
             assert default_model_for_available_provider() == _DEFAULT_MODEL
 
     def test_openai_key_keeps_openai_default(self):
-        with patch.dict(os.environ, {"OPENAI_API_KEY": "sk-x"}, clear=True):
-            assert default_model_for_available_provider() == "gpt-4o-mini"
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "sk-x"}, clear=True), \
+                _patch_best_available():
+            assert default_model_for_available_provider() == _RANKED_OPENAI
 
     def test_anthropic_only_uses_claude_default(self):
         with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-a"}, clear=True):
@@ -172,8 +196,8 @@ class TestProviderAwareDefaultModel:
 
     def test_openai_wins_when_multiple_present(self):
         env = {"OPENAI_API_KEY": "sk-x", "ANTHROPIC_API_KEY": "sk-a"}
-        with patch.dict(os.environ, env, clear=True):
-            assert default_model_for_available_provider() == "gpt-4o-mini"
+        with patch.dict(os.environ, env, clear=True), _patch_best_available():
+            assert default_model_for_available_provider() == _RANKED_OPENAI
 
     def test_resolve_endpoint_picks_anthropic_default_with_only_anthropic_key(self):
         with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-a"}, clear=True):

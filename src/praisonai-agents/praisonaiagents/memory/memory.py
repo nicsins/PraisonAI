@@ -11,7 +11,6 @@ from praisonaiagents._logging import get_logger
 from datetime import datetime, timezone
 
 # Decomposed memory functionality - imported as mixins for backward compatibility
-from .search import SearchMixin
 from .core import MemoryCoreMixin
 
 # Protocol-driven imports (AGENTS.md compliant)
@@ -19,6 +18,7 @@ from .protocols import MemoryProtocol
 from .adapters import get_memory_adapter, get_first_available_memory_adapter
 from .adapters.sqlite_adapter import SqliteMemoryAdapter
 from .adapters.factories import sanitize_chroma_metadata
+from ..llm.model_providers import default_auxiliary_model
 
 # Disable litellm telemetry before any imports
 os.environ["LITELLM_TELEMETRY"] = "False"
@@ -38,7 +38,7 @@ CACHE_BOUNDARY = "--- CACHE_BOUNDARY ---"
 
 
 
-class Memory(SearchMixin, MemoryCoreMixin):
+class Memory(MemoryCoreMixin):
     """
     A single-file memory manager covering:
     - Short-term memory (STM) for ephemeral context
@@ -327,8 +327,17 @@ class Memory(SearchMixin, MemoryCoreMixin):
         # compatible).
         suffix = self._path_safe_suffix(self.cfg.get("user_id"))
 
-        config["short_db"] = self.cfg.get("short_db", os.path.join(project_data, f"short_term{suffix}.db"))
-        config["long_db"] = self.cfg.get("long_db", os.path.join(project_data, f"long_term{suffix}.db"))
+        # ``db_path`` is a documented single-file alias for the sqlite backend
+        # (MemoryConfig(backend="sqlite", config={"db_path": ...})). Without this
+        # it was silently dropped and both agents fell back to the per-user
+        # default paths, so a caller-supplied shared file never took effect and
+        # cross-instance recall failed. An explicit short_db/long_db still wins.
+        db_path = self.cfg.get("db_path")
+        default_short = db_path or os.path.join(project_data, f"short_term{suffix}.db")
+        default_long = db_path or os.path.join(project_data, f"long_term{suffix}.db")
+
+        config["short_db"] = self.cfg.get("short_db", default_short)
+        config["long_db"] = self.cfg.get("long_db", default_long)
         config["rag_db_path"] = self.cfg.get("rag_db_path", os.path.join(project_data, f"chroma_db{suffix}"))
         config["collection_name"] = self.cfg.get("collection_name", f"memory_store{suffix}")
         config["verbose"] = self.verbose
@@ -372,8 +381,15 @@ class Memory(SearchMixin, MemoryCoreMixin):
         # per-user store paths derived in _get_adapter_config (explicit paths win).
         suffix = self._path_safe_suffix(self.cfg.get("user_id"))
 
-        self.short_db = self.cfg.get("short_db", os.path.join(project_data, f"short_term{suffix}.db"))
-        self.long_db = self.cfg.get("long_db", os.path.join(project_data, f"long_term{suffix}.db"))
+        # Honor the ``db_path`` single-file alias here too so the legacy direct
+        # connections (_get_stm_conn/_get_ltm_conn) point at the caller-supplied
+        # file, matching _get_adapter_config. Explicit short_db/long_db still win.
+        db_path = self.cfg.get("db_path")
+        default_short = db_path or os.path.join(project_data, f"short_term{suffix}.db")
+        default_long = db_path or os.path.join(project_data, f"long_term{suffix}.db")
+
+        self.short_db = self.cfg.get("short_db", default_short)
+        self.long_db = self.cfg.get("long_db", default_long)
         
         # Only create separate SQLite adapter if primary adapter is not SQLite
         if self.provider != "sqlite":
@@ -499,45 +515,39 @@ class Memory(SearchMixin, MemoryCoreMixin):
     def _get_stm_conn(self):
         """Get thread-local short-term memory SQLite connection."""
         if not hasattr(self._local, 'stm_conn') or self._local.stm_conn is None:
-            self._local.stm_conn = sqlite3.connect(
+            # Hardened factory: WAL where the filesystem supports it, safe
+            # DELETE fallback on NFS/SMB/FUSE/virtiofs (Issue #5264).
+            from ..storage.sqlite import connect as _sqlite_connect
+
+            self._local.stm_conn = _sqlite_connect(
                 self.short_db,
                 check_same_thread=False,  # Allow cross-thread cleanup
-                timeout=30.0  # 30 second timeout for lock contention
+                timeout=30.0,  # 30 second timeout for lock contention
+                busy_timeout_ms=30000,  # 30 seconds
             )
-            # Configure busy timeout for better contention handling
-            self._local.stm_conn.execute("PRAGMA busy_timeout=30000")  # 30 seconds
-            
-            # Enable WAL mode for concurrent read/write without blocking
-            result = self._local.stm_conn.execute("PRAGMA journal_mode=WAL").fetchone()
-            if result and result[0].upper() != 'WAL':
-                logger.warning(f"WAL mode not enabled for STM, got: {result[0]}")
             self._local.stm_conn.commit()
             
-            # Register connection for cleanup
-            with self._connection_lock:
-                self._all_connections.add(self._local.stm_conn)
+            # Register connection for cleanup (also reclaims dead threads' connections)
+            self._sqlite_adapter._register_connection(self._local.stm_conn)
         return self._local.stm_conn
 
     def _get_ltm_conn(self):
         """Get thread-local long-term memory SQLite connection."""
         if not hasattr(self._local, 'ltm_conn') or self._local.ltm_conn is None:
-            self._local.ltm_conn = sqlite3.connect(
+            # Hardened factory: WAL where the filesystem supports it, safe
+            # DELETE fallback on NFS/SMB/FUSE/virtiofs (Issue #5264).
+            from ..storage.sqlite import connect as _sqlite_connect
+
+            self._local.ltm_conn = _sqlite_connect(
                 self.long_db,
                 check_same_thread=False,  # Allow cross-thread cleanup
-                timeout=30.0  # 30 second timeout for lock contention
+                timeout=30.0,  # 30 second timeout for lock contention
+                busy_timeout_ms=30000,  # 30 seconds
             )
-            # Configure busy timeout for better contention handling
-            self._local.ltm_conn.execute("PRAGMA busy_timeout=30000")  # 30 seconds
-            
-            # Enable WAL mode for concurrent read/write without blocking
-            result = self._local.ltm_conn.execute("PRAGMA journal_mode=WAL").fetchone()
-            if result and result[0].upper() != 'WAL':
-                logger.warning(f"WAL mode not enabled for LTM, got: {result[0]}")
             self._local.ltm_conn.commit()
             
-            # Register connection for cleanup
-            with self._connection_lock:
-                self._all_connections.add(self._local.ltm_conn)
+            # Register connection for cleanup (also reclaims dead threads' connections)
+            self._sqlite_adapter._register_connection(self._local.ltm_conn)
         return self._local.ltm_conn
 
     def _log_verbose(self, msg: str, level: int = logging.INFO):
@@ -587,13 +597,8 @@ class Memory(SearchMixin, MemoryCoreMixin):
                 ) from exc
 
             # Initialize ChromaDB with persistent storage
-            self.chroma_client = chromadb.PersistentClient(
-                path=rag_path,
-                settings=ChromaSettings(
-                    anonymized_telemetry=False,
-                    allow_reset=True
-                )
-            )
+            from .adapters.factories import _create_chroma_client
+            self.chroma_client = _create_chroma_client(chromadb, ChromaSettings, rag_path)
 
             collection_name = self.cfg.get("collection_name", "memory_store")
             self._collection_name = collection_name
@@ -678,7 +683,9 @@ class Memory(SearchMixin, MemoryCoreMixin):
         clarity: float = None,
         accuracy: float = None,
         weights: Dict[str, float] = None,
-        evaluator_quality: float = None
+        evaluator_quality: float = None,
+        trust=None,
+        origin: Optional[str] = None,
     ):
         """Store in short-term memory with optional quality metrics"""
         logger.info(f"Storing in short-term memory: {text[:100]}...")
@@ -688,6 +695,7 @@ class Memory(SearchMixin, MemoryCoreMixin):
             metadata, completeness, relevance, clarity, 
             accuracy, weights, evaluator_quality
         )
+        metadata = self._stamp_provenance(metadata, trust, origin)
         logger.info(f"Processed metadata: {metadata}")
         
         # Generate unique ID and timestamp once
@@ -772,6 +780,59 @@ class Memory(SearchMixin, MemoryCoreMixin):
             if all(r.get("metadata", {}).get(k) == v for k, v in metadata_filter.items())
         ]
 
+    @staticmethod
+    def _stamp_provenance(
+        metadata: Optional[Dict[str, Any]],
+        trust=None,
+        origin: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Record a provenance/trust signal in a dedicated metadata field.
+
+        The trust value lives in ``metadata["trust"]`` — a structured field the
+        model cannot forge through prose — so recall can be gated on it. When
+        ``trust`` is omitted the write is left unstamped (treated as trusted by
+        default), preserving backward compatibility.
+        """
+        if trust is None and origin is None:
+            return metadata or {}
+        from .protocols import MemoryTrust
+        metadata = dict(metadata) if metadata else {}
+        if trust is not None:
+            metadata["trust"] = MemoryTrust(trust).value
+        if origin is not None:
+            metadata["origin"] = origin
+        return metadata
+
+    @staticmethod
+    def _filter_by_trust(
+        results: List[Dict[str, Any]],
+        min_trust=None,
+    ) -> List[Dict[str, Any]]:
+        """Drop results whose recorded trust is below ``min_trust``.
+
+        Records without a ``trust`` field are treated as ``TRUSTED`` (legacy
+        writes), so the default ``min_trust`` behaviour is unchanged. Passing
+        ``min_trust=MemoryTrust.TRUSTED`` fences out ``untrusted``-origin
+        content so poisoned memory is not recalled as trusted context.
+        """
+        if min_trust is None:
+            return results
+        from .protocols import MemoryTrust
+        # Validate the requested threshold strictly: a misspelled/unknown
+        # ``min_trust`` must fail loudly rather than silently weakening the gate.
+        threshold = MemoryTrust.rank(MemoryTrust(min_trust))
+
+        def _record_trust(record: Dict[str, Any]):
+            meta = record.get("metadata")
+            if not isinstance(meta, dict):
+                return None  # legacy/unnormalized record → treated as TRUSTED
+            return meta.get("trust")
+
+        return [
+            r for r in results
+            if MemoryTrust.rank(_record_trust(r)) >= threshold
+        ]
+
     def search_short_term(
         self, 
         query: str, 
@@ -781,29 +842,31 @@ class Memory(SearchMixin, MemoryCoreMixin):
         rerank: bool = False,
         metadata_filter: Optional[Dict[str, Any]] = None,
         user_id: Optional[str] = None,
+        min_trust=None,
         **kwargs
     ) -> List[Dict[str, Any]]:
-        """Search short-term memory with optional quality/metadata/user filter"""
+        """Search short-term memory with optional quality/metadata/user/trust filter"""
         self._log_verbose(f"Searching short memory for: {query}")
         metadata_filter = self._build_metadata_filter(metadata_filter, user_id)
         
         if self.use_mem0 and hasattr(self, "mem0_client"):
             # Over-fetch when a metadata_filter is present so scoped results
             # ranked beyond `limit` are still evaluated before truncation.
-            fetch_limit = limit * 10 if metadata_filter else limit
+            fetch_limit = limit * 10 if (metadata_filter or min_trust is not None) else limit
             # Pass rerank and other kwargs to Mem0 search
             search_params = {"query": query, "limit": fetch_limit, "rerank": rerank}
             search_params.update(kwargs)
             results = self._safe_mem0_search(self.mem0_client, **search_params)
             filtered = [r for r in results if r.get("score", 1.0) >= relevance_cutoff]
-            return self._apply_metadata_filter(filtered, metadata_filter)[:limit]
+            filtered = self._apply_metadata_filter(filtered, metadata_filter)
+            return self._filter_by_trust(filtered, min_trust)[:limit]
             
         elif self.use_mongodb and hasattr(self, "mongo_short_term"):
             try:
                 results = []
                 # Over-fetch when a metadata_filter is present so scoped results
                 # ranked beyond `limit` survive the post-filter below.
-                fetch_limit = limit * 10 if metadata_filter else limit
+                fetch_limit = limit * 10 if (metadata_filter or min_trust is not None) else limit
                 
                 # If vector search is enabled and we have embeddings
                 if self.use_vector_search and hasattr(self, "_get_embedding"):
@@ -856,7 +919,8 @@ class Memory(SearchMixin, MemoryCoreMixin):
                             "score": 1.0  # Default score for text search
                         })
                 
-                return self._apply_metadata_filter(results, metadata_filter)[:limit]
+                results = self._apply_metadata_filter(results, metadata_filter)
+                return self._filter_by_trust(results, min_trust)[:limit]
                 
             except Exception as e:
                 self._log_verbose(f"Error searching MongoDB short-term memory: {e}", logging.ERROR)
@@ -874,7 +938,7 @@ class Memory(SearchMixin, MemoryCoreMixin):
                 
                 # Over-fetch when a metadata_filter is present so scoped results
                 # ranked beyond `limit` survive the post-filter below.
-                fetch_limit = limit * 10 if metadata_filter else limit
+                fetch_limit = limit * 10 if (metadata_filter or min_trust is not None) else limit
                 resp = self.chroma_col.query(
                     query_embeddings=[query_embedding],
                     n_results=fetch_limit
@@ -893,7 +957,8 @@ class Memory(SearchMixin, MemoryCoreMixin):
                                 "metadata": metadata,
                                 "score": score
                             })
-                return self._apply_metadata_filter(results, metadata_filter)[:limit]
+                results = self._apply_metadata_filter(results, metadata_filter)
+                return self._filter_by_trust(results, min_trust)[:limit]
             except Exception as e:
                 self._log_verbose(f"Error searching ChromaDB: {e}", logging.ERROR)
                 return []
@@ -909,7 +974,7 @@ class Memory(SearchMixin, MemoryCoreMixin):
                 try:
                     # Over-fetch when a metadata_filter is present so post-filtering
                     # can still return up to `limit` scoped results.
-                    adapter_limit = limit * 10 if metadata_filter else limit
+                    adapter_limit = limit * 10 if (metadata_filter or min_trust is not None) else limit
                     adapter_results = self.memory_adapter.search_short_term(query, limit=adapter_limit, **kwargs)
                     adapter_results = self._apply_metadata_filter(adapter_results, metadata_filter)
                     if min_quality > 0:
@@ -919,6 +984,7 @@ class Memory(SearchMixin, MemoryCoreMixin):
                         ]
                     if relevance_cutoff > 0:
                         adapter_results = [r for r in adapter_results if r.get("score", 1.0) >= relevance_cutoff]
+                    adapter_results = self._filter_by_trust(adapter_results, min_trust)
                     final_results = adapter_results[:limit]
                     top_score = final_results[0].get("score") if final_results else None
                     self._emit_memory_event("search", "short_term", query=query,
@@ -932,7 +998,7 @@ class Memory(SearchMixin, MemoryCoreMixin):
             # Local fallback
             conn = self._get_stm_conn()
             c = conn.cursor()
-            fetch_limit = limit * 10 if metadata_filter else limit
+            fetch_limit = limit * 10 if (metadata_filter or min_trust is not None) else limit
             rows = c.execute(
                 "SELECT id, content, meta FROM short_mem WHERE content LIKE ? LIMIT ?",
                 (f"%{query}%", fetch_limit)
@@ -948,7 +1014,8 @@ class Memory(SearchMixin, MemoryCoreMixin):
                         "text": row[1],
                         "metadata": meta
                     })
-            results = self._apply_metadata_filter(results, metadata_filter)[:limit]
+            results = self._apply_metadata_filter(results, metadata_filter)
+            results = self._filter_by_trust(results, min_trust)[:limit]
             # Emit trace event for memory search
             top_score = results[0].get("score") if results else None
             self._emit_memory_event("search", "short_term", query=query, 
@@ -992,7 +1059,9 @@ class Memory(SearchMixin, MemoryCoreMixin):
         clarity: float = None,
         accuracy: float = None,
         weights: Dict[str, float] = None,
-        evaluator_quality: float = None
+        evaluator_quality: float = None,
+        trust=None,
+        origin: Optional[str] = None,
     ):
         """Store in long-term memory with optional quality metrics"""
         logger.info(f"Storing in long-term memory: {text[:100]}...")
@@ -1004,6 +1073,7 @@ class Memory(SearchMixin, MemoryCoreMixin):
             metadata, completeness, relevance, clarity,
             accuracy, weights, evaluator_quality
         )
+        metadata = self._stamp_provenance(metadata, trust, origin)
         logger.info(f"Processed metadata: {metadata}")
         
         # Generate unique ID
@@ -1128,9 +1198,10 @@ class Memory(SearchMixin, MemoryCoreMixin):
         rerank: bool = False,
         metadata_filter: Optional[Dict[str, Any]] = None,
         user_id: Optional[str] = None,
+        min_trust=None,
         **kwargs
     ) -> List[Dict[str, Any]]:
-        """Search long-term memory with optional quality/metadata/user filter"""
+        """Search long-term memory with optional quality/metadata/user/trust filter"""
         self._log_verbose(f"Searching long memory for: {query}")
         self._log_verbose(f"Min quality: {min_quality}")
         metadata_filter = self._build_metadata_filter(metadata_filter, user_id)
@@ -1139,7 +1210,7 @@ class Memory(SearchMixin, MemoryCoreMixin):
         # Over-fetch from every backend when a metadata_filter is present so
         # scoped records ranked beyond `limit` survive the post-filter applied
         # before the final `[:limit]` truncation below.
-        fetch_limit = limit * 10 if metadata_filter else limit
+        fetch_limit = limit * 10 if (metadata_filter or min_trust is not None) else limit
 
         if self.use_mem0 and hasattr(self, "mem0_client"):
             # Pass rerank and other kwargs to Mem0 search
@@ -1264,7 +1335,7 @@ class Memory(SearchMixin, MemoryCoreMixin):
             try:
                 # Over-fetch when a metadata_filter is present so post-filtering
                 # can still return up to `limit` scoped results.
-                adapter_limit = limit * 10 if metadata_filter else limit
+                adapter_limit = limit * 10 if (metadata_filter or min_trust is not None) else limit
                 adapter_results = self.memory_adapter.search_long_term(query, limit=adapter_limit, **kwargs)
                 adapter_results = self._apply_metadata_filter(adapter_results, metadata_filter)
                 if min_quality > 0:
@@ -1274,6 +1345,7 @@ class Memory(SearchMixin, MemoryCoreMixin):
                     ]
                 if relevance_cutoff > 0:
                     adapter_results = [r for r in adapter_results if r.get("score", 1.0) >= relevance_cutoff]
+                adapter_results = self._filter_by_trust(adapter_results, min_trust)
                 final_results = adapter_results[:limit]
                 top_score = final_results[0].get("score") if final_results else None
                 self._emit_memory_event("search", "long_term", query=query,
@@ -1326,7 +1398,12 @@ class Memory(SearchMixin, MemoryCoreMixin):
         if relevance_cutoff > 0:
             results = [r for r in results if r.get("score", 1.0) >= relevance_cutoff]
             logger.info(f"After relevance filter: {len(results)} results")
-        
+
+        # Gate recall by provenance/trust: untrusted-origin content is dropped
+        # when the caller requests a minimum trust (e.g. a gateway bot recalling
+        # only trusted context), so poisoned memory never re-enters as trusted.
+        results = self._filter_by_trust(results, min_trust)
+
         final_results = results[:limit]
         # Emit trace event for memory search
         top_score = final_results[0].get("score") if final_results else None
@@ -2166,13 +2243,40 @@ class Memory(SearchMixin, MemoryCoreMixin):
             litellm_available = importlib.util.find_spec("litellm") is not None
             openai_available = importlib.util.find_spec("openai") is not None
 
+            # Resolve the endpoint ABOVE the branch. It used to be read only
+            # inside `elif openai_available:`, which never runs: litellm ships in
+            # both the `llm` and `memory` extras, so `litellm_available` is
+            # always true and a base_url supplied through config was silently
+            # discarded -- the request went to OpenAI regardless.
+            _cfg = getattr(self, "cfg", None) or {}
+            _cfg_inner = _cfg.get("config") if isinstance(_cfg.get("config"), dict) else {}
+            _configured_base_url = _cfg.get("base_url") or _cfg_inner.get("base_url")
+            _configured_base_url = (_configured_base_url
+                                    or os.getenv("OPENAI_BASE_URL")
+                                    or os.getenv("OPENAI_API_BASE"))
+
+            # Resolve the credential from config first. A custom endpoint that
+            # requires a key was previously sent only OPENAI_API_KEY or the
+            # literal "local", so an api_key supplied through config was dropped
+            # and the endpoint rejected the request.
+            _configured_api_key = (_cfg.get("api_key")
+                                   or _cfg_inner.get("api_key")
+                                   or os.getenv("OPENAI_API_KEY")
+                                   or "local")
+
             if litellm_available:
                 # Use LiteLLM for consistency with the rest of the codebase
                 import litellm
                 
                 # Convert model name if it's in litellm format
-                model_name = llm or "gpt-4o-mini"
-                
+                model_name = default_auxiliary_model(llm)
+
+                _endpoint_kwargs = {}
+                if _configured_base_url:
+                    # litellm spells the endpoint `api_base`, not `base_url`.
+                    _endpoint_kwargs["api_base"] = _configured_base_url
+                    _endpoint_kwargs["api_key"] = _configured_api_key
+
                 response = litellm.completion(
                     model=model_name,
                     messages=[{
@@ -2180,15 +2284,27 @@ class Memory(SearchMixin, MemoryCoreMixin):
                         "content": custom_prompt or default_prompt
                     }],
                     response_format={"type": "json_object"},
-                    temperature=0.3
+                    temperature=0.3,
+                    **_endpoint_kwargs
                 )
             elif openai_available:
                 # Fallback to OpenAI client
                 from openai import OpenAI
-                client = OpenAI()
+                # Pass the endpoint explicitly. A bare OpenAI() happens to work
+                # when OPENAI_BASE_URL is exported, but silently ignores a
+                # base_url supplied through config -- which is the shape the rest
+                # of the memory layer uses.
+                _client_kwargs = {}
+                _base_url = _configured_base_url
+                if _base_url:
+                    _client_kwargs["base_url"] = _base_url
+                    # Local servers reject an empty key; any non-empty value works.
+                    # Prefer a config-supplied key so a secured endpoint is reached.
+                    _client_kwargs["api_key"] = _configured_api_key
+                client = OpenAI(**_client_kwargs)
                 
                 response = client.chat.completions.create(
-                    model=llm or "gpt-4o-mini",
+                    model=default_auxiliary_model(llm),
                     messages=[{
                         "role": "user", 
                         "content": custom_prompt or default_prompt
@@ -2410,6 +2526,7 @@ class Memory(SearchMixin, MemoryCoreMixin):
                 # Remove from registry before closing
                 with self._connection_lock:
                     self._all_connections.discard(self._local.stm_conn)
+                    self._sqlite_adapter._connection_owners.pop(self._local.stm_conn, None)
                 self._local.stm_conn.close()
                 self._local.stm_conn = None
             except Exception as e:
@@ -2420,6 +2537,7 @@ class Memory(SearchMixin, MemoryCoreMixin):
                 # Remove from registry before closing
                 with self._connection_lock:
                     self._all_connections.discard(self._local.ltm_conn)
+                    self._sqlite_adapter._connection_owners.pop(self._local.ltm_conn, None)
                 self._local.ltm_conn.close()
                 self._local.ltm_conn = None
             except Exception as e:
@@ -2429,16 +2547,31 @@ class Memory(SearchMixin, MemoryCoreMixin):
         # Other active threads should manage their own connections
         # Only clear full registry in __del__ or explicit shutdown
         
-        # Close memory adapter if it exists (protocol-driven path)
+        # Close memory adapter if it exists (protocol-driven path).
+        #
+        # SQLite is thread-scoped by contract (#1562/#1563): close only the
+        # calling thread's adapter connections and KEEP the shared adapter so
+        # other threads and subsequent same-thread searches keep using the
+        # adapter's tables. Tearing it down here would make searches fall back
+        # to legacy SQL against short_mem/long_mem (#5486).
         if hasattr(self, 'memory_adapter') and self.memory_adapter:
-            try:
-                if hasattr(self.memory_adapter, 'close') and callable(self.memory_adapter.close):
-                    self.memory_adapter.close()
-                    logger.debug("Memory adapter closed successfully")
-            except Exception as e:
-                logger.warning(f"Error closing memory adapter: {e}")
-            finally:
-                self.memory_adapter = None
+            if isinstance(self.memory_adapter, SqliteMemoryAdapter):
+                try:
+                    if hasattr(self.memory_adapter, 'close_thread_connections'):
+                        self.memory_adapter.close_thread_connections()
+                        logger.debug("SQLite adapter thread connections closed")
+                except Exception as e:
+                    logger.warning(f"Error closing SQLite adapter thread connections: {e}")
+                # Intentionally preserve self.memory_adapter for reuse.
+            else:
+                try:
+                    if hasattr(self.memory_adapter, 'close') and callable(self.memory_adapter.close):
+                        self.memory_adapter.close()
+                        logger.debug("Memory adapter closed successfully")
+                except Exception as e:
+                    logger.warning(f"Error closing memory adapter: {e}")
+                finally:
+                    self.memory_adapter = None
         
         # Close MongoDB client if it exists (legacy path)
         if hasattr(self, 'mongo_client') and self.mongo_client:

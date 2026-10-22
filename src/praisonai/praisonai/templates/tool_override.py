@@ -121,6 +121,24 @@ class ToolOverrideLoader:
         """
         return [Path(d).expanduser() for d in self.DEFAULT_TOOL_DIRS]
     
+    @staticmethod
+    def _extract_callables(module) -> Dict[str, Callable]:
+        """Extract public callable members (tools) from a loaded module.
+
+        Single owner of the "which members count as a tool" rule: skip
+        underscore-prefixed names and accept callables that are not classes.
+        Shared by ``load_from_file`` and ``load_from_module`` so the filter
+        cannot silently diverge between the two load paths.
+        """
+        tools = {}
+        for name in dir(module):
+            if name.startswith("_"):
+                continue
+            obj = getattr(module, name)
+            if callable(obj) and not isinstance(obj, type):
+                tools[name] = obj
+        return tools
+    
     def load_from_file(self, file_path: str) -> Dict[str, Callable]:
         """
         Load tools from a Python file.
@@ -159,13 +177,7 @@ class ToolOverrideLoader:
             raise ImportError(f"Could not load module from: {path}")
         
         # Extract callable functions (tools)
-        tools = {}
-        for name in dir(module):
-            if name.startswith("_"):
-                continue
-            obj = getattr(module, name)
-            if callable(obj) and not isinstance(obj, type):
-                tools[name] = obj
+        tools = self._extract_callables(module)
         
         self._loaded_tools.update(tools)
         return tools
@@ -180,19 +192,23 @@ class ToolOverrideLoader:
         Returns:
             Dict mapping tool names to callable functions
         """
+        # Importing a dotted module executes its top-level code (``__init__``),
+        # exactly like the file-based path that is routed through the canonical
+        # safe loader. Honour the same PRAISONAI_ALLOW_LOCAL_TOOLS opt-in here so
+        # a template-supplied module string cannot bypass the single security
+        # gate and run arbitrary user code on the failure path.
+        if os.environ.get("PRAISONAI_ALLOW_LOCAL_TOOLS", "").lower() != "true":
+            raise PermissionError(
+                "PRAISONAI_ALLOW_LOCAL_TOOLS=true is required to import user "
+                f"modules (refusing to load '{module_path}')."
+            )
         try:
             module = importlib.import_module(module_path)
         except ImportError as e:
             raise ImportError(f"Could not import module: {module_path}") from e
         
         # Extract callable functions (tools)
-        tools = {}
-        for name in dir(module):
-            if name.startswith("_"):
-                continue
-            obj = getattr(module, name)
-            if callable(obj) and not isinstance(obj, type):
-                tools[name] = obj
+        tools = self._extract_callables(module)
         
         self._loaded_tools.update(tools)
         return tools
@@ -455,8 +471,18 @@ def create_tool_registry_with_overrides(
                     # Try as a Python module path
                     tools = loader.load_from_module(source)
                     registry.update(tools)
+            except PermissionError as exc:
+                # A denied opt-in must not vanish silently: the agent would
+                # then run without a tool it explicitly declared. Surface the
+                # remediation (set PRAISONAI_ALLOW_LOCAL_TOOLS=true) at warning
+                # level so the operator sees why the source was skipped.
+                logger.warning(
+                    "skipping tools_source %r: %s", source, exc,
+                )
             except Exception:
-                pass
+                logger.debug(
+                    "failed to load tools_source %r", source, exc_info=True,
+                )
     
     # 2. Add override directories (CLI --tools-dir)
     if override_dirs:

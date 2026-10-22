@@ -21,7 +21,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, List, Optional
 from datetime import datetime
 
 # ============================================================================
@@ -33,6 +33,18 @@ _debug_initialized = False
 
 # Sentinel marking a failed registry build so it is not retried every command.
 _REGISTRY_FAILED = object()
+
+
+def _definitions_fingerprint(workspace=None):
+    """Fingerprint of rules/definition files, or ``None`` when unavailable."""
+    try:
+        from praisonai_code.cli.features.custom_definitions import (
+            definitions_fingerprint,
+        )
+
+        return definitions_fingerprint(workspace)
+    except Exception:  # pragma: no cover - defensive
+        return None
 
 def _init_debug_logging():
     """Initialize debug logging to file. Only called when debug mode is enabled."""
@@ -85,6 +97,7 @@ class AsyncTUIConfig:
     show_logo: bool = True
     show_status_bar: bool = True
     session_id: Optional[str] = None
+    resume: bool = False  # Replay session_id's transcript on launch (bare `praisonai -c/--session`)
     workspace: Optional[str] = None
     history_file: Optional[str] = None
     compact_mode: bool = False
@@ -95,6 +108,27 @@ class AsyncTUIConfig:
     plan_mode: bool = False  # Read-only PLAN mode: deny writes/edits/shell until confirmed
     enable_acp: bool = True  # Load ACP tools + start the ACP runtime (disable via --no-acp)
     enable_lsp: bool = True  # Load LSP tools + start the LSP runtime (disable via --no-lsp)
+    # Consolidated Agent capability params threaded from `chat`/`code` CLI flags
+    # so an interactive session honours --knowledge/--guardrails/--web/etc.
+    # exactly as `run`/YAML/Python do. Each is None when the flag was not
+    # supplied (Agent default preserved); otherwise a value the Agent
+    # constructor already accepts (bool, preset str, or list of sources).
+    knowledge: Optional[Any] = None
+    guardrails: Optional[Any] = None
+    web: Optional[Any] = None
+    reflection: Optional[Any] = None
+    planning: Optional[Any] = None
+    context: Optional[Any] = None
+    execution: Optional[Any] = None
+    caching: Optional[Any] = None
+    # --tools/--toolset restrict (or extend) the interactive session's callable
+    # set, resolved through the same ``ToolResolver`` path `run`/YAML/Python use
+    # so CLI == YAML == Python. When set, the resolved callables REPLACE the
+    # default interactive tool groups so `chat --tools X` is a genuine
+    # restriction, not merely an addition (issue #5140). Left None -> the
+    # default interactive tools load unchanged.
+    tools: Optional[Any] = None
+    toolset: Optional[Any] = None
 
 
 # ============================================================================
@@ -152,6 +186,138 @@ def _is_empty_agent_response(response) -> bool:
     plain ``not response`` check is insufficient (issue #2568).
     """
     return _extract_response_output(response) is None
+
+
+# ============================================================================
+# Consolidated capability options (issue #4890)
+# ============================================================================
+
+# CLI flag value -> Agent constructor param. Each option maps 1:1 onto the
+# consolidated capability param the core Agent already accepts (bool | preset
+# str | list of sources), so an interactive session reaches the same runtime
+# capability as `run`/YAML/Python. ``hooks`` is threaded separately below since
+# it is a file path, not a bool/preset value.
+_CAPABILITY_OPTION_NAMES = (
+    "knowledge",
+    "guardrails",
+    "web",
+    "reflection",
+    "planning",
+    "context",
+    "execution",
+    "caching",
+)
+
+
+# Capabilities whose Agent param accepts a list of sources, so a comma-separated
+# flag value splits into a list (e.g. ``--knowledge=docs/,notes.md``). Every
+# other capability takes a single bool/preset string: ``--guardrails="Be
+# accurate, cite sources"`` is one validator prompt, NOT a list, so it must pass
+# through untouched or Agent construction fails (issue #4890).
+_SOURCE_LIST_CAPABILITIES = frozenset({"knowledge"})
+
+
+def _coerce_capability_value(raw: Any, name: str) -> Any:
+    """Turn a raw CLI flag value into an Agent-ready capability value.
+
+    The consolidated flags arrive as ``"true"`` (bare flag), ``"false"``, a
+    preset string (e.g. ``strict``/``thorough``), or -- only for a source-list
+    capability like ``knowledge`` -- a comma-separated source list (e.g.
+    ``docs/,notes.md``). Map the booleans to real bools; split a comma list into
+    a list of sources only for source-list capabilities; and pass any other
+    string through unchanged so it reaches the Agent's own preset handling. A
+    single-value capability (``guardrails``, ``web``, ...) keeps its comma-
+    containing string intact, since its Agent param is a scalar not a list.
+    """
+    if raw is None or isinstance(raw, bool):
+        return raw
+    if not isinstance(raw, str):
+        return raw
+    lowered = raw.strip().lower()
+    if lowered == "true":
+        return True
+    if lowered == "false":
+        return False
+    if name in _SOURCE_LIST_CAPABILITIES and "," in raw:
+        parts = [p.strip() for p in raw.split(",") if p.strip()]
+        return parts or raw
+    return raw
+
+
+def _apply_capability_options(agent_config: dict, config: "AsyncTUIConfig") -> None:
+    """Apply supplied capability options onto ``agent_config`` in place.
+
+    Only options actually supplied (non-None on the config) are set, so an unset
+    flag leaves the Agent's own default untouched.
+    """
+    for name in _CAPABILITY_OPTION_NAMES:
+        raw = getattr(config, name, None)
+        if raw is None:
+            continue
+        agent_config[name] = _coerce_capability_value(raw, name)
+
+
+def _resolve_restricted_tools(config: "AsyncTUIConfig") -> Optional[list]:
+    """Resolve ``--tools``/``--toolset`` into the interactive session's toolset.
+
+    Reuses the exact ``ToolResolver`` resolution `run`/YAML/Python already use
+    so ``chat --tools web_search`` restricts an interactive session to the same
+    callables it would get from ``run --tools web_search`` (issue #5140).
+
+    ``config.tools`` is a comma-separated list of tool names and/or ``tools.py``
+    file paths; ``config.toolset`` is a comma-separated list of named toolset
+    groups. Returns ``None`` when neither is supplied, so the caller falls back
+    to the default interactive tool groups unchanged. When at least one is
+    supplied the resolved callables REPLACE the defaults, making the flag a real
+    restriction.
+    """
+    import os as _os
+
+    tools_arg = getattr(config, "tools", None)
+    toolset_arg = getattr(config, "toolset", None)
+    if not tools_arg and not toolset_arg:
+        return None
+
+    from praisonai_code.tool_resolver import ToolResolver
+
+    resolver = ToolResolver()
+
+    # Split ``--tools`` items into file paths and plain names. File paths (``.py``
+    # or an existing path) are loaded through ``load_functions_from_module`` so
+    # the documented ``chat --tools ./tools.py`` form works exactly as it does
+    # for ``run`` instead of resolving to nothing.
+    file_callables: list = []
+    plain_names: list = []
+    if tools_arg:
+        for item in (t.strip() for t in str(tools_arg).split(",")):
+            if not item:
+                continue
+            if item.endswith(".py") or _os.path.exists(item):
+                module_fns = resolver.load_functions_from_module(item)
+                if module_fns:
+                    file_callables.extend(module_fns.values())
+                elif not _os.path.exists(item):
+                    # A ``.py`` name that isn't on disk: fall back to name
+                    # resolution (strip the suffix) so "internet_search.py"
+                    # resolves as the named tool "internet_search".
+                    plain_names.append(item[:-3] if item.endswith(".py") else item)
+            else:
+                plain_names.append(item)
+
+    toolset_names = [
+        t.strip() for t in str(toolset_arg).split(",") if t.strip()
+    ] if toolset_arg else None
+
+    resolved = resolver.resolve_tools_and_toolsets(
+        tool_names=plain_names or None, toolset_names=toolset_names
+    )
+    # File-loaded callables prepend the resolver-resolved names/toolsets so the
+    # combined restriction reaches the interactive agent.
+    combined = file_callables + list(resolved)
+    # An explicit restriction that resolves to nothing must still restrict: an
+    # empty list is returned (not None) so the session does not silently fall
+    # back to the full default toolset the user asked to narrow.
+    return combined
 
 
 class _LogCapture(logging.Handler):
@@ -213,6 +379,7 @@ class AsyncTUI:
         self._running = False
         self._agent = None
         self._review_agent = None  # Cached read-only agent for review commands
+        self._definitions_fingerprint = _definitions_fingerprint(self.config.workspace)
         self._interrupt_controller = None  # Cooperative cancellation for in-flight turns
         self._interrupt_worker = None  # Tracks an in-flight/abandoned turn worker
         self._processing = False
@@ -226,6 +393,13 @@ class AsyncTUI:
         # ids of queued prompts that must run against the read-only review agent
         self._read_only_prompts: set = set()
         self._conversation_history: List[dict] = []  # Full conversation history
+        self._context_manager = None  # Lazily built ContextManagerHandler
+        self._context_manager_model: Optional[str] = None
+        # When a session is resumed (bare `praisonai -c/--session` or
+        # `/continue`), the id is recorded here so the lazily-built agent is
+        # wired to that session's store + prior turns for real conversational
+        # continuity — not just display-only scrollback (Issue #4910).
+        self._resume_session_id: Optional[str] = None
         self._total_tokens = 0
         self._total_cost = 0.0
         self._workspace_files: List[str] = []  # Files in workspace for @ completion
@@ -384,33 +558,31 @@ class AsyncTUI:
             self.messages.append(ChatMessage(role="system", content="Failed to revert."))
 
     def _process_file_mentions(self, prompt: str) -> str:
-        """Process @file mentions and include file contents."""
+        """Process @file mentions and include file contents.
+
+        Delegates to the shared core ``MentionsParser`` so this interactive
+        surface, ``praisonai run``, YAML and Python all expand ``@file``
+        references identically (and share the same workspace-containment and
+        path-traversal gates). The private regex this used to carry drifted
+        from the non-interactive path — the parser is the single source now.
+        """
         import os
-        import re
-        
+
         workspace = self.config.workspace or os.getcwd()
-        
-        # Find all @file mentions
-        pattern = r'@([^\s]+)'
-        matches = re.findall(pattern, prompt)
-        
-        if not matches:
+
+        try:
+            from praisonaiagents.tools.mentions import MentionsParser
+        except ImportError:
             return prompt
-        
-        file_contents = []
-        for match in matches:
-            file_path = os.path.join(workspace, match)
-            if os.path.isfile(file_path):
-                try:
-                    with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                        content = f.read()
-                    file_contents.append(f"\n--- Content of {match} ---\n{content}\n--- End of {match} ---\n")
-                except Exception as e:
-                    file_contents.append(f"\n[Error reading {match}: {e}]\n")
-        
-        if file_contents:
-            return prompt + "\n" + "\n".join(file_contents)
-        return prompt
+
+        parser = MentionsParser(workspace_path=workspace)
+        if not parser.has_mentions(prompt):
+            return prompt
+
+        context, cleaned = parser.process(prompt)
+        if not context:
+            return prompt
+        return f"{cleaned}\n\n{context}".rstrip()
     
     # Tool names that can mutate the workspace or run commands. Review turns
     # run with these filtered OUT so a purported read-only review cannot write
@@ -420,6 +592,110 @@ class AsyncTUI:
         "move_file", "execute_command", "run_command", "shell", "bash",
     })
 
+    def _persist_turn(self, user_content: str, assistant_content: Optional[str]) -> None:
+        """Write a completed turn to the session store.
+
+        Nothing in the TUI wrote to it, so a fresh ``praisonai chat`` / bare
+        ``praisonai`` / standalone ``praisonai code`` produced zero saved
+        sessions: ``/sessions`` answered "No saved sessions found." and
+        ``/continue`` (and ``--session``/``--continue``) had nothing to resume,
+        so every conversation on the default interactive path was lost on exit.
+        The resume machinery added for Issue #4910 works; there was simply never
+        anything for it to find.
+
+        Best-effort: a storage failure must never break the turn the user just
+        completed, so it degrades to a debug log.
+        """
+        if not self.session_id or not user_content:
+            return
+        try:
+            from praisonai_code.cli.session import get_session_store
+
+            store = get_session_store()
+            session = store.get_or_create(self.session_id)
+            if self.config.model:
+                session.current_model = self.config.model
+            session.add_user_message(user_content)
+            if assistant_content:
+                session.add_assistant_message(assistant_content)
+            store.save(session)
+        except Exception as e:
+            logger.debug(f"Could not persist turn to session store: {e}")
+
+    def _persist_imported_messages(
+        self, session_id: str, messages: List[dict]
+    ) -> None:
+        """Persist an imported transcript to *both* stores.
+
+        The model rehydrates from the project session store (via
+        ``apply_cli_session_continuity``); ``/sessions`` and ``/continue`` list
+        from the flat unified store. Writing only one left the other empty --
+        so the previous pair-stepping loop, which wrote solely to the unified
+        store, imported a transcript the model never received and dropped any
+        trailing or non-alternating message. ``set_chat_history`` replaces the
+        project transcript verbatim (every role preserved, no pairing), and the
+        unified mirror keeps the session discoverable. Best-effort: a storage
+        failure degrades to a debug log rather than aborting the import.
+        """
+        if not session_id or not messages:
+            return
+        # Normalise to {role, content} so the project store restores exactly
+        # what was imported, in order, regardless of alternation.
+        normalised = [
+            {
+                "role": m.get("role", "user"),
+                "content": m.get("content", "") or "",
+            }
+            for m in messages
+        ]
+        try:
+            from praisonai_code.cli.state.project_sessions import (
+                get_project_session_store,
+            )
+
+            get_project_session_store().set_chat_history(session_id, normalised)
+        except Exception as e:  # pragma: no cover - defensive
+            logger.debug("Could not persist import to project store: %s", e)
+
+        # Mirror into the flat unified store so /sessions and /continue list it.
+        try:
+            from praisonai_code.cli.session import get_session_store
+
+            store = get_session_store()
+            session = store.get_or_create(session_id)
+            if self.config.model:
+                session.current_model = self.config.model
+            for msg in normalised:
+                if msg["role"] == "user":
+                    session.add_user_message(msg["content"])
+                elif msg["role"] == "assistant":
+                    session.add_assistant_message(msg["content"])
+            store.save(session)
+        except Exception as e:  # pragma: no cover - defensive
+            logger.debug("Could not persist import to unified store: %s", e)
+
+    def _reset_agent_context(self) -> None:
+        """Drop the model's context too, so /clear and /new mean what they say.
+
+        ``_conversation_history`` drives the transcript pane; the agent keeps
+        its own ``chat_history``, and a resumed session is re-attached to the
+        store on the next build. Clearing only the former left the model still
+        answering from the conversation the user just cleared.
+
+        Rotating ``session_id`` is what actually severs the model context: the
+        rebuilt agent wires continuity from ``self._resume_session_id or
+        self.session_id``, and ``apply_cli_session_continuity`` re-reads the
+        stored turns for that id. Keeping the old id (the ``/clear`` case) meant
+        the next prompt reloaded the exact conversation the user just cleared;
+        assigning a fresh id gives the continuity read an empty history.
+        """
+        import uuid
+
+        self._resume_session_id = None
+        self._agent = None
+        self._review_agent = None
+        self.session_id = str(uuid.uuid4())[:8]
+
     def _get_agent(self, read_only: bool = False):
         """Lazy-load the agent with tools.
 
@@ -428,6 +704,15 @@ class AsyncTUI:
         enforcing review commands at the capability level rather than by prompt
         instruction alone.
         """
+        # Rebuild when rules/instruction/definition files changed since the
+        # agent was built, so edits apply on the next prompt without a restart.
+        # Conversation continuity is preserved via the session store (as for
+        # ``/model``).
+        fingerprint = _definitions_fingerprint(self.config.workspace)
+        if fingerprint != self._definitions_fingerprint:
+            self._definitions_fingerprint = fingerprint
+            self._agent = None
+            self._review_agent = None
         if read_only:
             if self._review_agent is None:
                 self._review_agent = self._build_agent(read_only=True)
@@ -514,9 +799,46 @@ class AsyncTUI:
                     if not read_only:
                         self._interrupt_controller = None
 
+                # Thread consolidated capability options (--knowledge/--guardrails/
+                # --web/--reflection/--planning/--context/--execution/--hooks/
+                # --caching) onto the same Agent params `run`/YAML/Python use, so an
+                # interactive session honours them instead of silently dropping them.
+                # Only options actually supplied are applied; unset ones keep the
+                # Agent's own defaults. Hooks are additive so the read-only review
+                # agent's cancellation wiring (set above) is preserved.
+                _apply_capability_options(agent_config, self.config)
+
                 logger.debug(f"Agent config: model={self.config.model}, tools={len(tools) if tools else 0}")
                 agent = Agent(**agent_config)
                 logger.debug("Agent created successfully")
+
+                # When resuming (bare `praisonai -c/--session` or `/continue`),
+                # wire the primary agent to the resumed session's store and
+                # prior turns via the same helper `run --continue` uses, so a
+                # follow-up prompt is answered *with* the restored conversation
+                # context rather than only redisplaying it (Issue #4910). The
+                # read-only review agent stays stateless. Best-effort: a failure
+                # degrades to the display-only transcript instead of aborting.
+                # A *resumed* session restores prior turns; a fresh one still
+                # needs auto_save wired, or nothing is ever written and there is
+                # no session to resume later -- which is why /sessions reported
+                # "No saved sessions found." on every install (see
+                # ``_persist_turn``, which covers the flat unified store that
+                # /sessions and /continue actually read).
+                if not read_only:
+                    continuity_id = self._resume_session_id or self.session_id
+                    if continuity_id:
+                        try:
+                            from praisonai_code.cli.state.project_sessions import (
+                                apply_cli_session_continuity,
+                            )
+
+                            apply_cli_session_continuity(
+                                agent, continuity_id, auto_save=continuity_id
+                            )
+                        except Exception as exc:  # pragma: no cover - defensive
+                            logger.debug("Session continuity wiring failed: %s", exc)
+
                 return agent
         except ImportError as e:
                 logger.error(f"Failed to import praisonaiagents: {e}")
@@ -568,7 +890,19 @@ class AsyncTUI:
         """Load interactive tools for the agent."""
         tools = []
         logger.debug("Starting tool loading...")
-        
+
+        # --tools/--toolset restrict the interactive session to an explicit set,
+        # resolved through the same ToolResolver path `run`/YAML/Python use
+        # (issue #5140). When supplied, the resolved callables REPLACE the
+        # default interactive groups so the flag is a genuine restriction.
+        restricted = _resolve_restricted_tools(self.config)
+        if restricted is not None:
+            logger.debug(
+                "Restricting interactive tools to --tools/--toolset selection: %d tool(s)",
+                len(restricted),
+            )
+            return restricted
+
         # Load the requested interactive tool groups. ACP/LSP are on by default
         # but can be disabled (code --no-acp/--no-lsp) so an explicitly
         # restricted session never exposes the disabled capability.
@@ -577,6 +911,11 @@ class AsyncTUI:
             groups.append("acp")
         if self.config.enable_lsp:
             groups.append("lsp")
+        # MCP servers declared in project config were never reachable from the
+        # code session (0 hits for "mcp" across code.py/interactive_tools.py/
+        # async_tui.py, against 65 in the sibling run.py). Opt out with
+        # PRAISON_TOOLS_DISABLE=mcp.
+        groups.append("mcp")
         try:
             from praisonai_code.cli.features.interactive_tools import get_interactive_tools
             tools = get_interactive_tools(
@@ -584,7 +923,11 @@ class AsyncTUI:
                 workspace=self.config.workspace,
             )
             if tools:
-                logger.debug(f"Loaded {len(tools)} tools from interactive_tools: {[t.__name__ for t in tools]}")
+                logger.debug(
+                    "Loaded %d tools from interactive_tools: %s",
+                    len(tools),
+                    [getattr(t, "__name__", getattr(t, "name", repr(t))) for t in tools],
+                )
                 return tools
         except ImportError as e:
             logger.debug(f"interactive_tools import failed: {e}")
@@ -769,12 +1112,19 @@ class AsyncTUI:
         "code-review": "Review the uncommitted diff for bugs (read-only)",
         "security-review": "Audit the uncommitted diff for security issues (read-only)",
         "handoff": "Delegate to specialized agent (code/research/review/docs)",
-        "compact": "Toggle compact output mode",
+        "compact": "Compact the conversation context (free tokens)",
+        "compact-display": "Toggle compact output mode",
         "multiline": "Toggle multiline input mode",
         "files": "List workspace files for @ mentions",
         "queue": "Show pending prompts in queue",
         "undo": "Undo the last turn (files + conversation)",
         "revert": "Revert the last N turns (files + conversation)",
+        "git-status": "Show working-tree status",
+        "git-diff": "Show the uncommitted diff",
+        "git-log": "Show recent commits",
+        "git-commit": "Stage and commit (message auto-generated when omitted)",
+        "git-undo": "Undo the last commit (keeps changes staged)",
+        "map": "Show a ranked repository map (operator overview)",
     }
 
     def _get_registry(self):
@@ -791,7 +1141,7 @@ class AsyncTUI:
                 )
 
                 self._registry = create_default_registry(
-                    self._BUILTIN_COMMANDS, include_custom=True
+                    self._BUILTIN_COMMANDS, include_custom=True, include_skills=True
                 )
             except Exception as exc:  # pragma: no cover - defensive
                 logger.debug("Command registry unavailable: %s", exc)
@@ -799,6 +1149,102 @@ class AsyncTUI:
         if self._registry is _REGISTRY_FAILED:
             return None
         return self._registry
+
+    def _resume_session(self, session_id: Optional[str] = None) -> bool:
+        """Restore a stored session's conversation into the TUI scrollback.
+
+        Shared by the in-TUI ``/continue`` command and the bare-invocation
+        ``praisonai -c/--session`` launch path (Issue #4910). When
+        ``session_id`` is ``None`` the most recently updated session is used
+        (``/continue`` semantics); otherwise the given id is loaded directly.
+        Reuses the same store + :meth:`_replay_history` renderer as before so
+        both surfaces show prior turns identically. Returns ``True`` when a
+        session was loaded and replayed.
+        """
+        try:
+            from praisonai_code.cli.session import get_session_store
+            store = get_session_store()
+            if session_id is None:
+                sessions = store.list_sessions()
+                if not sessions:
+                    self.messages.append(ChatMessage(role="system", content="No sessions to continue."))
+                    return False
+                sorted_sessions = sorted(
+                    sessions,
+                    key=lambda s: s.get("updated_at", s.get("created_at", 0)),
+                    reverse=True,
+                )
+                session_id = sorted_sessions[0].get("session_id")
+            session = store.load(session_id)
+            if session:
+                self.session_id = session.session_id
+                # Load the full stored history (not the default 50-message tail)
+                # so the replay's "… N earlier turns" note reflects the true
+                # total and older turns aren't silently dropped before bounding.
+                history = session.get_chat_history(
+                    max_messages=max(session.message_count, 1)
+                )
+            else:
+                # The bare-launch path (Issue #4910) selects the id from the
+                # project-scoped/global ``DefaultSessionStore`` family
+                # (``find_last_session``/``session_exists_anywhere``/``fork``),
+                # which is a *different* store than the flat unified TUI store
+                # above. Fall back to that same canonical store family so a
+                # ``praisonai -c/--session`` id (or a ``--fork`` child) actually
+                # loads instead of reporting "Could not load session".
+                history = self._load_history_from_project_stores(session_id)
+                if history is None:
+                    self.messages.append(ChatMessage(role="system", content="Could not load session."))
+                    return False
+                self.session_id = session_id
+            self._conversation_history = history
+            # Record the resumed id so the lazily-built agent is wired to the
+            # same session store and its prior turns (real conversational
+            # continuity, not display-only scrollback). See ``_build_agent``.
+            # Drop any already-built primary agent so it is rebuilt with the
+            # resumed session's context (covers a mid-session ``/continue``).
+            self._resume_session_id = self.session_id
+            self._agent = None
+            # Reset the display so repeated resumes redraw the restored
+            # conversation cleanly instead of appending to — and duplicating —
+            # stale on-screen turns.
+            self.messages.clear()
+            self.messages.append(ChatMessage(
+                role="system",
+                content=f"Continued session: {self.session_id} ({len(history)} messages)",
+            ))
+            self._replay_history(history)
+            return True
+        except Exception as e:
+            self.messages.append(ChatMessage(role="system", content=f"Could not continue session: {e}"))
+            return False
+
+    def _load_history_from_project_stores(self, session_id):
+        """Load a session transcript from the canonical CLI store family.
+
+        The bare ``praisonai -c/--session`` launch resolves ids via
+        ``state.project_sessions`` (project-scoped + global
+        ``DefaultSessionStore``), which is a distinct store from the flat
+        unified TUI store used by ``/continue``. This bridges the two so a
+        launch-resolved id (including a ``--fork`` child) is loadable. Returns
+        the message list, or ``None`` when the id is absent everywhere.
+        """
+        try:
+            from praisonai_code.cli.state.project_sessions import (
+                canonical_cli_stores,
+            )
+        except Exception:
+            return None
+        for store in canonical_cli_stores():
+            try:
+                if not store.session_exists(session_id):
+                    continue
+                history = store.get_chat_history(session_id)
+            except Exception:
+                continue
+            if history is not None:
+                return history
+        return None
 
     def _replay_history(self, history, limit: int = 20) -> None:
         """Redraw a restored conversation as live chat messages.
@@ -871,7 +1317,13 @@ class AsyncTUI:
   /code-review [file|--staged]   Review the uncommitted diff for bugs (read-only)
   /security-review [file|--staged]  Audit the uncommitted diff for security issues (read-only)
   /handoff <type> <task>  Delegate to specialized agent (code/research/review/docs)
-  /compact         Toggle compact output mode
+  /compact         Compact the conversation context (free tokens)
+  /compact-display Toggle compact output mode
+  /git-status      Show working-tree status
+  /git-diff        Show the uncommitted diff
+  /git-log [n]     Show recent commits
+  /git-commit [m]  Stage and commit (message auto-generated when omitted)
+  /git-undo        Undo the last commit (keeps changes staged)
   /multiline       Toggle multiline input mode
   /files           List workspace files for @ mentions
   /queue           Show pending prompts in queue
@@ -906,14 +1358,14 @@ Tips:
         elif cmd == "clear":
             self.messages.clear()
             self._conversation_history.clear()
+            self._reset_agent_context()
             self.messages.append(ChatMessage(role="system", content="Conversation cleared."))
             return True
         
         elif cmd == "new":
             self.messages.clear()
             self._conversation_history.clear()
-            import uuid
-            self.session_id = str(uuid.uuid4())[:8]
+            self._reset_agent_context()
             self.messages.append(ChatMessage(role="system", content=f"New session: {self.session_id}"))
             return True
         
@@ -968,10 +1420,33 @@ Tips:
             self.messages.append(ChatMessage(role="system", content=stats_info))
             return True
         
+        elif cmd in ("git-status", "git-diff", "git-log", "git-commit", "git-undo"):
+            self._handle_git_command(cmd, args)
+            return True
+
+        elif cmd == "map":
+            # /map was implemented only in the legacy standalone slash-command
+            # registry; the modern TUI builds its registry from _BUILTIN_COMMANDS
+            # and so treated /map as unknown despite the README advertising it.
+            # Wire it here so the primary coding interface reaches the working
+            # repo_map.RepoMap. Operator command, not an agent tool.
+            self._handle_map_command(args)
+            return True
+
         elif cmd == "compact":
+            # /compact used to toggle a *display* flag. Every other coding agent
+            # means "shrink the conversation context" by that command, and the
+            # real implementation (features/context_manager.py: 500+ lines of
+            # budget accounting, optimizer strategies, auto_compact) was
+            # unreachable from this TUI. The display toggle now lives under
+            # /compact-display.
+            self._compact_context(args, manual=True)
+            return True
+
+        elif cmd in ("compact-display", "dense"):
             self.config.compact_mode = not self.config.compact_mode
             mode = "enabled" if self.config.compact_mode else "disabled"
-            self.messages.append(ChatMessage(role="system", content=f"Compact mode {mode}"))
+            self.messages.append(ChatMessage(role="system", content=f"Compact display mode {mode}"))
             return True
         
         elif cmd == "multiline":
@@ -1019,46 +1494,8 @@ Tips:
             return True
         
         elif cmd == "continue":
-            # Continue most recent session
-            try:
-                from praisonai_code.cli.session import get_session_store
-                store = get_session_store()
-                sessions = store.list_sessions()
-                if not sessions:
-                    self.messages.append(ChatMessage(role="system", content="No sessions to continue."))
-                else:
-                    # Get most recent
-                    sorted_sessions = sorted(
-                        sessions,
-                        key=lambda s: s.get("updated_at", s.get("created_at", 0)),
-                        reverse=True
-                    )
-                    if sorted_sessions:
-                        session = store.load(sorted_sessions[0].get("session_id"))
-                        if session:
-                            self.session_id = session.session_id
-                            # Load the full stored history (not the default
-                            # 50-message tail) so the replay's "… N earlier
-                            # turns" note reflects the true total and older
-                            # turns aren't silently dropped before bounding.
-                            history = session.get_chat_history(
-                                max_messages=max(session.message_count, 1)
-                            )
-                            self._conversation_history = history
-                            # Reset the display so repeated /continue calls (or
-                            # continuing after prior activity) redraw the
-                            # restored conversation cleanly instead of appending
-                            # to — and duplicating — stale on-screen turns.
-                            self.messages.clear()
-                            self.messages.append(ChatMessage(
-                                role="system", 
-                                content=f"Continued session: {self.session_id} ({len(history)} messages)"
-                            ))
-                            self._replay_history(history)
-                        else:
-                            self.messages.append(ChatMessage(role="system", content="Could not load session."))
-            except Exception as e:
-                self.messages.append(ChatMessage(role="system", content=f"Could not continue session: {e}"))
+            # Continue most recent session (or a specific id when given).
+            self._resume_session(args.strip() or None)
             return True
         
         elif cmd == "import":
@@ -1075,6 +1512,18 @@ Tips:
                     messages = data.get("messages", [])
                     self._conversation_history = messages
                     self.session_id = data.get("session_id", self.session_id)
+                    # Reported "Imported N messages" and then answered as though
+                    # none of them existed: the pair-stepping loop wrote to the
+                    # flat UnifiedSessionStore, but the rebuilt agent restores
+                    # context from the *project* session store -- so the model
+                    # saw none of the import and any trailing/non-alternating
+                    # message was dropped. Write the full transcript verbatim to
+                    # the same store `apply_cli_session_continuity` reads, then
+                    # route through the resume path so the model actually sees
+                    # every imported turn.
+                    self._persist_imported_messages(self.session_id, messages)
+                    self._resume_session_id = self.session_id
+                    self._agent = None
                     self.messages.append(ChatMessage(
                         role="system",
                         content=f"Imported {len(messages)} messages from {args}"
@@ -1318,6 +1767,284 @@ Example: /handoff code "refactor the auth module" """
             self.messages.append(ChatMessage(role="system", content=f"Unknown command: /{cmd}. Use /help for available commands."))
             return True
     
+    # ------------------------------------------------------------------
+    # Git
+    # ------------------------------------------------------------------
+
+    def _handle_git_command(self, cmd: str, args: str) -> None:
+        """Surface ``GitIntegrationHandler`` in the session.
+
+        ``GitManager`` implements status, diff, staging, commit, log, undo and
+        AI-generated commit messages, but the only caller in the code session
+        was ``/code-review``, which used it to collect a diff. Everything else
+        it can do was unreachable without leaving the session -- so the agent
+        would write changes and the operator had to drop to a shell to commit
+        them. These commands are deliberately *operator* commands, not agent
+        tools: committing is a decision, not a step the model takes on its own.
+        """
+        try:
+            from praisonai_code.cli.features.git_integration import (
+                GitIntegrationHandler,
+            )
+        except ImportError as exc:
+            self.messages.append(ChatMessage(
+                role="system", content=f"Git integration unavailable: {exc}"
+            ))
+            return
+
+        handler = GitIntegrationHandler()
+        try:
+            git = handler.initialize(repo_path=self.config.workspace or None)
+        except Exception as exc:  # noqa: BLE001
+            self.messages.append(ChatMessage(
+                role="system", content=f"Git unavailable: {exc}"
+            ))
+            return
+
+        if not git.is_repo:
+            self.messages.append(ChatMessage(
+                role="system", content="Not a git repository."
+            ))
+            return
+
+        try:
+            if cmd == "git-status":
+                status = git.get_status()
+                if not status.has_changes:
+                    body = f"On branch {status.branch}. Working tree clean."
+                else:
+                    parts = [f"On branch {status.branch}"]
+                    for label, files in (
+                        ("Staged", status.staged_files),
+                        ("Modified", status.modified_files),
+                        ("Untracked", status.untracked_files),
+                    ):
+                        if files:
+                            parts.append(f"{label}: " + ", ".join(files[:20]))
+                    body = "\n".join(parts)
+
+            elif cmd == "git-diff":
+                diff = git.get_diff_content(staged=args.strip() == "--staged")
+                body = diff.strip() or "No uncommitted changes."
+
+            elif cmd == "git-log":
+                try:
+                    count = int(args.strip()) if args.strip() else 10
+                except ValueError:
+                    count = 10
+                commits = git.get_log(count=max(1, count))
+                if not commits:
+                    body = "No commits yet."
+                else:
+                    body = "\n".join(
+                        f"{c.short_hash or c.hash[:8]}  {c.message.splitlines()[0]}"
+                        for c in commits
+                    )
+
+            elif cmd == "git-commit":
+                message = args.strip() or None
+                commit = handler.commit(message=message)
+                if commit is None:
+                    body = "Nothing to commit (or the commit failed)."
+                else:
+                    short = commit.short_hash or commit.hash[:8]
+                    body = f"Committed {short}: {commit.message.splitlines()[0]}"
+
+            else:  # git-undo
+                ok = handler.undo(soft=True)
+                body = (
+                    "Undid the last commit; changes kept in the working tree."
+                    if ok else "Could not undo the last commit."
+                )
+        except Exception as exc:  # noqa: BLE001
+            body = f"Git command failed: {exc}"
+
+        self.messages.append(ChatMessage(role="system", content=body))
+
+    def _handle_map_command(self, args: str) -> None:
+        """Surface ``repo_map.RepoMap`` in the modern TUI.
+
+        The repository map is an at-a-glance operator overview of an unfamiliar
+        repo. Deliberately not re-exposed as an agent tool: the agent already
+        has grep/glob/ast_grep_search, which is where the field landed for how a
+        model finds code. Never raises -- a missing optional dependency or an
+        unindexable tree degrades to a system message.
+        """
+        root = args.strip() or self.config.workspace or os.getcwd()
+        try:
+            from praisonai_code.cli.features.repo_map import RepoMapHandler
+        except ImportError as exc:
+            self.messages.append(ChatMessage(
+                role="system", content=f"Repository map unavailable: {exc}"
+            ))
+            return
+        try:
+            handler = RepoMapHandler()
+            handler.initialize(root=root)
+            map_str = handler.get_map()
+        except Exception as exc:  # noqa: BLE001
+            self.messages.append(ChatMessage(
+                role="system", content=f"Repository map failed: {exc}"
+            ))
+            return
+        if not map_str or not map_str.strip():
+            self.messages.append(ChatMessage(
+                role="system", content="No indexable source files found."
+            ))
+            return
+        self.messages.append(ChatMessage(role="system", content=map_str))
+
+    # ------------------------------------------------------------------
+    # Context compaction
+    # ------------------------------------------------------------------
+
+    def _get_context_manager(self):
+        """Lazily build the real ``ContextManagerHandler``.
+
+        ``features/context_manager.py`` implements token budgeting, overflow
+        detection, optimizer strategies and ``should_auto_compact``, but nothing
+        in the modern code session imported it -- only the legacy interactive
+        path did. Returns ``None`` (never raises) when the SDK context package
+        is unavailable, so a missing optional dependency degrades to "no
+        compaction" rather than breaking the session.
+        """
+        mgr = getattr(self, "_context_manager", None)
+        current_model = self.config.model
+        if mgr is not None and getattr(self, "_context_manager_model", None) == current_model:
+            return mgr
+        try:
+            from praisonai_code.cli.features.context_manager import ContextManagerHandler
+
+            mgr = ContextManagerHandler(
+                model=current_model or "gpt-4o-mini",
+                session_id=self.session_id or "",
+                agent_name="praisonai-code",
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Context manager unavailable: %s", exc)
+            self._context_manager = None
+            self._context_manager_model = current_model
+            return None
+        self._context_manager = mgr
+        self._context_manager_model = current_model
+        return mgr
+
+    def _live_history(self):
+        """The message list the model actually sees, and a setter for it.
+
+        Prefers the agent's own ``chat_history`` -- compacting only the TUI's
+        transcript would change what is *displayed* while leaving the model's
+        context untouched, which is exactly the kind of no-op /compact this
+        change exists to remove.
+        """
+        agent = getattr(self, "_agent", None)
+        if agent is not None and hasattr(agent, "chat_history"):
+            try:
+                history = list(agent.chat_history or [])
+            except Exception:  # noqa: BLE001
+                history = []
+
+            def _set(messages):
+                agent.chat_history = list(messages)
+
+            return history, _set, "agent"
+
+        def _set_local(messages):
+            self._conversation_history = list(messages)
+
+        return list(self._conversation_history), _set_local, "session"
+
+    def _compact_context(self, args: str = "", manual: bool = True) -> bool:
+        """Run real context compaction. Returns True if anything was freed."""
+        mgr = self._get_context_manager()
+        if mgr is None:
+            if manual:
+                self.messages.append(ChatMessage(
+                    role="system",
+                    content="Context compaction unavailable (praisonaiagents.context not installed).",
+                ))
+            return False
+
+        history, set_history, source = self._live_history()
+        if len(history) < 4:
+            if manual:
+                self.messages.append(ChatMessage(
+                    role="system",
+                    content=f"Not enough history to compact ({len(history)} messages; need at least 4).",
+                ))
+            return False
+
+        strategy = (args or "").strip() or None
+        try:
+            mgr.track_history(history)
+            optimized, result = mgr.optimize(history, strategy=strategy)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Compaction failed: %s", exc, exc_info=True)
+            if manual:
+                self.messages.append(ChatMessage(
+                    role="system", content=f"Compaction failed: {exc}"
+                ))
+            return False
+
+        saved = getattr(result, "tokens_saved", 0) or 0
+        if saved <= 0:
+            if manual:
+                self.messages.append(ChatMessage(
+                    role="system", content="Context is already within budget; nothing to compact.",
+                ))
+            return False
+
+        set_history(optimized)
+        if source == "agent":
+            # Keep the transcript pane in step with the model's context.
+            self._conversation_history = list(optimized)
+
+        strategy_used = getattr(result, "strategy_used", None)
+        strategy_label = getattr(strategy_used, "value", strategy_used) or "smart"
+        self.messages.append(ChatMessage(
+            role="system",
+            content=(
+                f"Compacted context: {result.original_tokens:,} → "
+                f"{result.optimized_tokens:,} tokens "
+                f"(saved {saved:,}, {result.reduction_percent:.1f}%) "
+                f"via {strategy_label}."
+            ),
+        ))
+        return True
+
+    def _maybe_auto_compact(self, pending_prompt: str = "") -> None:
+        """Compact before a turn when the session is near its context budget.
+
+        ``ContextManagerHandler.should_auto_compact()`` existed and was never
+        called from this TUI, so a long session ran until the provider returned
+        a context-length error instead of shrinking first.
+
+        The pending user prompt is included in the budget check: a large
+        incoming message can cross the threshold *after* the accumulated history
+        alone was still under it, and checking history-only would let that turn
+        be rejected by the provider despite auto-compaction being on.
+        """
+        mgr = self._get_context_manager()
+        if mgr is None:
+            return
+        history, _set, _source = self._live_history()
+        if len(history) < 4:
+            return
+        # Count the pending prompt against the budget without mutating the
+        # real history: it is appended to the model context immediately after
+        # this check, so it is part of the next request.
+        check_history = history
+        if pending_prompt:
+            check_history = history + [{"role": "user", "content": pending_prompt}]
+        try:
+            mgr.track_history(check_history)
+            if not mgr.should_auto_compact():
+                return
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("auto-compact check failed: %s", exc)
+            return
+        self._compact_context(manual=False)
+
     def _execute_prompt(self, prompt: str, read_only: bool = False) -> Optional[str]:
         """Execute a prompt and return the response (suppresses agent output).
 
@@ -1608,6 +2335,13 @@ Example: /handoff code "refactor the auth module" """
             if not read_only:
                 self._checkpoint_turn(prompt[:60])
             
+            # Shrink the context *before* the turn if it is near the model's
+            # budget, rather than letting the provider reject the request. The
+            # pending prompt is included so a large incoming message that tips
+            # the session over the threshold triggers compaction here instead
+            # of being rejected by the provider.
+            self._maybe_auto_compact(pending_prompt=prompt)
+
             # Add to conversation history
             self._conversation_history.append({"role": "user", "content": prompt})
             
@@ -1667,9 +2401,11 @@ Example: /handoff code "refactor the auth module" """
                 self.messages.append(ChatMessage(role="system", content=f"Tools used: {tools_used}"))
             
             streamed_msg = streamed["message"]
+            assistant_text: Optional[str] = None
             if error[0]:
                 self.messages.append(ChatMessage(role="assistant", content=f"Error: {error[0]}"))
-                self._conversation_history.append({"role": "assistant", "content": f"Error: {error[0]}"})
+                assistant_text = f"Error: {error[0]}"
+                self._conversation_history.append({"role": "assistant", "content": assistant_text})
             elif result[0]:
                 # If the turn already streamed its narrative into a live
                 # assistant message, reuse it as the finalised turn (updating it
@@ -1681,7 +2417,12 @@ Example: /handoff code "refactor the auth module" """
                         streamed_msg.content = result[0]
                 else:
                     self.messages.append(ChatMessage(role="assistant", content=result[0]))
+                assistant_text = result[0]
                 self._conversation_history.append({"role": "assistant", "content": result[0]})
+
+            # Persist the completed turn so /sessions, /continue and the
+            # --session/--continue flags have something to find.
+            self._persist_turn(prompt, assistant_text)
             
             self._update_output()
             
@@ -1789,7 +2530,15 @@ Example: /handoff code "refactor the auth module" """
         import asyncio
         
         self._running = True
-        
+
+        # Resume a prior session into the scrollback before the loop starts
+        # (Issue #4910). Reuses the same store + replay path as `/continue`, so
+        # a returning user reaches the interactive surface with their prior
+        # transcript already restored. Best-effort: a failure degrades to a
+        # fresh session rather than aborting launch.
+        if self.config.resume and self.config.session_id:
+            self._resume_session(self.config.session_id)
+
         # Start runtime (ACP/LSP servers) before TUI
         try:
             # Use the shared async bridge instead of a throwaway loop so
@@ -1855,11 +2604,24 @@ Example: /handoff code "refactor the auth module" """
                 
                 self.messages.append(ChatMessage(role="user", content=user_input))
                 print("  ⏳ Praison AI is thinking... (Ctrl-C to interrupt)")
+                # Shrink context before the turn here too: long fallback-mode
+                # sessions otherwise get no automatic overflow protection and
+                # run until the provider rejects the request. Pending prompt is
+                # included in the budget check for the same reason as the main
+                # loop.
+                self._maybe_auto_compact(pending_prompt=user_input)
+                self._conversation_history.append(
+                    {"role": "user", "content": user_input}
+                )
                 response = self._execute_prompt_interruptible(user_input)
-                
+
                 if response:
                     self.messages.append(ChatMessage(role="assistant", content=response))
+                    self._conversation_history.append(
+                        {"role": "assistant", "content": response}
+                    )
                     print(f"\n● {response}\n")
+                self._persist_turn(user_input, response)
                 
             except KeyboardInterrupt:
                 print("\n  Use /exit to quit")
@@ -1883,10 +2645,20 @@ Example: /handoff code "refactor the auth module" """
         from prompt_toolkit.history import FileHistory
         from prompt_toolkit.completion import Completer, Completion
         
-        # Create completer for commands and files. Derive the list from the
-        # single source of truth (_BUILTIN_COMMANDS) so registration and
-        # autocomplete never drift (e.g. code-review/security-review).
+        # Create completer for commands and files. Start from the built-ins
+        # (single source of truth so registration and autocomplete never drift,
+        # e.g. code-review/security-review) and extend with discovered registry
+        # commands — custom ``.praisonai/commands/*.md`` and installed skills —
+        # so typing ``/`` offers them too. Degrades to built-ins on any failure.
         commands = list(self._BUILTIN_COMMANDS.keys())
+        registry = self._get_registry()
+        if registry is not None:
+            try:
+                for c in registry.list_commands():
+                    if c.name not in commands:
+                        commands.append(c.name)
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.debug("Skipping registry completions: %s", exc)
         workspace_files = self._workspace_files
         
         class PraisonCompleter(Completer):

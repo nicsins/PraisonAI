@@ -21,6 +21,7 @@
  */
 import type { StoragePort } from "../ports/storage.ts";
 import { createChatRepository, type ChatRepository, type StoredChat, type StoredMessage } from "./repository.ts";
+import type { HistoryMessage } from "./history.ts";
 
 /** What the engine ports call. Mirrors the engine-side interface exactly. */
 export interface RecordedIndices {
@@ -130,5 +131,64 @@ export function createSession(deps: SessionDeps): Session {
     },
 
     repository,
+  };
+}
+
+
+/**
+ * A `Session` seen as the engine's `RunPersistence`.
+ *
+ * The two halves were designed apart and never reconciled, and that is exactly
+ * why nothing was ever wired: `Session.record` takes a prompt, the engine's
+ * `RunPersistence.record` takes a whole `RunRequest`, and the signatures do not
+ * line up. So the session was built, the port was declared, and no conversation
+ * was ever written -- a gap that read as closed from either end.
+ *
+ * Naming the adapter rather than inlining a lambda at the call site is
+ * deliberate: this is the one place the two vocabularies meet, and a lambda
+ * buried in composition is a seam nobody can find later.
+ *
+ * `chatId` is deliberately NOT used to switch chats here. The session already
+ * knows which conversation is open; taking direction from the request instead
+ * would let an in-flight turn write into whichever chat the user has since
+ * navigated to.
+ */
+export function persistenceFor(session: Session): {
+  record(request: { readonly prompt: string }, answer: string): Promise<RecordedIndices | null>;
+} {
+  return {
+    record: (request, answer) => session.record(request.prompt, answer),
+  };
+}
+
+/**
+ * A `Session` seen as the engine's conversation MEMORY.
+ *
+ * The mirror image of `persistenceFor`, and it exists for the same reason: the
+ * two halves were designed apart. `Session` knows the whole `StoredChat`;
+ * an engine wants prior turns and nothing else -- no ids, no titles, no
+ * timestamps, no engineId. This is the projection, named rather than inlined
+ * so the one place the two vocabularies meet stays findable.
+ *
+ * READ FROM `current()`, exactly as `record` WRITES to it. That is what makes a
+ * REOPENED conversation carry its history: `open(chatId)` loads the stored
+ * chat into `current`, so the messages a user scrolls back through and the
+ * messages the next turn remembers are the same array. A history assembled
+ * from turns seen in this process instead would have given a fresh launch a
+ * model with amnesia and a screen full of transcript -- which is the original
+ * defect surviving a force-stop.
+ *
+ * It does NOT include the prompt currently being sent. `record` runs after a
+ * turn succeeds, so `current()` holds completed turns only; the engine adds
+ * the live prompt itself. Including it here would send the question twice --
+ * once as history and once as the prompt -- and a model asked the same
+ * question twice in one request answers the wrong one about half the time.
+ */
+export function historyFor(session: Session): {
+  messages(): readonly HistoryMessage[];
+} {
+  return {
+    messages: () =>
+      (session.current()?.messages ?? []).map((m) => ({ role: m.role, content: m.content })),
   };
 }

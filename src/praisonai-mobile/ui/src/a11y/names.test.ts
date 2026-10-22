@@ -17,14 +17,17 @@ import {
   accessibleName,
   approvalRowName,
   chatRowName,
+  emptyStateName,
   routeTitle,
   toolRowName,
+  userRowNames,
 } from "./names.ts";
+import { emptyState } from "../transcript/empty-state.ts";
 import { en } from "../i18n/strings.ts";
 import { UNKNOWN } from "../format.ts";
 import { buildChatList } from "../chats/list-view-model.ts";
-import { buildTranscript, toolRowsOf, type ToolRowView } from "../transcript/view-model.ts";
-import { apply, initialTurn, type TurnState } from "../../../core/src/run/transcript.ts";
+import { buildTranscript, toolRowsOf, type ToolRowView, type UserRow } from "../transcript/view-model.ts";
+import { apply, beginTurn, initialTurn, type TurnState } from "../../../core/src/run/transcript.ts";
 import { add, choose, emptyApprovals } from "../../../core/src/run/approvals.ts";
 import type { RunEvent } from "../../../protocol/src/events.ts";
 
@@ -188,4 +191,94 @@ test("every route has a title, so no screen's heading is blank", () => {
   ];
   for (const title of titles) assert.notEqual(title.trim(), "");
   assert.equal(new Set(titles).size, 4);
+});
+
+test("a titled chat row announces its title, and an untitled one says so", () => {
+  // `row.title === ""` -> `!== ""` survived, inverting both directions at once:
+  // a real title announced as "Untitled", and an untitled row announced as an
+  // EMPTY accessible name. A nameless row reads as just "button" and cannot be
+  // told apart from the one above it, which is what this function exists to
+  // prevent -- the comment two lines above says so.
+  assert.equal(chatRowName(en, { kind: "chat", id: "c1", title: "Quarterly plan" } as never), "Quarterly plan");
+  assert.equal(chatRowName(en, { kind: "chat", id: "c1", title: "" } as never), en.untitled);
+  assert.notEqual(chatRowName(en, { kind: "chat", id: "c1", title: "" } as never), "", "a row must never be nameless");
+});
+
+// ---- the user's own message -------------------------------------------------
+
+/** The user row of a turn seeded with a prompt. */
+const userRowOf = (prompt: string, ...events: readonly RunEvent[]): UserRow => {
+  const turn = events.reduce<TurnState>(apply, beginTurn(prompt));
+  const row = buildTranscript(turn).rows.find((r) => r.kind === "user");
+  assert.ok(row !== undefined && row.kind === "user", "no user row");
+  return row;
+};
+
+test("a user row is NOT given an aria-label, for the same reason a text row is not", () => {
+  // Rule 3 in this file's header, applied to the other speaker. An aria-label
+  // REPLACES the element's content in the accessibility tree, so labelling a
+  // message would cost the reader the ability to navigate their own words by
+  // word, sentence or character -- and hand them a summary of a thing they
+  // wrote instead of the thing. The speaker is announced as CONTENT instead.
+  assert.equal(accessibleName(en, userRowOf("what is the capital of France", start)), null);
+});
+
+test("a user row says WHO said it, so the two sides are not told apart by colour", () => {
+  // On screen a user row is distinguished by which edge it hugs and what colour
+  // it is. Both are CSS; neither is in the accessibility tree. Without a spoken
+  // speaker a screen-reader user hears an undifferentiated run of paragraphs
+  // and cannot tell their own question from the answer to it -- this file's
+  // founding defect, with alignment standing in for hue.
+  const names = userRowNames(en, userRowOf("hello", start));
+  assert.notEqual(names.speaker.trim(), "");
+  assert.match(names.speaker, /you/i, "the speaker must actually name the speaker");
+});
+
+test("only a message that is NOT stored is annotated as such", () => {
+  // A caveat on every message is a caveat nobody reads. The note appears when
+  // the turn ended and `end.userIndex` never arrived -- the message is on
+  // screen and will not be in the conversation when it is reopened -- and at no
+  // other time.
+  const streaming = userRowNames(en, userRowOf("q", start, { type: "delta", msgId: M, text: "a" }));
+  assert.equal(streaming.note, null, "a live turn must not be accused of losing anything");
+
+  const written = userRowNames(en, userRowOf("q", start, { type: "delta", msgId: M, text: "a" },
+    { type: "end", msgId: M, userIndex: 0, assistantIndex: 1, versions: 1, active: 0 }));
+  assert.equal(written.note, null);
+
+  const lost = userRowNames(en, userRowOf("q", start, { type: "delta", msgId: M, text: "a" },
+    { type: "end", msgId: M, userIndex: null, assistantIndex: null, versions: 1, active: 0 }));
+  assert.notEqual(lost.note, null, "a message the engine did not write must say so");
+  assert.match(String(lost.note), /not saved/i);
+});
+
+test("the empty chat has something to say to a screen reader", () => {
+  // An empty transcript is a `role="log"` with nothing in it, so a fresh chat
+  // is announced as nothing at all. The panel's own heading and paragraph are
+  // browsable content -- rule 3 forbids an aria-label over prose -- and this is
+  // the sentence the composition root reads into the polite region instead.
+  const view = emptyState({ hasRows: false, keyRequired: true, key: "present" }, en);
+  assert.ok(view !== null);
+  const said = emptyStateName(en, view);
+  assert.ok(said.includes(view.title), said);
+  assert.ok(said.includes(view.body), said);
+});
+
+test("the spoken key guidance includes the way out of it", () => {
+  // A reader hears the region before reaching anything focusable inside it, so
+  // "Open settings" arriving three tab stops later is a discovery rather than
+  // an instruction. It belongs in the sentence.
+  const view = emptyState({ hasRows: false, keyRequired: true, key: "absent" }, en);
+  assert.ok(view !== null && view.action !== null);
+  const said = emptyStateName(en, view);
+  assert.ok(said.includes(view.action.label), said);
+  assert.match(said, /key/i);
+});
+
+test("the welcome is not spoken as an instruction to fix something", () => {
+  // The pair: a name that appended a settings prompt unconditionally would tell
+  // a configured user to go and configure the app, out loud, on every new chat.
+  const view = emptyState({ hasRows: false, keyRequired: true, key: "present" }, en);
+  assert.ok(view !== null);
+  assert.equal(emptyStateName(en, view).toLowerCase().includes("settings"), false);
 });

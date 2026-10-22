@@ -38,6 +38,27 @@ def _base_model_name(model_name: str) -> str:
     return name
 
 
+def _coerce_output_token_limit(value) -> int | None:
+    """Return a positive integer output ceiling, or ``None`` when invalid."""
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        coerced = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    # ``int`` truncates fractional metadata (for example, ``8192.5``), which
+    # would turn an invalid ceiling into an apparently authoritative limit.
+    # Keep numeric strings such as ``"8192"`` compatible with LiteLLM's
+    # metadata while rejecting non-integral numeric values before conversion.
+    if not isinstance(value, str):
+        try:
+            if value != coerced:
+                return None
+        except Exception:
+            return None
+    return coerced if coerced > 0 else None
+
+
 def _fallback_supports_structured_outputs(model_name: str) -> bool:
     """Static heuristic used only when litellm is unavailable.
 
@@ -100,6 +121,50 @@ def _fallback_supports_prompt_caching(model_name: str) -> bool:
     """Static heuristic used only when litellm is unavailable."""
     name = _base_model_name(model_name)
     return any(p in name for p in ("claude-3", "claude-sonnet", "claude-opus", "claude-haiku", "gpt-4o", "gpt-4.1", "gpt-5", "deepseek"))
+
+
+def _fallback_supports_vision(model_name: str) -> bool:
+    """Static heuristic used only when litellm is unavailable."""
+    name = _base_model_name(model_name)
+    return any(
+        p in name
+        for p in (
+            "gpt-4o", "gpt-4.1", "gpt-4-turbo", "gpt-4-vision", "gpt-5",
+            "o1", "o3", "o4", "claude-3", "claude-sonnet", "claude-opus",
+            "claude-haiku", "gemini", "llava", "pixtral", "grok-2", "grok-4",
+            "qwen-vl", "qwen2-vl", "internvl", "vision",
+        )
+    )
+
+
+def _fallback_supports_pdf_input(model_name: str) -> bool:
+    """Static heuristic used only when litellm is unavailable.
+
+    Narrower than vision: a model may read images and still reject a raw PDF
+    document part. Kept to the families that accept PDFs natively today
+    (Anthropic Claude 3.5+/4, OpenAI gpt-4o/4.1/5 file inputs, Gemini).
+    """
+    name = _base_model_name(model_name)
+    return any(
+        p in name
+        for p in (
+            "claude-3-5", "claude-3-7", "claude-sonnet", "claude-opus",
+            "claude-haiku", "gpt-4o", "gpt-4.1", "gpt-5", "gemini",
+        )
+    )
+
+
+def _fallback_supports_audio_input(model_name: str) -> bool:
+    """Static heuristic used only when litellm is unavailable.
+
+    Very narrow on purpose: most chat models reject an ``input_audio`` part
+    outright, so guessing ``True`` would trade a silent drop for a hard API
+    error. Only the explicitly audio-capable families are reported.
+    """
+    name = _base_model_name(model_name)
+    if "audio" in name:  # gpt-4o-audio-preview, gpt-audio, ...
+        return True
+    return any(p in name for p in ("gemini-1.5", "gemini-2", "gemini-3", "qwen-audio"))
 
 
 @lru_cache(maxsize=256)
@@ -301,6 +366,89 @@ def supports_prompt_caching(model_name: str) -> bool:
     return _fallback_supports_prompt_caching(model_name)
 
 
+@lru_cache(maxsize=256)
+def supports_vision(model_name: str) -> bool:
+    """Check if a model can accept image parts.
+
+    Uses LiteLLM's ``supports_vision()`` as the primary check, falling back to
+    a static heuristic when litellm is not installed.
+    """
+    if not model_name:
+        return False
+
+    litellm = None
+    try:
+        litellm = _get_litellm()
+        if litellm is None:
+            return _fallback_supports_vision(model_name)
+        if hasattr(litellm, "supports_vision"):
+            return litellm.supports_vision(model=model_name)
+    except Exception:
+        pass
+
+    if litellm is not None:
+        return False
+    return _fallback_supports_vision(model_name)
+
+
+@lru_cache(maxsize=256)
+def supports_pdf_input(model_name: str) -> bool:
+    """Check if a model can accept a PDF document part natively.
+
+    Uses LiteLLM's ``supports_pdf_input()`` (top level or ``litellm.utils``)
+    as the primary check, falling back to a static heuristic when litellm is
+    not installed. Callers that get ``False`` must degrade *visibly* (e.g.
+    extract the PDF's text) rather than dropping the attachment.
+    """
+    if not model_name:
+        return False
+
+    litellm = None
+    try:
+        litellm = _get_litellm()
+        if litellm is None:
+            return _fallback_supports_pdf_input(model_name)
+        fn = getattr(litellm, "supports_pdf_input", None)
+        if fn is None and hasattr(litellm, "utils"):
+            fn = getattr(litellm.utils, "supports_pdf_input", None)
+        if fn is not None:
+            return fn(model=model_name)
+    except Exception:
+        pass
+
+    if litellm is not None:
+        return False
+    return _fallback_supports_pdf_input(model_name)
+
+
+@lru_cache(maxsize=256)
+def supports_audio_input(model_name: str) -> bool:
+    """Check if a model can accept an ``input_audio`` part.
+
+    Uses LiteLLM's ``supports_audio_input()`` as the primary check, falling
+    back to a static heuristic when litellm is not installed.
+    """
+    if not model_name:
+        return False
+
+    litellm = None
+    try:
+        litellm = _get_litellm()
+        if litellm is None:
+            return _fallback_supports_audio_input(model_name)
+        fn = getattr(litellm, "supports_audio_input", None)
+        if fn is None and hasattr(litellm, "utils"):
+            fn = getattr(litellm.utils, "supports_audio_input", None)
+        if fn is not None:
+            return fn(model=model_name)
+    except Exception:
+        pass
+
+    if litellm is not None:
+        return False
+    return _fallback_supports_audio_input(model_name)
+
+
 # Models that support web fetch via LiteLLM (Anthropic only)
 # Web fetch retrieves full content from specific URLs (web pages and PDFs)
 # Source: https://docs.litellm.ai/docs/completion/web_fetch
@@ -408,6 +556,70 @@ def is_reasoning_model(model_name: str) -> bool:
         or model.startswith('o4')
         or model.startswith('gpt-5')
     )
+
+
+@lru_cache(maxsize=256)
+def max_output_tokens(model_name: str):
+    """Best-effort maximum *output* tokens for a model, or ``None`` if unknown.
+
+    Reuses the same LiteLLM ``get_model_info`` lookup already relied on for
+    input/context budgeting (``context/budgeter.py``), so the output budget can
+    be derived from — and clamped to — the resolved model's real ceiling.
+
+    Lazy and dependency-free: returns ``None`` when litellm is unavailable or
+    the model is unknown, letting callers keep their existing constant default.
+
+    Args:
+        model_name: The name of the model to check (with or without provider prefix)
+
+    Returns:
+        Optional[int]: The model's maximum output tokens, or None if unknown.
+    """
+    if not model_name:
+        return None
+
+    litellm = None
+    try:
+        litellm = _get_litellm()
+    except Exception:
+        litellm = None
+    if litellm is None:
+        return None
+
+    # Only ``max_output_tokens`` is a true output ceiling. The generic
+    # ``max_tokens`` field is treated as a context-window limit elsewhere in
+    # this codebase (see ``context/budgeter.py``), so substituting it here would
+    # return an inflated ceiling and leave an over-limit request unclamped —
+    # exactly the 400 this accessor exists to prevent. When output-specific
+    # metadata is absent we return ``None`` and let the caller fall back.
+
+    # Primary: litellm's get_model_info (handles provider inference).
+    if hasattr(litellm, "get_model_info"):
+        try:
+            info = litellm.get_model_info(model=model_name)
+            if info:
+                out = _coerce_output_token_limit(info.get("max_output_tokens"))
+                if out is not None:
+                    return out
+        except Exception:
+            pass
+
+    # Fallback: the model_cost registry the context budgeter reads directly,
+    # which resolves several names get_model_info raises on (e.g. bare
+    # Anthropic ids). Mirrors context/budgeter.py's _litellm_model_info.
+    try:
+        model_cost = getattr(litellm, "model_cost", None)
+        if model_cost:
+            model_lower = model_name.lower()
+            info = model_cost.get(model_lower)
+            if info is None and "/" in model_name:
+                info = model_cost.get(model_name.split("/")[-1].lower())
+            if info:
+                return _coerce_output_token_limit(info.get("max_output_tokens"))
+    except Exception:
+        pass
+
+    return None
 
 
 def is_gemini_internal_tool(tool) -> bool:

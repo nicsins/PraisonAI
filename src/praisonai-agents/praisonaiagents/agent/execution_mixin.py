@@ -22,49 +22,28 @@ logger = logging.getLogger(__name__)
 
 from typing import List, Optional, Any, Dict, Union, Generator, TYPE_CHECKING
 
-# Shared HTTP launch state (Agent.launch() multi-endpoint registration)
-_server_lock = threading.Lock()
-_server_started: Dict[int, bool] = {}
-_registered_agents: Dict[int, Dict[str, str]] = {}
-_shared_apps: Dict[int, Any] = {}
+# Shared HTTP launch state — the process-wide registry is defined in
+# agent/server_registry.py and shared with PraisonAIAgents.launch() so a
+# standalone Agent and a team launched on the same port cannot double-bind it or
+# hide each other's endpoints.
+from .server_registry import _server_registry
 
 
 def cleanup_launch_registration(agent_id: str) -> None:
     """Remove launch() endpoints registered for ``agent_id`` from the shared
     HTTP state that ``Agent.launch()`` actually populates.
 
-    ``Agent.launch()`` writes routes into the module-level ``_registered_agents``
-    and ``_shared_apps`` dicts above. This tears those routes back down so a
-    closed agent's endpoint stops accepting requests and the request handler
-    closure no longer keeps the Agent object graph alive.
+    ``Agent.launch()`` reserves routes on the shared ``_server_registry``. This
+    tears those routes back down so a closed agent's endpoint stops accepting
+    requests and the request handler closure no longer keeps the Agent object
+    graph alive.
+
+    The endpoint-registry removal and the matching FastAPI route teardown are
+    performed together under the registry lock (see
+    ``_AgentServerRegistry.teardown_routes_for``) so cleanup cannot race a
+    concurrent launch that reserves and registers a route on the same port.
     """
-    with _server_lock:
-        for port, paths in list(_registered_agents.items()):
-            stale_paths = [p for p, aid in paths.items() if aid == agent_id]
-            for p in stale_paths:
-                del paths[p]
-                app = _shared_apps.get(port)
-                if app is not None:
-                    try:
-                        # Only drop the agent-owned POST route. launch() always
-                        # registers the handler via ``.post(path)``, so filtering
-                        # on both path AND method preserves unrelated routes that
-                        # share the path with a different verb (e.g. the built-in
-                        # GET /health and GET /).
-                        app.router.routes = [
-                            r for r in app.router.routes
-                            if not (
-                                getattr(r, "path", None) == p
-                                and "POST" in (getattr(r, "methods", None) or set())
-                            )
-                        ]
-                        # Invalidate cached OpenAPI schema so removed routes
-                        # disappear from /openapi.json and /docs.
-                        app.openapi_schema = None
-                    except Exception:
-                        pass
-            if not paths:
-                _registered_agents.pop(port, None)
+    _server_registry.teardown_routes_for(agent_id)
 
 if TYPE_CHECKING:
     pass
@@ -221,8 +200,12 @@ class ExecutionMixin:
                 response = await self.achat(prompt, **kwargs)
                 response_str = str(response) if response else ""
                 
-                # Auto-save session after chat
-                self._auto_save_session()
+                # Auto-save session after chat. Offloaded to a worker thread so
+                # the synchronous FileLock/JSON read-modify-write never stalls
+                # the shared event loop (the session store is a process-wide
+                # singleton, so a blocking write here blocks every concurrent
+                # async agent task on the same loop).
+                await asyncio.to_thread(self._auto_save_session)
                 
                 # Wrap in AutonomyResult for consistent API
                 from .autonomy import AutonomyResult
@@ -297,7 +280,33 @@ class ExecutionMixin:
             raise
         except Exception as exc:  # noqa: BLE001 - normalised into outcome
             return RunOutcome.from_exception(exc)
-        return RunOutcome.completed(output=str(result) if result is not None else None)
+        return self._outcome_for_result(result)
+
+    def _outcome_for_result(self, result):
+        """Map a normally-returned run result into a canonical RunOutcome.
+
+        A run that returned without raising is ``completed`` *unless* the core
+        recorded a provider block/refusal/truncation on ``last_stop_reason`` from
+        the LLM ``finish_reason``/refusal signal — in which case the specific,
+        actionable terminal reason (``content_filtered | refused |
+        length_truncated``) is surfaced instead of a silent empty ``completed``.
+        Any other stop reason (``completed``/``max_steps``/unknown) preserves the
+        existing ``completed`` semantics, so behaviour is unchanged on success.
+        """
+        from .run_outcome import RunOutcome, PROVIDER_BLOCK_REASONS
+        output = str(result) if result is not None else None
+        # Read the recorded classification without letting a lookup problem mask a
+        # provider block as a successful ``completed``. Only an expected
+        # missing-state lookup (``AttributeError``) is treated as "no reason
+        # recorded"; anything else propagates rather than silently succeeding.
+        reason = None
+        try:
+            reason = getattr(self, "last_stop_reason", None)
+        except AttributeError:
+            reason = None
+        if reason in PROVIDER_BLOCK_REASONS:
+            return RunOutcome(reason=reason, output=output)
+        return RunOutcome.completed(output=output)
 
     def run(self, prompt: str, **kwargs: Any) -> Optional[str]:
         """Execute agent silently and return structured result.
@@ -383,7 +392,7 @@ class ExecutionMixin:
             result = executor()
         except BaseException as exc:  # noqa: BLE001 - normalised into outcome
             return RunOutcome.from_exception(exc)
-        return RunOutcome.completed(output=str(result) if result is not None else None)
+        return self._outcome_for_result(result)
 
     def _delegate_to_backend(self, prompt: str, **kwargs) -> Optional[str]:
         """Delegate execution to external managed backend (e.g., ManagedAgentIntegration).
@@ -467,35 +476,19 @@ class ExecutionMixin:
                             extra={"session_id": sid, "managed_session_id": msid},
                             exc_info=True,
                         )
-            self._auto_save_session()
+            # Offload the blocking session write off the event loop.
+            await asyncio.to_thread(self._auto_save_session)
 
         return result
 
     def _execute_backend_sync(self, prompt: str, **kwargs) -> Optional[str]:
         """Execute backend in sync mode, handling async backends."""
-        try:
-            # Try to run in existing event loop
-            loop = asyncio.get_running_loop()
-            # If we're already in an async context, we can't use asyncio.run()
-            # Create a new task instead
-            import concurrent.futures
-            import threading
-            
-            def run_async():
-                new_loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(new_loop)
-                try:
-                    return new_loop.run_until_complete(self.backend.execute(prompt, **kwargs))
-                finally:
-                    new_loop.close()
-            
-            with concurrent.futures.ThreadPoolExecutor() as executor:
-                future = executor.submit(run_async)
-                return future.result()
-                
-        except RuntimeError:
-            # No event loop running, safe to use asyncio.run()
-            return asyncio.run(self.backend.execute(prompt, **kwargs))
+        from ..utils.async_bridge import run_coroutine_from_any_context
+        # Single shared bridge: copies contextvars and surfaces backend errors
+        # unchanged, whether or not an event loop is already running.
+        return run_coroutine_from_any_context(
+            self.backend.execute(prompt, **kwargs), timeout=None
+        )
     
     def _delegate_streaming_to_backend(self, prompt: str, **kwargs):
         """Delegate to backend's streaming method."""
@@ -776,21 +769,32 @@ Write the complete compiled report:"""
         Args:
             new_model: The new model name to switch to (e.g., "gpt-4o", "claude-3-sonnet")
         """
-        # Store the new model name
-        self.llm = new_model
-        
-        # Recreate the LLM instance with the new model
-        try:
-            from ..llm.llm import LLM
-            self._llm_instance = LLM(
-                model=new_model,
-                base_url=self._openai_base_url,
-                api_key=self._openai_api_key,
-            )
-            self._using_custom_llm = True
-        except ImportError:
-            # If LLM class not available, just update the model string
-            pass
+        # Serialise against an in-flight sync model fallback (which also swaps
+        # self.llm / self._unified_dispatcher) so the two can't interleave.
+        with self._get_model_fallback_lock().sync():
+            # Store the new model name
+            self.llm = new_model
+
+            # Drop any cached dispatcher bound to the old model so the next
+            # chat()/achat() rebuilds against new_model. Without this, the
+            # OpenAI path keeps dispatching on the old model even though
+            # self.llm now reads the new name (mirrors _apply_default_llm).
+            if getattr(self, '_unified_dispatcher', None) is not None:
+                self._unified_dispatcher = None
+
+            # Recreate the LLM instance with the new model
+            try:
+                from ..llm.llm import LLM
+                self._llm_instance = LLM(
+                    model=new_model,
+                    base_url=self._openai_base_url,
+                    api_key=self._openai_api_key,
+                )
+                self._using_custom_llm = True
+                self._wire_deferred_history_callback()
+            except ImportError:
+                # If LLM class not available, just update the model string
+                pass
 
     def start(self, prompt: Optional[str] = None, **kwargs: Any) -> Union[str, Generator[str, None, None], None]:
         """Start the agent interactively with verbose output.
@@ -1384,10 +1388,27 @@ Write the complete compiled report:"""
                 )
                 if _verdict.get("stuck"):
                     if _verdict.get("level") == "critical":
-                        return {
-                            "error": _verdict.get("message", "loop detected"),
-                            "loop_blocked": True,
-                        }
+                        # Async parity with the sync path in tool_execution.py:
+                        # route the critical verdict through the unified approval
+                        # pipeline (human override / per-project policy) instead
+                        # of an unconditional hard stop. Use the native async
+                        # helper so an async-only / event-loop-bound approval
+                        # backend runs on *this* loop via ``approve_async``,
+                        # preserving loop-bound resources — the sync bridge would
+                        # otherwise run the backend on a throwaway worker-thread
+                        # loop and turn its failure into a spurious denial.
+                        _approved = await self._doom_loop_approved_async(
+                            function_name, arguments, _verdict,
+                        )
+                        if _approved:
+                            _loop_detection.reset_matching_history(
+                                _ld_history, function_name, arguments
+                            )
+                        else:
+                            return {
+                                "error": _verdict.get("message", "loop detected"),
+                                "loop_blocked": True,
+                            }
                     elif not getattr(self, '_loop_warned_this_turn', False):
                         self._loop_warned_this_turn = True
                         self._pending_self_correction = (
@@ -1523,20 +1544,56 @@ Write the complete compiled report:"""
             ),
         )
 
+        # Bound the worker thread's wait on the async tool by the same per-agent
+        # tool timeout the direct path applies (ToolConfig.timeout, seconds). The
+        # inner coroutine already wraps itself in asyncio.wait_for, but the worker
+        # blocking on future.result() has no bound of its own: if the inner path
+        # hangs (or no timeout is configured) the middleware worker would block a
+        # thread-pool worker indefinitely. Give it a slightly larger grace bound so
+        # the inner wait_for surfaces its structured timeout first when configured.
+        tool_timeout = getattr(self, '_tool_timeout', None)
+        worker_timeout = (tool_timeout + 1.0) if tool_timeout and tool_timeout > 0 else None
+
         def _final_handler(req):
+            import concurrent.futures
             future = asyncio.run_coroutine_threadsafe(
                 self._execute_tool_async_with_retry(
                     req.tool_name, req.arguments, tool_call_id, tools_override
                 ),
                 loop,
             )
-            result = future.result()
+            try:
+                result = future.result(timeout=worker_timeout)
+            except concurrent.futures.TimeoutError:
+                # The scheduled coroutine did not finish within the bound. Request
+                # cancellation on the running loop so it stops rather than leaking,
+                # and surface the same structured timeout error the direct async
+                # path returns (retryable=False: an uncancellable side effect must
+                # not be re-run).
+                future.cancel()
+                logger.warning(
+                    "Middleware async tool '%s' timed out after %ss (agent=%s, run_id=%s, tool_call_id=%s)",
+                    req.tool_name,
+                    tool_timeout,
+                    self.name,
+                    getattr(self, '_current_run_id', 'unknown'),
+                    tool_call_id,
+                )
+                result = {
+                    "error": f"Tool timed out after {tool_timeout}s",
+                    "timeout": True,
+                    "_praison_retryable": False,
+                }
             return ToolResponse(tool_name=req.tool_name, result=result)
 
         def _run_chain():
             return manager.execute_tool_call(request, _final_handler)
 
-        response = await loop.run_in_executor(None, _run_chain)
+        # run_in_executor does not copy ContextVars (unlike asyncio.to_thread);
+        # run the chain in a copy of the caller's context so hooked async tools
+        # still see session identity, cancel state and the handoff chain.
+        import contextvars
+        response = await loop.run_in_executor(None, contextvars.copy_context().run, _run_chain)
         return response.result if isinstance(response, ToolResponse) else response
 
     async def _execute_tool_async_with_retry(self, function_name: str, arguments: Dict[str, Any], tool_call_id: Optional[str] = None, tools_override: Optional[List] = None) -> Any:
@@ -1668,13 +1725,50 @@ Write the complete compiled report:"""
 
             # Policy/guardrail gate (protocol-driven). Mirrors the sync path in
             # _execute_tool_impl so async callers cannot bypass a PolicyEngine
-            # deny or a tool-call guardrail. The check is pure/sync (no awaits).
+            # deny or a tool-call guardrail. A user-supplied guardrail/policy may
+            # do blocking work (an LLM moderation call, a DB/network lookup), so
+            # offload to a worker thread rather than run it inline and stall the
+            # event loop for every other coroutine sharing it.
             check = getattr(self, "_check_tool_policy_and_guardrails", None)
             if check is not None:
-                policy_result = check(function_name, arguments)
+                # ``tools_override`` is threaded through so a run-scoped tool
+                # list cannot bypass the per-tool guardrails its tools declare.
+                policy_result = await asyncio.to_thread(
+                    check, function_name, arguments, tools_override
+                )
                 if isinstance(policy_result, dict):
                     return policy_result  # Error dict
                 _, arguments = policy_result
+
+            # MCP tools first — parity with the sync path (_execute_tool_impl).
+            # Without this an MCP-backed tool call hard-fails via achat()/astart().
+            # Only consult MCP when searching the agent's own tools (no override),
+            # matching the sync path which resolves MCP against self.tools.
+            if tools_override is None:
+                resolve_mcp = getattr(self, "_resolve_mcp_tool_result", None)
+                if resolve_mcp is not None:
+                    found, mcp_result = resolve_mcp(function_name, arguments)
+                    if found:
+                        if inspect.isawaitable(mcp_result):
+                            mcp_result = await mcp_result
+                        # Normalize MCP transport/timeout failures into a native
+                        # error dict — parity with the sync path so an async MCP
+                        # timeout classifies as a retryable failure instead of
+                        # being handed to the model as a bare "Error: ..." string
+                        # that looks like a successful result.
+                        normalize_mcp = getattr(self, "_normalize_mcp_result", None)
+                        if normalize_mcp is not None:
+                            mcp_result = normalize_mcp(mcp_result)
+                        # Tool-result guardrail gate — the native path applies this
+                        # below, but the MCP branch returns early, so gate here too
+                        # or successful MCP output would bypass validation entirely.
+                        # Offloaded to a thread: a user guardrail may block on I/O.
+                        apply_result_guardrails = getattr(self, "_apply_tool_result_guardrails", None)
+                        if apply_result_guardrails is not None:
+                            mcp_result = await asyncio.to_thread(
+                                apply_result_guardrails, function_name, mcp_result
+                            )
+                        return mcp_result
 
             # Try to find the function in the override tools list first, then agent's tools list.
             # Resolve by BaseTool/FunctionTool ``.name`` (instances like BrowserBaseTool or
@@ -1683,7 +1777,10 @@ Write the complete compiled report:"""
             func = None
             tools_to_search = tools_override if tools_override is not None else self.tools
             from ..tools.base import BaseTool
+            plugin_owners = getattr(self, "_plugin_tool_owners", None)
             for tool in tools_to_search:
+                if plugin_owners and not self._is_plugin_tool_active(tool):
+                    continue
                 if isinstance(tool, BaseTool) and getattr(tool, 'name', None) == function_name:
                     func = tool
                     break
@@ -1694,10 +1791,50 @@ Write the complete compiled report:"""
                    (inspect.isclass(tool) and tool.__name__ == function_name):
                     func = tool
                     break
-            
+
+            # Name self-repair — parity with the sync path. A slightly hallucinated
+            # tool name (e.g. 'WebSearch' for 'web_search') is re-matched instead of
+            # hard-failing. Only over the agent's own active tools (no override).
+            if func is None and tools_override is None:
+                repair = getattr(self, "_self_repair_tool_name", None)
+                if repair is not None:
+                    func = repair(function_name)
+
             if func is None:
+                # Corrective, model-readable message with the available tools and a
+                # closest-match hint, mirroring the sync path so the model can retry.
+                available = None
+                if hasattr(self, "_available_active_tool_names"):
+                    try:
+                        available = self._available_active_tool_names()
+                    except Exception:
+                        available = None
+                if available is not None:
+                    suggestion = None
+                    try:
+                        import difflib
+                        near = difflib.get_close_matches(function_name, available, n=1, cutoff=0.5)
+                        suggestion = near[0] if near else None
+                    except Exception:
+                        pass
+                    hint = f" Did you mean '{suggestion}'?" if suggestion else ""
+                    error_msg = f"Tool '{function_name}' not found.{hint} Available tools: {available}"
+                    logging.error(error_msg)
+                    return {"error": error_msg, "available_tools": available}
                 logging.error(f"Function {function_name} not found in tools")
                 return {"error": f"Function {function_name} not found in tools"}
+
+            # Circuit breaker (pre-execution) — parity with the sync path
+            # (_execute_tool_with_circuit_breaker_impl). Without this the async
+            # tool path never engages the per-agent breaker, so a persistently
+            # failing external tool is hammered indefinitely via achat()/astart()
+            # and the model never receives the ``circuit_open`` signal the async
+            # retry loop already checks for. The helpers are pure/sync.
+            breaker_precheck = getattr(self, '_circuit_breaker_precheck', None)
+            if breaker_precheck is not None:
+                open_result = breaker_precheck(function_name)
+                if open_result is not None:
+                    return open_result
 
             # Loop guard (pre-execution) — parity with the sync path in
             # tool_execution.py. The async path previously had no loop-guard or
@@ -1738,6 +1875,21 @@ Write the complete compiled report:"""
 
             from ..streaming.events import tool_progress_channel
 
+            # breaker.acall() records the invocation outcome itself. Both record
+            # sites below then recorded the same failure a SECOND time -- once
+            # off the returned error dict, once in the raised-exception handler
+            # -- so every async tool failure counted twice and the breaker
+            # opened after ceil(threshold/2) calls (3 instead of the configured
+            # 5), out of parity with the sync path. This flag marks that the
+            # breaker already owns the outcome; it stays False when
+            # asyncio.wait_for times out, since the breaker never got a result.
+            #
+            # Declared outside the try: the except handler below reads it, and
+            # roughly seventy lines run between the try and the breaker setup.
+            # An exception in that window would otherwise raise NameError here
+            # and mask the original failure.
+            breaker_saw_outcome = {"done": False}
+
             try:
                 # BaseTool instances (plugin system, e.g. BrowserBaseTool) are not
                 # directly callable — dispatch to their .run() method like the sync path.
@@ -1762,21 +1914,133 @@ Write the complete compiled report:"""
                         call_arguments = dict(arguments)
                         call_arguments["idempotency_key"] = durable_key
 
+                # Establish the injection context (Injected[T] params, including
+                # the cooperative cancel_event) around dispatch so the async path
+                # matches the sync execute_tool path. Without this, a long-running
+                # tool (e.g. shell) executed via achat()/astart() never observes an
+                # interrupt and runs until its own timeout. Built lazily and reused
+                # for both the coroutine and executor branches.
+                from ..tools.injected import with_injection_context
+                _inject_state = None
+                if hasattr(self, "_build_agent_state"):
+                    try:
+                        _inject_state = self._build_agent_state()
+                    except Exception:
+                        _inject_state = None
+
                 async def _invoke():
                     # Set the tool-progress channel BEFORE dispatch so the sink
                     # propagates into the executor thread via contextvars, mirroring
                     # the sync execute_tool path.
                     if inspect.iscoroutinefunction(call_target):
                         logging.debug(f"Executing async function: {function_name}")
+                        if _inject_state is not None:
+                            with with_injection_context(_inject_state), tool_progress_channel(_progress_sink):
+                                return await call_target(**call_arguments)
                         with tool_progress_channel(_progress_sink):
                             return await call_target(**call_arguments)
                     logging.debug(f"Executing sync function in executor: {function_name}")
                     loop = asyncio.get_running_loop()
                     from ..trace.context_events import copy_context_to_callable
+                    # copy_context_to_callable snapshots the CURRENT context (incl.
+                    # the injection contextvar) into the executor thread, so setting
+                    # it here propagates cancel_event to the sync tool body too.
+                    if _inject_state is not None:
+                        with with_injection_context(_inject_state), tool_progress_channel(_progress_sink):
+                            return await loop.run_in_executor(
+                                None, copy_context_to_callable(lambda: call_target(**call_arguments))
+                            )
                     with tool_progress_channel(_progress_sink):
                         return await loop.run_in_executor(
                             None, copy_context_to_callable(lambda: call_target(**call_arguments))
                         )
+
+                # Circuit-breaker parity with the sync path (tool_execution.py).
+                # The async tool path previously had no breaker, so a repeatedly
+                # failing tool could be hammered every turn via achat()/async
+                # workflows. Wrap the invocation through the same per-agent/per-tool
+                # breaker (CircuitBreaker.acall is event-loop safe) so repeated
+                # failures OPEN the circuit and short-circuit further calls. A
+                # CircuitBreakerException is surfaced as an error dict carrying
+                # circuit_open=True, which the retry loop in
+                # _execute_tool_async_with_retry already treats as terminal.
+                breaker = None
+                # Sentinel exception type so the `except` clause below is always a
+                # valid type even when the circuit_breaker module is unavailable
+                # (a never-raised local class never matches a real exception).
+                class _CircuitBreakerException(Exception):
+                    pass
+                try:
+                    from ..tools.circuit_breaker import (
+                        get_circuit_breaker,
+                        CircuitBreakerConfig,
+                        CircuitBreakerException as _CircuitBreakerException,
+                    )
+                    breaker_name = f"tool_{id(self)}_{function_name}"
+                    breaker = get_circuit_breaker(
+                        breaker_name,
+                        CircuitBreakerConfig(
+                            failure_threshold=5,
+                            recovery_timeout=60.0,
+                            timeout=30.0,
+                            graceful_degradation=True,
+                        ),
+                    )
+                    if hasattr(self, "_register_breaker_finalizer"):
+                        self._register_breaker_finalizer(breaker_name)
+                except ImportError:
+                    # Circuit breaker not available - fall back to direct invocation.
+                    logging.debug("Circuit breaker not available on async path, executing directly")
+
+                # Sentinel used to register an error-dict result as a breaker
+                # failure without losing the dict, mirroring the sync path's
+                # _ToolFailure wrapper (tool_execution.py). Approval/permission/
+                # policy/guardrail denials are NOT treated as breaker failures.
+                class _ToolFailure(Exception):
+                    def __init__(self, error_dict):
+                        self.error_dict = error_dict
+                        super().__init__(error_dict.get("error", "Tool execution failed"))
+
+                async def _invoke_for_breaker():
+                    r = await _invoke()
+                    if isinstance(r, dict) and r.get("error") and \
+                       not r.get("approval_denied") and \
+                       not r.get("permission_denied") and \
+                       not r.get("approval_error") and \
+                       not r.get("policy_denied") and \
+                       not r.get("guardrail_denied"):
+                        raise _ToolFailure(r)
+                    return r
+
+                async def _invoke_guarded():
+                    if breaker is None:
+                        return await _invoke()
+                    # Set before the await: acall records an outcome however it
+                    # exits (returning, raising _ToolFailure, or letting a raw
+                    # tool exception through). The only exit that records
+                    # nothing is _CircuitBreakerException, and that path returns
+                    # _circuit_open_result() without reaching either record site.
+                    breaker_saw_outcome["done"] = True
+                    try:
+                        return await breaker.acall(_invoke_for_breaker)
+                    except _ToolFailure as tf:
+                        # Failure was counted by the breaker; return the original dict.
+                        return tf.error_dict
+
+                def _circuit_open_result():
+                    # Record the rejection as a failure so repeated open-circuit
+                    # rejections still feed the loop guard, then surface an error
+                    # dict carrying circuit_open=True — the retry loop in
+                    # _execute_tool_async_with_retry treats it as terminal.
+                    if loop_guard is not None:
+                        loop_guard.record(function_name, arguments, False, result=None)
+                    return {
+                        "error": f"Tool '{function_name}' circuit breaker open - too many recent failures",
+                        "circuit_open": True,
+                        "agent_name": getattr(self, "name", None),
+                        "session_id": getattr(self, "_session_id", None),
+                        "remediation": "Wait for recovery_timeout (60s) or investigate recent tool failures.",
+                    }
 
                 # Apply the per-agent tool timeout (ToolConfig.timeout) so the async
                 # path matches the sync path in tool_execution.py. asyncio.wait_for
@@ -1786,7 +2050,10 @@ Write the complete compiled report:"""
                 tool_timeout = getattr(self, '_tool_timeout', None)
                 if tool_timeout and tool_timeout > 0:
                     try:
-                        result = await asyncio.wait_for(_invoke(), timeout=tool_timeout)
+                        result = await asyncio.wait_for(_invoke_guarded(), timeout=tool_timeout)
+                    except _CircuitBreakerException as cbe:
+                        logging.warning(f"Tool '{function_name}' circuit breaker open: {cbe}")
+                        return _circuit_open_result()
                     except asyncio.TimeoutError:
                         logging.warning(f"Tool {function_name} timed out after {tool_timeout}s")
                         # Mark as non-retryable: asyncio.wait_for cannot cancel a sync
@@ -1797,13 +2064,78 @@ Write the complete compiled report:"""
                         # Fall through (not return) so the loop guard records this
                         # timeout as a failure — repeated timeouts must accumulate
                         # toward the BLOCK/HALT thresholds like any other failure.
+                        #
+                        # A timeout cancels the awaited ``_invoke_guarded``; the
+                        # cancellation surfaces inside ``breaker.acall`` as
+                        # ``asyncio.CancelledError`` (a BaseException, not
+                        # Exception), so ``acall`` never ran ``_on_failure`` for
+                        # it. The fall-through breaker-record block below only
+                        # runs when ``breaker is None``, so without recording it
+                        # here a repeatedly timing-out tool would never open the
+                        # circuit. Record the one failure directly on the breaker
+                        # (the block below stays disabled, so it is counted once).
+                        if breaker is not None:
+                            try:
+                                breaker._on_failure()
+                            except Exception:
+                                logging.debug(
+                                    "Failed to record tool timeout on circuit breaker",
+                                    exc_info=True,
+                                )
                         result = {
                             "error": f"Tool timed out after {tool_timeout}s",
                             "timeout": True,
                             "_praison_retryable": False,
                         }
                 else:
-                    result = await _invoke()
+                    try:
+                        result = await _invoke_guarded()
+                    except _CircuitBreakerException as cbe:
+                        logging.warning(f"Tool '{function_name}' circuit breaker open: {cbe}")
+                        return _circuit_open_result()
+
+                # Circuit breaker (post-execution) — record the outcome so
+                # repeated failures open the breaker, mirroring the sync path's
+                # breaker.call. Approval/permission/policy/guardrail denials are
+                # NOT counted as tool failures (same exclusions the sync wrapper
+                # applies in _execute_tool_with_circuit_breaker_impl), so a gated
+                # tool never trips the breaker.
+                #
+                # Only when the breaker wrapper did not already run. When
+                # ``breaker`` is set, ``breaker.acall`` above has already called
+                # _on_success/_on_failure for this invocation, and recording
+                # again counted every outcome twice -- halving the configured
+                # failure_threshold (a breaker set to 5 opened after 3) and, on
+                # the success side, closing a HALF_OPEN circuit in half the
+                # required successes.
+                breaker_record = (
+                    getattr(self, '_circuit_breaker_record', None)
+                    if breaker is None else None
+                )
+                if breaker_record is not None:
+                    is_breaker_failure = (
+                        isinstance(result, dict)
+                        and result.get("error")
+                        and not result.get("approval_denied")
+                        and not result.get("permission_denied")
+                        and not result.get("approval_error")
+                        and not result.get("policy_denied")
+                        and not result.get("guardrail_denied")
+                    )
+                    breaker_record(function_name, not is_breaker_failure)
+
+                # Tool-result guardrail gate (protocol-driven) — parity with the
+                # sync path in tool_execution.py. Runs on the raw result before it
+                # re-enters the LLM context so a guardrail can inspect or redact
+                # unsafe tool output. Fail-closed. Zero overhead when unset.
+                # Offloaded to a thread: a user guardrail may block on I/O (an LLM
+                # moderation call, a network lookup), which would otherwise stall
+                # the event loop for every other coroutine sharing it.
+                apply_result_guardrails = getattr(self, "_apply_tool_result_guardrails", None)
+                if apply_result_guardrails is not None:
+                    result = await asyncio.to_thread(
+                        apply_result_guardrails, function_name, result, tools_override
+                    )
 
                 # Loop guard (post-execution) — record the outcome and surface a
                 # block/halt decision back to the model on this same turn, mirroring
@@ -1834,6 +2166,22 @@ Write the complete compiled report:"""
 
             except Exception as e:
                 logging.error(f"Error executing {function_name}: {str(e)}", exc_info=True)
+                # Circuit breaker (failure on raised exception) — a raised tool
+                # exception is a failure just like an error-dict result, and the
+                # sync path's ``breaker.call`` counts it. Approval/permission/
+                # policy/guardrail denials surface as error dicts (handled
+                # above), not raises, so this path only ever sees genuine tool
+                # failures.
+                #
+                # Again only when the breaker wrapper did not run: ``acall``
+                # records the failure and re-raises, so the exception arriving
+                # here has already been counted once.
+                breaker_record = (
+                    getattr(self, '_circuit_breaker_record', None)
+                    if breaker is None else None
+                )
+                if breaker_record is not None:
+                    breaker_record(function_name, False)
                 # Record the failed invocation so repeated identical failures
                 # accumulate toward the loop-guard BLOCK/HALT thresholds — a raised
                 # tool exception is a failure just like an error-dict result on the
@@ -1910,18 +2258,13 @@ Write the complete compiled report:"""
         NOTE: This implementation will be moved to wrapper layer in future version.
         For now, it maintains backward compatibility while following lazy import patterns.
         """
-        global _server_started, _registered_agents, _shared_apps, _server_lock
-
         from .launch_security import authorise_launch_request, resolve_launch_host
 
         # Try to import FastAPI dependencies - lazy loading
         try:
-            import uvicorn
-            from fastapi import FastAPI, HTTPException, Request
+            from fastapi import HTTPException, Request
             from fastapi.responses import JSONResponse
             from pydantic import BaseModel
-            import threading
-            import time
             import asyncio
             
             # Define the request model here since we need pydantic
@@ -1947,130 +2290,102 @@ Write the complete compiled report:"""
         # process-wide launch token and retroactively 401 a running endpoint.
         host = resolve_launch_host(host)
 
-        should_start = False
-        with _server_lock:
-            # Initialize port-specific collections if needed (once per port)
-            if port not in _registered_agents:
-                _registered_agents[port] = {}
+        # Get or create the shared FastAPI app for this port (shared with
+        # PraisonAIAgents.launch via the same _server_registry singleton).
+        app, is_new_app = _server_registry.get_or_create_app(
+            port,
+            title=f"PraisonAI Agents API (Port {port})",
+        )
 
-            # Initialize shared FastAPI app if not already created for this port
-            if _shared_apps.get(port) is None:
-                _shared_apps[port] = FastAPI(
-                    title=f"PraisonAI Agents API (Port {port})",
-                    description="API for interacting with PraisonAI Agents"
+        if is_new_app:
+            # Add a root endpoint with a welcome message
+            @app.get("/")
+            async def root():
+                return {
+                    "message": f"Welcome to PraisonAI Agents API on port {port}. See /docs for usage.",
+                    "endpoints": _server_registry.list_routes(port)
+                }
+
+            # Add healthcheck endpoint
+            @app.get("/health")
+            async def healthcheck():
+                return {
+                    "status": "ok",
+                    "endpoints": _server_registry.list_routes(port)
+                }
+
+        # Normalize path to ensure it starts with /
+        if not path.startswith('/'):
+            path = f'/{path}'
+
+        # Atomically reserve the route; on collision the registry returns a
+        # de-duplicated path so multiple agents can share a single port.
+        path, original_path = _server_registry.reserve_route(port, path, self.agent_id)
+        if original_path is not None:
+            logging.warning(f"Path '{original_path}' is already registered on port {port}.")
+            print(f"⚠️ Warning: Path '{original_path}' is already registered on port {port}.")
+            print(f"🔄 Using '{path}' instead")
+
+        # Define the endpoint handler
+        @app.post(path)
+        async def handle_agent_query(request: Request, query_data: Optional[AgentQuery] = None):
+            if not authorise_launch_request(request):
+                raise HTTPException(status_code=401, detail="Unauthorized")
+            # Handle both direct JSON with query field and form data
+            if query_data is None:
+                try:
+                    request_data = await request.json()
+                    if "query" not in request_data:
+                        raise HTTPException(status_code=400, detail="Missing 'query' field in request")
+                    query = request_data["query"]
+                except Exception:
+                    # Fallback to form data or query params
+                    form_data = await request.form()
+                    if "query" in form_data:
+                        query = form_data["query"]
+                    else:
+                        raise HTTPException(status_code=400, detail="Missing 'query' field in request")
+            else:
+                query = query_data.query
+
+            try:
+                # Use async version if available, otherwise use sync version
+                if asyncio.iscoroutinefunction(self.chat):
+                    response = await self.achat(query, task_name=None, task_description=None, task_id=None)
+                else:
+                    # Run sync function in a thread to avoid blocking
+                    loop = asyncio.get_running_loop()
+                    response = await loop.run_in_executor(None, lambda p=query: self.chat(p))
+
+                return {"response": response}
+            except Exception as e:
+                logging.error(f"Error processing query: {str(e)}", exc_info=True)
+                return JSONResponse(
+                    status_code=500,
+                    content={"error": f"Error processing query: {str(e)}"}
                 )
 
-                # Add a root endpoint with a welcome message
-                @_shared_apps[port].get("/")
-                async def root():
-                    return {
-                        "message": f"Welcome to PraisonAI Agents API on port {port}. See /docs for usage.",
-                        "endpoints": list(_registered_agents[port].keys())
-                    }
+        # Invalidate the cached OpenAPI schema so routes registered by later
+        # shared-port launch() calls still show up in /openapi.json and /docs.
+        # FastAPI caches app.openapi_schema on first access and does not
+        # regenerate it when new routes are added afterwards.
+        app.openapi_schema = None
 
-                # Add healthcheck endpoint
-                @_shared_apps[port].get("/health")
-                async def healthcheck():
-                    return {
-                        "status": "ok",
-                        "endpoints": list(_registered_agents[port].keys())
-                    }
+        print(f"🚀 Agent '{self.name}' available at http://{host}:{port}")
 
-            # The path registration below must run on EVERY call, not just when the
-            # port is new, so multiple agents can share a single port.
-
-            # Normalize path to ensure it starts with /
-            if not path.startswith('/'):
-                path = f'/{path}'
-
-            # Check if path is already registered for this port
-            if path in _registered_agents[port]:
-                logging.warning(f"Path '{path}' is already registered on port {port}. Please use a different path.")
-                print(f"⚠️ Warning: Path '{path}' is already registered on port {port}.")
-                # Use a modified path to avoid conflicts
-                original_path = path
-                path = f"{path}_{self.agent_id[:6]}"
-                logging.warning(f"Using '{path}' instead of '{original_path}'")
-                print(f"🔄 Using '{path}' instead")
-
-            # Register the agent to this path
-            _registered_agents[port][path] = self.agent_id
-
-            # Define the endpoint handler
-            @_shared_apps[port].post(path)
-            async def handle_agent_query(request: Request, query_data: Optional[AgentQuery] = None):
-                if not authorise_launch_request(request):
-                    raise HTTPException(status_code=401, detail="Unauthorized")
-                # Handle both direct JSON with query field and form data
-                if query_data is None:
-                    try:
-                        request_data = await request.json()
-                        if "query" not in request_data:
-                            raise HTTPException(status_code=400, detail="Missing 'query' field in request")
-                        query = request_data["query"]
-                    except Exception:
-                        # Fallback to form data or query params
-                        form_data = await request.form()
-                        if "query" in form_data:
-                            query = form_data["query"]
-                        else:
-                            raise HTTPException(status_code=400, detail="Missing 'query' field in request")
-                else:
-                    query = query_data.query
-
-                try:
-                    # Use async version if available, otherwise use sync version
-                    if asyncio.iscoroutinefunction(self.chat):
-                        response = await self.achat(query, task_name=None, task_description=None, task_id=None)
-                    else:
-                        # Run sync function in a thread to avoid blocking
-                        loop = asyncio.get_running_loop()
-                        response = await loop.run_in_executor(None, lambda p=query: self.chat(p))
-
-                    return {"response": response}
-                except Exception as e:
-                    logging.error(f"Error processing query: {str(e)}", exc_info=True)
-                    return JSONResponse(
-                        status_code=500,
-                        content={"error": f"Error processing query: {str(e)}"}
-                    )
-
-            # Invalidate the cached OpenAPI schema so routes registered by later
-            # shared-port launch() calls still show up in /openapi.json and /docs.
-            # FastAPI caches app.openapi_schema on first access and does not
-            # regenerate it when new routes are added afterwards.
-            _shared_apps[port].openapi_schema = None
-
-            print(f"🚀 Agent '{self.name}' available at http://{host}:{port}")
-
-            # Check and mark server as started atomically to prevent race conditions
-            should_start = not _server_started.get(port, False)
-            if should_start:
-                _server_started[port] = True
-
-        # Server start/wait outside the lock to avoid holding it during sleep
-        if should_start:
-            # Start the server in a separate thread
-            def run_server():
-                try:
-                    print(f"✅ FastAPI server started at http://{host}:{port}")
-                    print(f"📚 API documentation available at http://{host}:{port}/docs")
-                    print(f"🔌 Available endpoints: {', '.join(list(_registered_agents[port].keys()))}")
-                    uvicorn.run(_shared_apps[port], host=host, port=port, log_level="debug" if debug else "info")
-                except Exception as e:
-                    logging.error(f"Error starting server: {str(e)}", exc_info=True)
-                    print(f"❌ Error starting server: {str(e)}")
-
-            # Run server in a background thread
-            server_thread = threading.Thread(target=run_server, daemon=True)
-            server_thread.start()
-
-            # Wait for a moment to allow the server to start and register endpoints
-            self._safe_sleep(0.5)
-        else:
-            # If server is already running, wait a moment to make sure the endpoint is registered
-            self._safe_sleep(0.1)
-            print(f"🔌 Available endpoints on port {port}: {', '.join(list(_registered_agents[port].keys()))}")
+        # Start the shared server for this port if it is not already running.
+        # start_server_if_needed atomically checks-and-marks the port and blocks
+        # on the registry's readiness Event (configurable via
+        # PRAISONAI_SERVER_READY_TIMEOUT) instead of a heuristic sleep, matching
+        # PraisonAIAgents.launch().
+        started = _server_registry.start_server_if_needed(
+            port, host, log_level="debug" if debug else "info"
+        )
+        endpoints = _server_registry.list_routes(port)
+        if started:
+            print(f"✅ FastAPI server started at http://{host}:{port}")
+            print(f"📚 API documentation available at http://{host}:{port}/docs")
+        print(f"🔌 Available endpoints on port {port}: {', '.join(endpoints)}")
 
         # Get the stack frame to check if this is the last launch() call in the script
         import inspect

@@ -87,6 +87,10 @@ def __getattr__(name):
             from .model_capabilities import supports_streaming_with_tools
             _lazy_cache[name] = supports_streaming_with_tools
             return supports_streaming_with_tools
+        elif name == "max_output_tokens":
+            from .model_capabilities import max_output_tokens
+            _lazy_cache[name] = max_output_tokens
+            return max_output_tokens
         elif name == "ModelRouter":
             from .model_router import ModelRouter
             _lazy_cache[name] = ModelRouter
@@ -219,6 +223,10 @@ def __getattr__(name):
             from .error_classifier import classify_error
             _lazy_cache[name] = classify_error
             return classify_error
+        elif name == "resolve_provider":
+            from .model_providers import resolve_provider
+            _lazy_cache[name] = resolve_provider
+            return resolve_provider
 
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
@@ -239,6 +247,7 @@ __all__ = [
     "process_stream_chunks",
     "supports_structured_outputs",
     "supports_streaming_with_tools",
+    "max_output_tokens",
     "ModelRouter",
     "ModelProfile",
     "TaskComplexity",
@@ -278,5 +287,7 @@ __all__ = [
     "sanitize_text",
     # Error Classification (G5)
     "ErrorCategory",
-    "classify_error"
+    "classify_error",
+    # Model-name → provider-id resolution
+    "resolve_provider",
 ]

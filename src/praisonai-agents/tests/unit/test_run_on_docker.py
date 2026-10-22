@@ -13,7 +13,6 @@ Everything that needs a live daemon is marked, so it is skipped loudly rather
 than passing quietly when Docker is not running.
 """
 
-import shutil
 import subprocess
 
 import pytest
@@ -24,19 +23,34 @@ from praisonaiagents.agent.placement import managed_runtimes, tool_places
 
 
 def _docker_running() -> bool:
-    if not shutil.which("docker"):
-        return False
+    """Ask the PRODUCT whether docker is usable, not a probe of our own.
+
+    This used to run `docker version --format {{.Server.Version}}` with a 25s
+    timeout. The runtime asks the docker provider's `is_available`, which runs
+    `docker version` with a 5s timeout. On a cold CI runner those disagree: the
+    test's probe succeeds, the test runs, and the runtime then refuses with
+    "run_on='docker' cannot start: docker is not available on this machine".
+
+    A guard that can disagree with the thing it is guarding is not a guard.
+    Gating on the same answer means these tests skip exactly when the runtime
+    would refuse, and run exactly when it would not.
+    """
     try:
-        return subprocess.run(
-            ["docker", "version", "--format", "{{.Server.Version}}"],
-            capture_output=True, timeout=25,
-        ).returncode == 0
+        from praisonaiagents.managed._compute_bridge import resolve_compute
+
+        # Exactly what ComputeManagedAgent._ensure does, including how it reads
+        # is_available (a property on one provider, a method on another).
+        provider = resolve_compute("docker")
+        available = getattr(provider, "is_available", True)
+        available = available() if callable(available) else available
+        return available is not False
     except Exception:
+        # Cannot even resolve the provider: the runtime could not either.
         return False
 
 
 needs_docker = pytest.mark.skipif(
-    not _docker_running(), reason="needs a running Docker daemon"
+    not _docker_running(), reason="needs a Docker daemon the runtime agrees is available"
 )
 
 
@@ -293,10 +307,12 @@ def test_a_hosted_backend_reclaims_its_instance_when_collected():
     instance kept billing until the provider's own idle timer noticed, which
     docker and flyio do not have."""
     import gc
+    import threading
 
     from praisonai.integrations.compute_managed_agent import ComputeManagedAgent
 
     released = []
+    release_done = threading.Event()
 
     class Fake:
         provider_name = "fake"
@@ -312,6 +328,7 @@ def test_a_hosted_backend_reclaims_its_instance_when_collected():
 
         async def shutdown(self, instance_id):
             released.append(instance_id)
+            release_done.set()
 
     import asyncio
 
@@ -323,6 +340,7 @@ def test_a_hosted_backend_reclaims_its_instance_when_collected():
 
     del backend
     gc.collect()
+    assert release_done.wait(5), "the background instance release did not complete"
     assert released == ["inst-1"], "the instance outlived the backend that owned it"
 
 
@@ -346,17 +364,57 @@ def test_release_reclaims_even_on_an_event_loop_thread():
     ever runs, silently leaking the instance -- so _release must bridge the loop
     the way SharedCompute does, not call asyncio.run() directly."""
     import asyncio
+    import threading
 
     from praisonai.integrations.compute_managed_agent import _release
 
     released = []
+    release_done = threading.Event()
 
     class Fake:
         async def shutdown(self, instance_id):
             released.append(instance_id)
+            release_done.set()
 
     async def collect_on_the_loop():
         _release(Fake(), "inst-loop", "docker")
+        assert await asyncio.to_thread(release_done.wait, 5), "background release did not complete"
 
     asyncio.run(collect_on_the_loop())
     assert released == ["inst-loop"], "an instance leaked when GC ran on a live loop"
+
+
+def test_release_returns_before_a_slow_provider_finishes():
+    """A live event loop must remain runnable while the cloud teardown waits."""
+    import asyncio
+    import threading
+
+    from praisonai.integrations.compute_managed_agent import _release
+
+    started = threading.Event()
+    allow_completion = threading.Event()
+    completed = threading.Event()
+    released = []
+
+    class Fake:
+        async def shutdown(self, instance_id):
+            started.set()
+            try:
+                assert await asyncio.to_thread(allow_completion.wait, 5)
+                released.append(instance_id)
+            finally:
+                completed.set()
+
+    async def collect_on_the_loop():
+        try:
+            _release(Fake(), "slow-instance", "docker")
+            assert await asyncio.to_thread(started.wait, 5)
+            assert not completed.is_set(), "release blocked the caller until teardown ended"
+            # This caller's loop can still advance before permitting teardown.
+            await asyncio.sleep(0)
+        finally:
+            allow_completion.set()
+            assert await asyncio.to_thread(completed.wait, 5)
+
+    asyncio.run(collect_on_the_loop())
+    assert released == ["slow-instance"]

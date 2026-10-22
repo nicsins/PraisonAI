@@ -133,12 +133,23 @@ _LAZY_IMPORTS = {
     'resolve_harness': ('praisonaiagents.model_harness.profiles', 'resolve_harness'),
     'register_profile': ('praisonaiagents.model_harness.profiles', 'register_profile'),
 
+    # Test doubles - drive an Agent offline and keep real requests out of a suite
+    'ScriptedModel': ('praisonaiagents.model_harness.scripted', 'ScriptedModel'),
+    'ScriptExhausted': ('praisonaiagents.model_harness.scripted', 'ScriptExhausted'),
+    'allow_model_requests': ('praisonaiagents.model_harness.guard', 'allow_model_requests'),
+    'no_model_requests': ('praisonaiagents.model_harness.guard', 'no_model_requests'),
+    'ModelRequestBlocked': ('praisonaiagents.model_harness.guard', 'ModelRequestBlocked'),
+
     # Run outcomes - typed validation and agent execution results
     'AgentRunOutcome': ('praisonaiagents.run_outcome', 'AgentRunOutcome'),
     'RunStatus': ('praisonaiagents.run_outcome', 'RunStatus'),
     'TerminationReason': ('praisonaiagents.run_outcome', 'TerminationReason'),
     'termination_to_run_status': ('praisonaiagents.run_outcome', 'termination_to_run_status'),
     'validate_decision_string': ('praisonaiagents.run_outcome', 'validate_decision_string'),
+    'RunTerminal': ('praisonaiagents.run_outcome', 'RunTerminal'),
+    'merge_run_terminal': ('praisonaiagents.run_outcome', 'merge_run_terminal'),
+    'is_sticky': ('praisonaiagents.run_outcome', 'is_sticky'),
+    'collapse': ('praisonaiagents.run_outcome', 'collapse'),
     
     # Main display utilities (imports rich)
     'TaskOutput': ('praisonaiagents.main', 'TaskOutput'),
@@ -216,10 +227,25 @@ _LAZY_IMPORTS = {
     'aembed': ('praisonaiagents.embedding.embed', 'aembed'),
     'EmbeddingResult': ('praisonaiagents.embedding.result', 'EmbeddingResult'),
     'get_dimensions': ('praisonaiagents.embedding.dimensions', 'get_dimensions'),
+
+    # System One / Jev decision models (Ollama /v1/systemone)
+    'system_one': ('praisonaiagents.decisions', 'system_one'),
+    'asystem_one': ('praisonaiagents.decisions', 'asystem_one'),
+    'SystemOneResult': ('praisonaiagents.decisions', 'SystemOneResult'),
+    'choice_question': ('praisonaiagents.decisions', 'choice_question'),
+    'noul_question': ('praisonaiagents.decisions', 'noul_question'),
+    'score_question': ('praisonaiagents.decisions', 'score_question'),
+    'is_decision_model': ('praisonaiagents.decisions', 'is_decision_model'),
+    'DecisionRoutePlan': ('praisonaiagents.decisions', 'DecisionRoutePlan'),
+    'DecisionTriageRouter': ('praisonaiagents.decisions', 'DecisionTriageRouter'),
+    'triaged_start': ('praisonaiagents.decisions', 'triaged_start'),
+    'triage_decision': ('praisonaiagents.decisions', 'triage_decision'),
+    'default_ticket_triage_questions': ('praisonaiagents.decisions', 'default_ticket_triage_questions'),
     
     # Guardrails
     'GuardrailResult': ('praisonaiagents.guardrails', 'GuardrailResult'),
     'LLMGuardrail': ('praisonaiagents.guardrails', 'LLMGuardrail'),
+    'GuardrailRetry': ('praisonaiagents.guardrails', 'GuardrailRetry'),
     
     # Approval (agent-centric approval backends)
     'AutoApproveBackend': ('praisonaiagents.approval.backends', 'AutoApproveBackend'),

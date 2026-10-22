@@ -20,8 +20,19 @@ import { UNKNOWN } from "../format.ts";
  *  asserted below, so a new function key cannot be added without a sample. */
 const SAMPLES: Readonly<Record<string, () => string>> = {
   bootFailed: () => en.bootFailed("no storage"),
+  engineNotReady: () => en.engineNotReady("ECONNREFUSED"),
+  settingRejected: () => en.settingRejected("Engine address"),
+  settingRejectedExample: () =>
+    en.settingRejectedExample("Engine address", "http://192.168.1.10:8765"),
+  settingInactive: () => en.settingInactive("Engine", "remote-http"),
+  secretStored: () => en.secretStored("OpenAI API key"),
+  secretCleared: () => en.secretCleared("OpenAI API key"),
   chatUnreadable: () => en.chatUnreadable("chat-7"),
   chatsAllUnreadable: () => en.chatsAllUnreadable(3),
+  chatUpdated: () => en.chatUpdated("Trip plan", "2h ago"),
+  deleteChat: () => en.deleteChat("Trip plan"),
+  deleteChatConfirm: () => en.deleteChatConfirm("Trip plan"),
+  chatDeleted: () => en.chatDeleted("Trip plan"),
   minutesAgo: () => en.minutesAgo(2, "2"),
   hoursAgo: () => en.hoursAgo(2, "2"),
   daysAgo: () => en.daysAgo(2, "2"),
@@ -30,6 +41,7 @@ const SAMPLES: Readonly<Record<string, () => string>> = {
   durationHoursMinutes: () => en.durationHoursMinutes("1", "02"),
   draftingTool: () => en.draftingTool("bash"),
   droppedEvents: () => en.droppedEvents(2, ["wrong_msg_id"]),
+    droppedReason: () => en.droppedReason("wrong_msg_id"),
   toolStatus: () => en.toolStatus("unresolved"),
   toolRowName: () => en.toolRowName("failed", "search", "1.2s"),
   approvalQuestion: () => en.approvalQuestion("bash"),
@@ -74,6 +86,18 @@ test("the table reproduces the literals that are hardcoded at render sites today
   assert.equal(en.routeSettings, "Settings");
   assert.equal(en.chatsEmpty, "No conversations yet.");
   assert.equal(en.emptyTranscript, "Ask something to begin.");
+  // The empty chat screen's own copy. Pinned like the rest: these are the two
+  // sentences a new user reads before anything else in the product, and they
+  // were reviewed as copy rather than typed into a render site.
+  assert.equal(en.emptyNeedsKeyTitle, "Add an API key to start");
+  assert.equal(
+    en.emptyNeedsKeyBody,
+    "PraisonAI answers using your own OpenAI account. Paste a key in Settings and this chat is ready.",
+  );
+  assert.equal(
+    en.emptyAbout,
+    "PraisonAI answers questions, explains things, and works through tasks with you.",
+  );
   assert.equal(en.crashed, "Something went wrong. Your conversations are saved.");
   assert.equal(en.bootFailed("no storage"), "PraisonAI could not start: no storage");
 });
@@ -96,6 +120,9 @@ test("no string is blank and no parameterised string drops its argument", () => 
   assert.ok(en.chatUnreadable("chat-7").includes("chat-7"));
   assert.ok(en.errorRowName("auth", "bad key").includes("bad key"));
   assert.ok(en.droppedEvents(2, ["wrong_msg_id"]).includes("wrong_msg_id"));
+  // The refusal has to NAME the setting: the field it belongs to may already
+  // be off screen, and "that value was refused" alone says which of nothing.
+  assert.ok(en.settingRejected("Engine address").includes("Engine address"));
 });
 
 test("every sample corresponds to a key that still exists", () => {
@@ -161,4 +188,66 @@ test("an unmeasured duration is spoken as words, not as an em dash", () => {
   const unmeasured = en.toolRowName("ok", "search", null);
   assert.equal(unmeasured.includes(UNKNOWN), false);
   assert.ok(/unknown/i.test(unmeasured), unmeasured);
+});
+
+// ---- gap 7: a dropped event says what happened ------------------------------
+
+test("a dropped reason reads as a sentence, not a machine tag", () => {
+  // A user seeing `wrong_msg_id` learns nothing at all. This is the whole gap.
+  assert.match(en.droppedReason("wrong_msg_id"), /different message/);
+  assert.match(en.droppedReason("unparseable_json"), /not valid JSON/);
+});
+
+test("the machine tag is KEPT alongside the sentence", () => {
+  // Translating the tag away would make the one searchable string in the
+  // message unsearchable for whoever the user reports it to.
+  const text = en.droppedEvents(1, ["wrong_msg_id"]);
+  assert.match(text, /\[wrong_msg_id\]/, "the tag must survive");
+  assert.match(text, /different message/, "and so must the explanation");
+});
+
+test("an unknown reason passes through rather than becoming 'unknown'", () => {
+  // A newer engine can invent one, and the tag is still the thing worth
+  // reporting -- replacing it with a generic phrase destroys the only
+  // information in the message.
+  assert.equal(en.droppedReason("some_future_reason"), "some_future_reason");
+});
+
+test("no reasons means no trailing punctuation", () => {
+  // The pair for the formatting: a dangling ":" reads as a truncated message.
+  const text = en.droppedEvents(2, []);
+  assert.ok(!text.includes(":"), text);
+  assert.ok(!text.includes("["), text);
+});
+
+test("every reason the decoder can produce has a sentence", () => {
+  // The exhaustiveness that matters: a reason with no words falls back to its
+  // tag, which is safe but is the gap reappearing one enum member at a time.
+  const REASONS = [
+    "unparseable_json", "not_an_object", "missing_type", "unknown_event",
+    "missing_msg_id", "missing_required_field", "empty_text",
+    "before_start", "wrong_msg_id", "after_terminal",
+  ];
+  for (const reason of REASONS) {
+    assert.notEqual(en.droppedReason(reason), reason, `${reason} has no sentence`);
+  }
+});
+
+test("the key guidance says what to do, and names where", () => {
+  // The two facts it has to carry. Without the first it is a diagnosis; without
+  // the second the user is left hunting for the screen that takes a key -- and
+  // "Settings" is the word on the button they will be looking for once they get
+  // there. Asserted on the SENSE rather than the exact sentence so the copy can
+  // be reworded without the guarantee going quiet.
+  assert.match(en.emptyNeedsKeyTitle, /key/i);
+  assert.match(en.emptyNeedsKeyBody, /settings/i);
+  // And it must not be the raw provider sentence it replaces.
+  assert.equal(en.emptyNeedsKeyBody.includes("OPENAI_API_KEY"), false);
+});
+
+test("an empty chat with a key set is not told to get a key", () => {
+  // The pair. A welcome that mentioned a key would put the app's one blocking
+  // requirement in front of a user who has already met it.
+  assert.equal(/api key/i.test(`${en.emptyTranscript} ${en.emptyAbout}`), false);
+  assert.notEqual(en.emptyAbout.trim(), en.emptyNeedsKeyBody.trim());
 });

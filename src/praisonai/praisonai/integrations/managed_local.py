@@ -28,6 +28,7 @@ import re
 import shlex
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -57,6 +58,7 @@ _DEFAULT_TOOLS = [
     "search_web",
 ]
 
+from ._managed_base import ManagedBackendBase
 from ._tool_aliases import TOOL_ALIAS_MAP
 
 
@@ -198,7 +200,7 @@ def _build_custom_tool_fn(
     return _custom_fn
 
 
-class LocalManagedAgent:
+class LocalManagedAgent(ManagedBackendBase):
     """Provider-agnostic local managed agent backend.
 
     Satisfies ``ManagedBackendProtocol`` (Core SDK).  Uses PraisonAI's own
@@ -256,6 +258,15 @@ class LocalManagedAgent:
 
         # Internal agent (lazy)
         self._inner_agent: Any = None
+
+        # Guards check-then-create of the inner agent and the session (which
+        # mutates _session_history and writes it to disk via _persist_state()).
+        # execute() offloads the sync body to a thread-pool executor, so a shared
+        # instance can be entered concurrently; without this two threads both
+        # build an inner Agent, or both mutate _session_history mid-serialisation
+        # and corrupt the persisted JSON. threading.Lock is non-reentrant, so
+        # _ensure_session resolves the agent before taking the lock.
+        self._resource_lock = threading.Lock()
 
         # Session store: explicit > db-adapter > lazy default
         self._session_store: Any = None
@@ -720,63 +731,80 @@ class LocalManagedAgent:
             raise RuntimeError(f"pip install error in compute for {pip_pkgs}: {e}") from e
 
     def _ensure_agent(self) -> Any:
-        """Create or return the inner PraisonAI Agent."""
+        """Create or return the inner PraisonAI Agent (double-checked locking)."""
         if self._inner_agent is not None:
             return self._inner_agent
 
-        self._install_packages()
+        with self._resource_lock:
+            if self._inner_agent is not None:
+                return self._inner_agent
 
-        from praisonaiagents import Agent
+            self._install_packages()
 
-        model = self._resolve_model()
-        tools = self._resolve_tools()
-        system = self._cfg.get("system", self.instructions)
-        name = self._cfg.get("name", "Agent")
+            from praisonaiagents import Agent
 
-        agent_kwargs: Dict[str, Any] = {
-            "name": name,
-            "instructions": system,
-            "llm": model,
-            "tools": tools,
-        }
+            model = self._resolve_model()
+            tools = self._resolve_tools()
+            system = self._cfg.get("system", self.instructions)
+            name = self._cfg.get("name", "Agent")
 
-        # Pass API key and base directly to the inner agent instead of mutating
-        # the process-global environment. os.environ.setdefault() would let the
-        # first agent's credentials win for the whole process and leak into every
-        # subprocess spawned thereafter, cross-contaminating other tenants.
-        if self.api_key:
-            agent_kwargs["api_key"] = self.api_key
-        if self.api_base:
-            agent_kwargs["base_url"] = self.api_base
+            agent_kwargs: Dict[str, Any] = {
+                "name": name,
+                "instructions": system,
+                "llm": model,
+                "tools": tools,
+            }
 
-        self._inner_agent = Agent(**agent_kwargs)
-        self.agent_id = self.agent_id or f"agent_{uuid.uuid4().hex[:12]}"
-        self.environment_id = self.environment_id or f"env_{uuid.uuid4().hex[:12]}"
-        logger.info("[local_managed] agent created: %s model=%s", self.agent_id, model)
-        return self._inner_agent
+            # Pass API key and base directly to the inner agent instead of mutating
+            # the process-global environment. os.environ.setdefault() would let the
+            # first agent's credentials win for the whole process and leak into every
+            # subprocess spawned thereafter, cross-contaminating other tenants.
+            if self.api_key:
+                agent_kwargs["api_key"] = self.api_key
+            if self.api_base:
+                agent_kwargs["base_url"] = self.api_base
+
+            self._inner_agent = Agent(**agent_kwargs)
+            self.agent_id = self.agent_id or f"agent_{uuid.uuid4().hex[:12]}"
+            self.environment_id = self.environment_id or f"env_{uuid.uuid4().hex[:12]}"
+            logger.info("[local_managed] agent created: %s model=%s", self.agent_id, model)
+            return self._inner_agent
 
     def _ensure_session(self) -> str:
-        """Create a session ID if not set."""
+        """Create a session ID if not set.
+
+        Creates the inner agent *before* persisting the session so ``agent_id``
+        and ``environment_id`` are populated in the first persisted snapshot.
+        The shared ``ManagedBackendBase.stream`` calls ``_ensure_session`` ahead
+        of ``_iter_events``; without this the local backend would persist an
+        orphaned session with null IDs, and a subsequent ``_ensure_agent``
+        failure would leave that incomplete state behind.
+        """
         if self._session_id:
             return self._session_id
-        self._session_id = f"session_{uuid.uuid4().hex[:12]}"
-        self._session_history.append({
-            "id": self._session_id,
-            "status": "idle",
-            "title": self._cfg.get("session_title", "PraisonAI local session"),
-            "created_at": time.time(),
-        })
-        self._persist_state()
-        logger.info("[local_managed] session created: %s", self._session_id)
-        return self._session_id
+        # Build the inner agent *before* taking the lock: _ensure_agent acquires
+        # _resource_lock itself and threading.Lock is non-reentrant.
+        self._ensure_agent()
+        with self._resource_lock:
+            if self._session_id:
+                return self._session_id
+            self._session_id = f"session_{uuid.uuid4().hex[:12]}"
+            self._session_history.append({
+                "id": self._session_id,
+                "status": "idle",
+                "title": self._cfg.get("session_title", "PraisonAI local session"),
+                "created_at": time.time(),
+            })
+            self._persist_state()
+            logger.info("[local_managed] session created: %s", self._session_id)
+            return self._session_id
 
     # ------------------------------------------------------------------
     # execute() — ManagedBackendProtocol
     # ------------------------------------------------------------------
     async def execute(self, prompt: str, **kwargs) -> str:
         """Execute prompt locally and return full response."""
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, self._execute_sync, prompt)
+        return await self._execute_in_executor(self._execute_sync, prompt, **kwargs)
 
     def _sync_usage(self) -> None:
         """Sync token usage from inner agent to managed backend counters."""
@@ -852,51 +880,30 @@ class LocalManagedAgent:
                 emitter.agent_end(agent_name)
 
     # ------------------------------------------------------------------
-    # stream() — ManagedBackendProtocol
+    # stream() — ManagedBackendProtocol (via ManagedBackendBase)
     # ------------------------------------------------------------------
-    async def stream(self, prompt: str, **kwargs) -> AsyncIterator[str]:
-        """Yield text chunks as the agent produces them."""
-        import queue
-        import threading
+    def _iter_events(self, session_id: str, prompt: str):
+        """Yield text chunks from the local ``Agent.chat`` loop.
 
-        loop = asyncio.get_running_loop()
-        q: queue.Queue[Optional[str]] = queue.Queue()
+        Runs on ``ManagedBackendBase.stream``'s producer thread. Ensures the
+        inner agent exists and persists the user turn before streaming.
+        """
+        agent = self._ensure_agent()
+        self._persist_message("user", prompt)
+        gen = agent.chat(prompt, stream=True)
+        if hasattr(gen, '__iter__'):
+            for chunk in gen:
+                if chunk:
+                    yield str(chunk)
+        elif gen:
+            yield str(gen)
 
-        def _producer():
-            full = ""
-            try:
-                agent = self._ensure_agent()
-                self._ensure_session()
-                self._persist_message("user", prompt)
-                gen = agent.chat(prompt, stream=True)
-                if hasattr(gen, '__iter__'):
-                    for chunk in gen:
-                        if chunk:
-                            text = str(chunk)
-                            q.put(text)
-                            full += text
-                else:
-                    if gen:
-                        text = str(gen)
-                        q.put(text)
-                        full = text
-            except Exception as e:
-                logger.error("[local_managed] stream error: %s", e)
-            finally:
-                if full:
-                    self._persist_message("assistant", full)
-                self._sync_usage()
-                self._persist_state()
-                q.put(None)
-
-        thread = threading.Thread(target=_producer, daemon=True)
-        thread.start()
-
-        while True:
-            chunk = await loop.run_in_executor(None, q.get)
-            if chunk is None:
-                break
-            yield chunk
+    def _after_stream(self, full: str) -> None:
+        """Persist the assembled assistant turn + usage after streaming."""
+        if full:
+            self._persist_message("assistant", full)
+        self._sync_usage()
+        self._persist_state()
 
     # ------------------------------------------------------------------
     # Session management — ManagedBackendProtocol

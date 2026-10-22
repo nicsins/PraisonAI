@@ -18,6 +18,45 @@ import itertools
 import pytest
 
 from praisonaiagents import Agent, AgentFlow, AgentTeam, Task
+
+
+@pytest.fixture(autouse=True)
+def _no_live_provider(monkeypatch):
+    """Keep these off the network.
+
+    Every test here drives a real turn (chat/achat/_start_stream/team.start)
+    only to prove the placement hook ran first, and each already tolerates the
+    turn failing -- "no API key, a stubbed model, an outright error". What they
+    did not do is stop the call going out, so on any machine with a key
+    exported they made real billed requests to the provider. Pointing the
+    endpoint at a closed local port fails the turn instantly and locally, which
+    is exactly the downstream outcome the assertions are written against.
+    """
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-not-a-real-key-for-tests")
+    for var in ("OPENAI_BASE_URL", "OPENAI_API_BASE"):
+        monkeypatch.setenv(var, "http://127.0.0.1:1/v1")
+
+    # Redirecting the endpoint alone is not enough. A refused connection is
+    # treated as retryable, so a single achat("hi") spends ~54 seconds backing
+    # off before giving up -- long enough that this module reads as a hang and
+    # stalls the whole `pytest tests/unit` run. The assertions only need the
+    # turn to fail, not to fail slowly, so refuse at the client seam instead.
+    from praisonaiagents.llm import openai_client as _oc
+
+    def _refuse(*args, **kwargs):
+        raise ConnectionError("provider disabled for unit tests")
+
+    async def _arefuse(*args, **kwargs):
+        raise ConnectionError("provider disabled for unit tests")
+
+    for name in ("create_completion", "chat_completion_with_tools",
+                 "chat_completion_with_tools_stream"):
+        if hasattr(_oc.OpenAIClient, name):
+            monkeypatch.setattr(_oc.OpenAIClient, name, _refuse, raising=False)
+    if hasattr(_oc.OpenAIClient, "achat_completion_with_tools"):
+        monkeypatch.setattr(
+            _oc.OpenAIClient, "achat_completion_with_tools", _arefuse, raising=False
+        )
 from praisonaiagents.agent.execution_location import describe
 from praisonaiagents.agent.placement import (
     managed_runtimes,
@@ -49,9 +88,24 @@ def test_a_name_in_both_sets_is_valid_for_both_parameters():
         assert _agent(tools_run_on=name) is not None, f"tools_run_on={name!r} must work"
 
 
-def test_the_two_scopes_of_one_place_are_reported_differently():
-    """Overlap is only safe if the object still says which scope you chose."""
-    whole = describe(_agent(run_on="docker"))
+def test_the_two_scopes_are_reported_differently():
+    """The object must still say which scope you chose.
+
+    This was written as "the two scopes of ONE place" and used docker for both.
+    That premise no longer holds: run_on= now rejects docker outright ("runs
+    commands but cannot host an agent loop"), and managed_runtimes() and
+    tool_places() currently share no member at all -- the intersection is
+    empty, so no single place can be passed to both parameters. The property
+    worth guarding is unchanged, so each scope is exercised with a place that
+    is valid for it.
+    """
+    whole_place = next(iter(managed_runtimes()))
+    assert whole_place not in tool_places(), (
+        "a place valid for both scopes now exists -- restore the single-place "
+        "form of this test, which is the stronger check"
+    )
+
+    whole = describe(_agent(run_on=whole_place))
     tools_only = describe(_agent(tools_run_on="docker"))
 
     assert whole["thinks_on"] == whole["tools_run_on"], "run_on moves the thinking too"
@@ -130,6 +184,46 @@ def test_a_plain_agent_is_untouched():
     agent = _agent()
     assert agent.tools_run_on is None
     assert agent._tools_sandbox is None
+
+
+# ── the default path pays nothing for placement it never asked for ────────────
+def test_the_default_path_runs_no_registry_lookups(monkeypatch):
+    """The whole point of the deferral: with neither run_on= nor tools_run_on=,
+    resolve_placement must not touch managed_runtimes() or tool_places() -- the
+    latter scans entry points and is the dominant cost of a warm Agent(). A
+    later refactor that hoists the lookups back to the top would leave every
+    validation test green while silently restoring that overhead; this bites."""
+    import praisonaiagents.agent.placement as placement
+
+    calls = []
+    monkeypatch.setattr(placement, "managed_runtimes",
+                        lambda: calls.append("managed") or ("anthropic",))
+    monkeypatch.setattr(placement, "tool_places",
+                        lambda: calls.append("places") or ["local"])
+
+    placement.resolve_placement("Agent")
+    assert calls == [], f"the default path performed lookups: {calls}"
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"run_on": "anthropic"},
+    {"tools_run_on": "subprocess"},
+])
+def test_a_named_placement_still_runs_the_lookups(monkeypatch, kwargs):
+    """Deferral must not become suppression: as soon as a placement is named,
+    validation needs the real registries, so both must be consulted."""
+    import praisonaiagents.agent.placement as placement
+
+    calls = []
+    monkeypatch.setattr(placement, "managed_runtimes",
+                        lambda: calls.append("managed") or ("anthropic",))
+    monkeypatch.setattr(placement, "tool_places",
+                        lambda: calls.append("places") or ["local", "subprocess"])
+
+    placement.resolve_placement("Agent", **kwargs)
+    assert "managed" in calls and "places" in calls, (
+        f"a named placement skipped a lookup: {calls}"
+    )
 
 
 def _team(**kw):

@@ -20,6 +20,9 @@ html{font-size:calc(16px * var(--ui-scale,1))}
 .confirm-box p{margin:0 0 1rem;font-size:.88rem;line-height:1.5}
 .confirm-box .row{display:flex;gap:.5rem;justify-content:flex-end}
 .confirm-box .ok.danger{background:var(--bad)}
+.confirm-box .txt{width:100%;box-sizing:border-box;margin:0 0 1rem;background:var(--ground);
+  color:var(--ink);border:1px solid var(--rule);border-radius:6px;padding:.4rem .55rem;
+  font:inherit;font-size:.88rem}
 .updbar .updx{font-size:.72rem;padding:.25rem .6rem}
 /* In normal flow above the composer. Fixed-position at bottom:18px put it
    directly on top of the text field -- and a composer that grows to ten
@@ -347,9 +350,94 @@ button.stop{background:var(--bad)}
    Same tokens as chat, same centred column. A training view that invented its
    own palette would read as a bolted-on second app, which is exactly what it
    must not be: it is the same product doing a different job. */
-#train{flex:1;overflow-y:auto;padding:1.5rem 0;display:none}
-#train.on{display:block}
+#train,#channels,#gateway,#knowledge,#images,#video,#studio{flex:1;overflow-y:auto;padding:1.5rem 0;display:none}
+#train.on,#channels.on,#gateway.on,#knowledge.on,#images.on,#video.on,#studio.on{display:block}
 body.training #thread,body.training #f{display:none}
+body.view-channels #thread,body.view-channels #f,body.view-channels #train,body.view-channels #gateway,body.view-channels #knowledge,body.view-channels #images,body.view-channels #video,body.view-channels #studio{display:none}
+body.view-channels #channels{display:block}
+body.view-gateway #thread,body.view-gateway #f,body.view-gateway #train,body.view-gateway #channels,body.view-gateway #knowledge,body.view-gateway #images,body.view-gateway #video,body.view-gateway #studio{display:none}
+body.view-gateway #gateway{display:block}
+body.view-knowledge #thread,body.view-knowledge #f,body.view-knowledge #train,body.view-knowledge #channels,body.view-knowledge #gateway,body.view-knowledge #images,body.view-knowledge #video,body.view-knowledge #studio{display:none}
+body.view-knowledge #knowledge{display:block}
+body.view-images #thread,body.view-images #f,body.view-images #train,body.view-images #channels,body.view-images #gateway,body.view-images #knowledge,body.view-images #video,body.view-images #studio{display:none}
+body.view-images #images{display:block}
+body.view-video #thread,body.view-video #f,body.view-video #train,body.view-video #channels,body.view-video #gateway,body.view-video #knowledge,body.view-video #images,body.view-video #studio{display:none}
+body.view-video #video{display:block}
+body.studio #thread,body.studio #f,body.studio #train,body.studio #channels,body.studio #gateway,body.studio #knowledge,body.studio #images,body.studio #video{display:none}
+body.studio #studio{display:block}
+body.studio .inner.studio-wrap{max-width:52rem}
+.imgpreview{max-width:min(100%,42rem);border-radius:10px;border:1px solid var(--rule);margin-top:1rem;display:block}
+.mediagrid{display:flex;flex-wrap:wrap;gap:.5rem;margin-top:.75rem}
+.mediagrid img,.mediagrid video{max-width:10rem;max-height:10rem;object-fit:cover;border-radius:6px;border:1px solid var(--rule)}
+.onboard-back{position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:90;
+  display:flex;align-items:center;justify-content:center;padding:1.5rem}
+.onboard{max-width:28rem;width:min(28rem,100%);padding:1rem 1.2rem;border:1px solid var(--rule);
+  border-radius:.65rem;background:var(--panel);text-align:left;
+  box-shadow:0 18px 48px rgba(0,0,0,.45);max-height:90vh;overflow:auto}
+.onboard h3{margin:0 0 .5rem;font-size:1rem}
+.onboard p{margin:0 0 .8rem;font-size:.82rem;color:var(--soft);line-height:1.5}
+.onboard input{width:100%;margin:.35rem 0 .6rem}
+.onboard .obStepLbl{font-size:.72rem;color:var(--soft);margin:0 0 .6rem}
+.onboard .obenv{margin:.4rem 0 .8rem;padding-left:1.1rem;font-size:.78rem;color:var(--soft)}
+.onboard code{font-size:.76rem;color:var(--accent)}
+.chlist{display:flex;flex-direction:column;gap:.5rem;margin:.6rem 0}
+.chrow{display:flex;align-items:center;gap:.6rem;padding:.55rem .65rem;border:1px solid var(--rule);
+  border-radius:.45rem;background:var(--panel)}
+.chrow .nm{font-weight:650;flex:1;min-width:0}
+.chrow .meta{font-size:.72rem;color:var(--soft)}
+.chrow .st{font-size:.68rem;padding:.15rem .45rem;border-radius:999px;border:1px solid var(--rule)}
+.chrow .st.run{color:var(--accent);border-color:var(--accent)}
+.chlog{max-height:28vh;overflow:auto;font-size:.72rem;font-family:ui-monospace,Menlo,monospace;
+  background:var(--code);border-radius:.4rem;padding:.5rem;margin-top:.6rem;white-space:pre-wrap}
+.studio-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:.75rem .9rem}
+@media(max-width:48rem){.studio-grid{grid-template-columns:1fr 1fr}}
+@media(max-width:32rem){.studio-grid{grid-template-columns:1fr}}
+.studio-grid-2{grid-template-columns:1fr 1fr}
+.studio-grid.mt-sm{margin-top:.35rem}
+.studio-grid.mt-md{margin-top:.75rem}
+.studio-credhint{margin:0 0 .5rem}
+.studio-row{display:flex;flex-wrap:wrap;align-items:flex-end;gap:.65rem .75rem;margin-bottom:.75rem}
+.studio-row .tf{flex:1;min-width:10rem;margin:0}
+.studio-prompt{width:100%;min-height:5.25rem;resize:vertical;background:var(--ground);color:var(--ink);
+  border:1px solid var(--rule);border-radius:.45rem;padding:.55rem .65rem;font:inherit;font-size:.88rem;line-height:1.55}
+.studio-prompt:focus{outline:none;border-color:var(--accent);
+  box-shadow:0 0 0 3px color-mix(in srgb,var(--accent) 18%,transparent)}
+.studio-notice{font-size:.72rem;color:var(--soft);line-height:1.45;margin:.55rem 0 0;padding:.55rem .65rem;
+  background:var(--code);border:1px solid var(--rule);border-radius:.45rem}
+.studio-notice.warn{border-color:color-mix(in srgb,var(--accent) 35%,var(--rule))}
+.studio-actions{display:flex;flex-wrap:wrap;gap:.45rem .55rem;margin-top:.85rem;align-items:center}
+.studio-actions .tbtn{min-width:9rem}
+.studio-actions .tbtn.primary{flex:none}
+.studio-status{font-size:.78rem;color:var(--soft);margin-top:.65rem;min-height:1.25em}
+.studio-status.busy{color:var(--accent)}
+.studio-status.err{color:var(--bad)}
+.studio-jobs-list{display:flex;flex-direction:column;gap:.45rem;min-height:2.5rem}
+.studio-jobs-list:empty::before{content:"No active jobs — generate an image or video above.";
+  font-size:.78rem;color:var(--soft);opacity:.75}
+.studio-job{display:flex;flex-wrap:wrap;align-items:flex-start;gap:.35rem .65rem;padding:.55rem .65rem;
+  border:1px solid var(--rule);border-radius:.45rem;background:var(--ground);font-size:.78rem}
+.studio-job .jprompt{flex:1;min-width:8rem;color:var(--ink);line-height:1.4}
+.studio-job .jerr{width:100%;font-size:.72rem;color:var(--bad);margin-top:.15rem;word-break:break-word}
+.studio-assets-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(11.5rem,1fr));gap:.65rem;
+  max-height:22rem;overflow-y:auto;padding:.15rem 0}
+.studio-assets-grid:empty::before{content:"Generated clips and images appear here.";
+  grid-column:1/-1;font-size:.78rem;color:var(--soft);opacity:.75;padding:.5rem 0}
+.studio-asset{border:1px solid var(--rule);border-radius:.5rem;padding:.5rem .55rem;font-size:.72rem;
+  background:var(--ground);display:flex;flex-direction:column;gap:.35rem}
+.studio-asset .ameta{color:var(--soft);line-height:1.35}
+.studio-asset .ameta b{color:var(--ink);font-weight:650;text-transform:capitalize}
+.studio-asset video,.studio-asset img{width:100%;max-height:10rem;object-fit:contain;border-radius:.35rem;
+  background:var(--code);margin-top:.15rem}
+.studio-card{margin-bottom:.85rem}
+.studio-card-hd{display:flex;align-items:baseline;justify-content:space-between;gap:.75rem;margin-bottom:.65rem}
+.studio-card-hd .sectlbl{margin:0;padding:0}
+.studio-adv{margin-top:.65rem;border:1px solid var(--rule);border-radius:.45rem;padding:.45rem .65rem .65rem}
+.studio-adv summary{cursor:pointer;font-size:.72rem;color:var(--soft);font-weight:650;user-select:none;list-style:none}
+.studio-adv summary::-webkit-details-marker{display:none}
+.studio-adv[open] summary{margin-bottom:.55rem}
+.ctool-link{background:none;border:0;color:var(--accent);cursor:pointer;font:inherit;font-size:.78rem;
+  padding:.25rem 0;text-decoration:underline;text-underline-offset:2px}
+.ctool-link:hover{color:var(--ink)}
 .trainhd{display:flex;align-items:baseline;gap:.6rem;margin:0 0 .2rem}
 .trainhd h2{font-size:1.05rem;margin:0;font-weight:650}
 .trainhd p{margin:0;color:var(--soft);font-size:.78rem}
@@ -434,6 +522,18 @@ body.training #thread,body.training #f{display:none}
               aria-controls="thread"><span class="ic" aria-hidden="true">▫</span>Chat</button>
       <button class="navbtn" id="viewTrain" type="button" role="tab" aria-selected="false"
               aria-controls="train"><span class="ic" aria-hidden="true">◩</span>Train</button>
+      <button class="navbtn" id="viewChannels" type="button" role="tab" aria-selected="false"
+              aria-controls="channels"><span class="ic" aria-hidden="true">◎</span>Channels</button>
+      <button class="navbtn" id="viewGateway" type="button" role="tab" aria-selected="false"
+              aria-controls="gateway"><span class="ic" aria-hidden="true">⬡</span>Gateway</button>
+      <button class="navbtn" id="viewKnowledge" type="button" role="tab" aria-selected="false"
+              aria-controls="knowledge"><span class="ic" aria-hidden="true">▣</span>Knowledge</button>
+      <button class="navbtn" id="viewImages" type="button" role="tab" aria-selected="false"
+              aria-controls="images"><span class="ic" aria-hidden="true">◻</span>Images</button>
+      <button class="navbtn" id="viewVideo" type="button" role="tab" aria-selected="false"
+              aria-controls="video"><span class="ic" aria-hidden="true">▷</span>Video</button>
+      <button class="navbtn" id="viewStudio" type="button" role="tab" aria-selected="false"
+              aria-controls="studio"><span class="ic" aria-hidden="true">▶</span>Studio</button>
     </div>
     <div class="sidetop">
       <button class="navbtn" id="newchat" type="button"><span class="ic" aria-hidden="true">✎</span>New chat<span class="k" data-chord="N"></span></button>
@@ -463,6 +563,8 @@ body.training #thread,body.training #f{display:none}
             aria-label="Attach a file">+</button>
     <button class="ctool on" id="toolsBtn" type="button" title="Tools enabled"
             aria-pressed="true">⚒ Tools</button>
+    <button class="ctool" id="knowledgeBtn" type="button" title="Use indexed knowledge"
+            aria-pressed="false">▣ Knowledge</button>
     <span class="grow"></span>
     <button id="send" disabled title="Send" aria-label="Send message">↑</button>
     <button id="stop" class="stop is-hidden" type="button">Stop</button>
@@ -484,6 +586,14 @@ body.training #thread,body.training #f{display:none}
               <span class="hint">A Hugging Face id.</span>
             </div>
             <div class="tf">
+              <label for="tRunOn">Run on</label>
+              <select id="tRunOn" name="run_on">
+                <option value="local" selected>This computer</option>
+                <option value="remote">A remote server</option>
+              </select>
+              <span class="hint" id="tRunOnHint">Needs an NVIDIA GPU.</span>
+            </div>
+            <div class="tf">
               <label for="tMethod">Method</label>
               <select id="tMethod" name="method">
                 <option value="sft" selected>SFT — supervised fine-tuning</option>
@@ -496,6 +606,21 @@ body.training #thread,body.training #f{display:none}
                 <option value="cpo">CPO — contrastive preference</option>
               </select>
               <span class="hint" id="tMethodHint">Trains on completions.</span>
+            </div>
+            <div class="tf remote-only is-hidden">
+              <label for="tRemoteHost">SSH host</label>
+              <input id="tRemoteHost" name="remote_host" placeholder="gpubox"/>
+              <span class="hint">An alias from your ~/.ssh/config.</span>
+            </div>
+            <div class="tf remote-only is-hidden">
+              <label for="tRemotePython">Remote python</label>
+              <input id="tRemotePython" name="remote_python" value="python3"/>
+              <span class="hint">Interpreter on that machine.</span>
+            </div>
+            <div class="tf remote-only is-hidden">
+              <label for="tRemoteWorkdir">Remote directory</label>
+              <input id="tRemoteWorkdir" name="remote_workdir" value="~/.praisonai-train"/>
+              <span class="hint">Where the run works. Created if absent.</span>
             </div>
             <div class="tf">
               <label for="tDataset">Dataset</label>
@@ -583,6 +708,234 @@ body.training #thread,body.training #f{display:none}
         </div>
       </div>
     </section>
+    <section id="channels" role="tabpanel" aria-labelledby="viewChannels" aria-label="Channels">
+      <div class="inner">
+        <div class="trainhd">
+          <h2>Channels</h2>
+          <p>Telegram, Slack, and Discord. Tokens use env: refs from ~/.praisonai/.env</p>
+        </div>
+        <form id="chAddForm" class="tcard">
+          <div class="tgrid">
+            <div class="tf">
+              <label for="chPlatform">Platform</label>
+              <select id="chPlatform" name="platform">
+                <option value="telegram">Telegram</option>
+                <option value="slack">Slack</option>
+                <option value="discord">Discord</option>
+              </select>
+            </div>
+            <div class="tf">
+              <label for="chName">Name</label>
+              <input id="chName" name="name" placeholder="My bot"/>
+            </div>
+            <div class="tf">
+              <label for="chToken">Token ref</label>
+              <input id="chToken" name="token_ref" placeholder="env:TELEGRAM_BOT_TOKEN"/>
+            </div>
+            <div class="tf" id="chAppTokenWrap">
+              <label for="chAppToken">Slack app token ref</label>
+              <input id="chAppToken" name="app_token_ref" placeholder="env:SLACK_APP_TOKEN"/>
+            </div>
+          </div>
+          <div class="trow">
+            <button class="tbtn" type="submit">Add channel</button>
+          </div>
+          <p class="tnote" id="chError" role="alert"></p>
+        </form>
+        <div class="tcard">
+          <div class="sectlbl">Your channels</div>
+          <div id="chList" class="chlist"></div>
+          <div class="sectlbl">Channel log</div>
+          <pre class="chlog" id="chLog">Select a channel and click “View log”.</pre>
+        </div>
+      </div>
+    </section>
+    <section id="knowledge" role="tabpanel" aria-labelledby="viewKnowledge" aria-label="Knowledge">
+      <div class="inner">
+        <div class="trainhd">
+          <h2>Knowledge (RAG)</h2>
+          <p>Index a folder of documents, then enable “Use knowledge” in chat.</p>
+        </div>
+        <div class="tcard">
+          <div class="tf">
+            <label for="knPaths">Folder paths (one per line)</label>
+            <textarea id="knPaths" rows="3" placeholder="C:\Users\you\Documents\my-docs"></textarea>
+          </div>
+          <div class="trow">
+            <button class="tbtn" id="knSave" type="button">Save folders</button>
+            <button class="tbtn" id="knIndex" type="button">Build index</button>
+            <button class="tbtn ghost" id="knTest" type="button">Test retrieval</button>
+          </div>
+          <p class="meta" id="knStatus">Not configured</p>
+          <pre class="chlog" id="knSnippet" hidden></pre>
+          <p class="tnote" id="knError" role="alert"></p>
+        </div>
+      </div>
+    </section>
+    <section id="images" role="tabpanel" aria-labelledby="viewImages" aria-label="Image generation">
+      <div class="inner">
+        <div class="trainhd">
+          <h2>Image generation</h2>
+          <p>Create images with DALL·E (OpenAI API key in Settings or ~/.praisonai/.env).</p>
+        </div>
+        <div class="tcard">
+          <p class="meta">For MiniMax, set MINIMAX_API_KEY in the engine environment.</p>
+          <div class="tf">
+            <label for="imgPrompt">Prompt</label>
+            <textarea id="imgPrompt" rows="3" placeholder="A watercolor lighthouse at sunset"></textarea>
+          </div>
+          <div class="tgrid">
+            <div class="tf">
+              <label for="imgModel">Model</label>
+              <select id="imgModel"><option value="dall-e-3" selected>dall-e-3</option>
+                <option value="dall-e-2">dall-e-2</option>
+                <option value="minimax/image-01">MiniMax image-01</option></select>
+            </div>
+            <div class="tf">
+              <label for="imgSize">Size</label>
+              <select id="imgSize"><option value="1024x1024" selected>1024×1024</option>
+                <option value="1792x1024">1792×1024</option><option value="1024x1792">1024×1792</option></select>
+            </div>
+          </div>
+          <div class="trow">
+            <button class="tbtn" id="imgGen" type="button">Generate image</button>
+          </div>
+          <p class="tnote" id="imgError" role="alert"></p>
+          <img class="imgpreview" id="imgPreview" alt="" hidden/>
+          <div class="mediagrid" id="imgRecent"></div>
+        </div>
+      </div>
+    </section>
+    <section id="video" role="tabpanel" aria-labelledby="viewVideo" aria-label="Video generation">
+      <div class="inner">
+        <div class="trainhd">
+          <h2>Video generation</h2>
+          <p id="vidHint">Optional: set REPLICATE_API_TOKEN in ~/.praisonai/.env (Replicate minimax/video-01).</p>
+        </div>
+        <div class="tcard">
+          <div class="tf">
+            <label for="vidModel">Model</label>
+            <select id="vidModel"></select>
+          </div>
+          <div class="tf">
+            <label for="vidPrompt">Prompt</label>
+            <textarea id="vidPrompt" rows="3" placeholder="A drone shot over coastal cliffs at golden hour"></textarea>
+          </div>
+          <div class="trow">
+            <button class="tbtn" id="vidGen" type="button">Generate video</button>
+          </div>
+          <p class="tnote" id="vidError" role="alert"></p>
+          <video class="imgpreview" id="vidPreview" controls hidden></video>
+        </div>
+      </div>
+    </section>
+    <section id="gateway" role="tabpanel" aria-labelledby="viewGateway" aria-label="Gateway">
+      <div class="inner">
+        <div class="trainhd">
+          <h2>Multi-bot gateway</h2>
+          <p>Run Telegram, Slack, and Discord together on port 8765. Stop individual bots first.</p>
+        </div>
+        <div class="tcard">
+          <div class="trow">
+            <span class="pill" id="gwState">stopped</span>
+            <span class="meta" id="gwMeta"></span>
+            <span class="grow"></span>
+            <button class="tbtn" id="gwStart" type="button">Start gateway</button>
+            <button class="tbtn danger" id="gwStop" type="button" hidden>Stop gateway</button>
+          </div>
+          <p class="tnote" id="gwError" role="alert"></p>
+          <div class="chlog" id="gwLog" hidden></div>
+        </div>
+      </div>
+    </section>
+    <section id="studio" role="tabpanel" aria-labelledby="viewStudio" aria-label="Creative Studio">
+      <div class="inner studio-wrap">
+        <div class="trainhd">
+          <h2>Creative Studio</h2>
+          <p>Projects, prompts, image &amp; video generation, timeline export.</p>
+        </div>
+        <div class="tcard studio-card">
+          <div class="studio-row">
+            <div class="tf">
+              <label for="sProject">Project</label>
+              <select id="sProject"></select>
+            </div>
+            <button type="button" class="tbtn ghost" id="sNewProject">New project</button>
+            <button type="button" class="tbtn ghost" id="sRefresh">Refresh</button>
+          </div>
+          <p class="hint studio-credhint" id="sCredHint">Set API keys in Settings.</p>
+          <div class="tf">
+            <label for="sPrompt">Prompt</label>
+            <textarea id="sPrompt" class="studio-prompt" rows="4" placeholder="Describe the shot…"></textarea>
+          </div>
+          <details class="studio-adv">
+            <summary>Image settings (testing &amp; keyframes)</summary>
+            <div class="studio-grid mt-sm">
+              <div class="tf">
+                <label for="sImageModel">Image model</label>
+                <select id="sImageModel"></select>
+              </div>
+              <div class="tf">
+                <label for="sImageQuality">Quality</label>
+                <select id="sImageQuality">
+                  <option value="low" selected>Low (testing)</option>
+                  <option value="medium">Medium</option>
+                  <option value="high">High</option>
+                </select>
+              </div>
+              <div class="tf">
+                <label for="sImageSize">Size</label>
+                <select id="sImageSize">
+                  <option value="1024x1024" selected>1024×1024</option>
+                  <option value="1536x1024">1536×1024</option>
+                  <option value="1024x1536">1024×1536</option>
+                </select>
+              </div>
+            </div>
+            <div class="studio-notice warn" id="sImageCost" hidden></div>
+          </details>
+          <div class="studio-grid studio-grid-2 mt-md">
+            <div class="tf">
+              <label for="sModel">Video model</label>
+              <select id="sModel"></select>
+            </div>
+            <div class="tf">
+              <label for="sRef">First-frame image</label>
+              <select id="sRef"><option value="">— none —</option></select>
+            </div>
+            <div class="tf">
+              <label for="sSeconds">Duration (sec)</label>
+              <input id="sSeconds" type="number" min="4" max="16" value="8"/>
+            </div>
+            <div class="tf">
+              <label for="sVariants">Variations</label>
+              <input id="sVariants" type="number" min="1" max="4" value="1"/>
+            </div>
+          </div>
+          <div class="studio-actions">
+            <button type="button" id="sGenerateImage" class="tbtn primary">Generate image</button>
+            <button type="button" id="sGenerate" class="tbtn ghost">Generate video</button>
+            <button type="button" id="sUploadRef" class="tbtn ghost">Upload reference</button>
+            <input type="file" id="sFileIn" accept="image/*" class="is-hidden"/>
+            <button type="button" id="sExport" class="tbtn ghost">Export timeline</button>
+          </div>
+          <div id="sStatus" class="studio-status" role="status" aria-live="polite"></div>
+        </div>
+        <div class="tcard studio-card">
+          <div class="studio-card-hd">
+            <div class="sectlbl">Jobs</div>
+          </div>
+          <div class="studio-jobs-list" id="sJobs" aria-live="polite"></div>
+        </div>
+        <div class="tcard studio-card">
+          <div class="studio-card-hd">
+            <div class="sectlbl">Assets &amp; timeline</div>
+            <span class="hint" id="sTimelineMeta">0 clips</span>
+          </div>
+          <div class="studio-assets-grid" id="sAssets"></div>
+        </div>
+      </div>
+    </section>
   </main>
 </div>
 <div id="overlay"><div class="panel" id="panel"></div></div>
@@ -627,12 +980,14 @@ const clampNum = (min, max) => (v) =>
 const SETTINGS = [
   // ---- Models -------------------------------------------------------------
   { key: "model", section: "model", label: "Default model",
-    description: "Any OpenAI-compatible model id. New chats use this.",
+    description: "Any OpenAI-compatible model id. New chats use this. A provider-prefixed id (anthropic/…, gemini/…, ollama/…) routes through litellm to that provider — set its API key in the environment, or run Ollama locally. For an OpenAI-compatible endpoint instead, set a Base URL and use that endpoint’s bare model id.",
     keywords: ["llm", "gpt", "claude", "provider"],
     control: { kind: "combobox", suggestions: [
       "gpt-4o-mini", "gpt-4o", "gpt-4.1-mini", "o4-mini",
-      "claude-sonnet-4-20250514", "claude-opus-4-20250514",
-      "gemini-2.0-flash", "ollama/llama3.2",
+        "anthropic/claude-sonnet-4-20250514", "gemini/gemini-2.0-flash",
+        "ollama/llama3.2",
+        "lm_studio/qwen2.5-7b-instruct", "hosted_vllm/meta-llama/Llama-3.1-8B-Instruct",
+        "huggingface/meta-llama/Llama-3.1-8B-Instruct", "openrouter/qwen/qwen-2.5-72b-instruct",
     ]},
     default: "gpt-4o-mini" },
 
@@ -650,8 +1005,23 @@ const SETTINGS = [
     control: { kind: "slider", min: 0, max: 1, step: 0.01 },
     default: 1, validate: clampNum(0, 1) },
 
+  { key: "reasoning_effort", section: "model", label: "Reasoning effort",
+    description: "How hard the model thinks before answering. Off leaves the provider default. Maps to each backend's native knob.",
+    keywords: ["thinking", "reasoning", "effort", "budget", "o1", "o3"],
+    control: { kind: "select", options: [
+      { value: "off", label: "Off" }, { value: "minimal", label: "Minimal" },
+      { value: "low", label: "Low" }, { value: "medium", label: "Medium" },
+      { value: "high", label: "High" }]},
+    default: "off" },
+
+  { key: "framework", section: "model", label: "Agent framework",
+    description: "Which engine runs a turn. PraisonAI is built in; installing praisonai-frameworks adds CrewAI, AutoGen, LangGraph, Agno, Google ADK, OpenAI Agents SDK and Pydantic AI.",
+    keywords: ["crewai", "autogen", "langgraph", "agno", "adk", "pydantic"],
+    control: { kind: "text", placeholder: "praisonai" },
+    default: "praisonai", requiresRestart: true },
+
   { key: "base_url", section: "model", label: "Base URL override",
-    description: "Point at a proxy, Azure, or a local server. Blank uses the provider default.",
+    description: "Point at Ollama, LM Studio, vLLM, a proxy or Azure. Sent to whichever provider the model names. Blank uses the provider default.",
     keywords: ["endpoint", "proxy", "azure", "ollama", "lm studio"],
     control: { kind: "text", placeholder: "https://api.openai.com/v1" },
     default: "", requiresRestart: true },
@@ -775,7 +1145,12 @@ const SETTINGS = [
 
   // ---- About --------------------------------------------------------------
   { key: "version", section: "about", label: "PraisonAI Desktop",
-    control: { kind: "readout", value: () => "0.1.0" } },
+    control: { kind: "readout", value: () =>
+      globalThis.__PRAISONAI_DESKTOP_VERSION__ || "unknown" } },
+
+  { key: "agents_version", section: "about", label: "PraisonAI Agents",
+    control: { kind: "readout", value: () =>
+      globalThis.__PRAISONAI_AGENTS_VERSION__ || "unknown" } },
 
   { key: "engine_status", section: "about", label: "Engine",
     description: "The Python process this window is talking to.",
@@ -784,12 +1159,16 @@ const SETTINGS = [
   { key: "logs_link", section: "about", label: "Engine log",
     control: { kind: "action", verb: "Open" }, action: "logs" },
 
+  { key: "engine_restart", section: "about", label: "Restart engine",
+    description: "Loads new engine code after an update. Chat may pause briefly.",
+    control: { kind: "action", verb: "Restart" }, action: "engine_restart" },
+
   { key: "check_now", section: "about", label: "Check for updates",
     control: { kind: "action", verb: "Check" }, action: "update" },
 
   // ---- Integrations -------------------------------------------------------
   { key: "mcp_servers", section: "integrations", label: "MCP servers",
-    description: "Tool servers launched over stdio. Each is disabled until you enable it.",
+    description: "Saved for a future release. Servers listed here are stored only \u2014 the engine does not launch them yet, so the model cannot use them.",
     keywords: ["tools", "model context protocol", "stdio", "extensions"],
     control: { kind: "action", verb: "Manage" }, action: "mcp" },
 ];
@@ -825,9 +1204,16 @@ function searchSettings(query, get) {
 window.__REGISTRY__ = { SECTIONS, SETTINGS, DEFAULTS, searchSettings };
 
 const { invoke } = window.__TAURI__.core;
+/**
+ * Start the engine as soon as the shell loads, before the rest of boot().
+ * Consumed exactly once: boot() clears it so a re-boot after provisioning
+ * reads fresh status rather than the stale pre-provision failure.
+ */
+let engineBootPromise=invoke('engine_status');
 const turns=document.getElementById('turns'), thread=document.getElementById('thread');
 const status=document.getElementById('status'), box=document.getElementById('p'), send=document.getElementById('send');
-let PORT=null, atBottom=true, activeRun=null, activeReader=null;
+status.textContent='starting engine…'; status.className='s-boot';
+let PORT=null, engineBlocked=true, atBottom=true, activeRun=null, activeReader=null;
 /** Set by Regenerate for exactly one submit, then cleared. */
 let regenerateOf=null;
 // The renderer honours these directly -- everything in here was previously
@@ -924,6 +1310,38 @@ function askConfirm(message, {danger=true, ok='Delete', cancel='Cancel'}={}){
   });
 }
 
+/**
+ * In-app text prompt, because `window.prompt` does not work here either.
+ *
+ * The same WKWebView that has no confirm panel has no prompt panel, so
+ * `prompt()` returns null without ever showing anything -- which is why the
+ * "Move to project" menu item issued no request at all. Mirrors askConfirm:
+ * resolves to the entered string, or null if cancelled.
+ */
+function askText(message, value='', {ok='OK', cancel='Cancel'}={}){
+  return new Promise(resolve=>{
+    const back=document.createElement('div'); back.className='confirm-back';
+    back.innerHTML='<div class="confirm-box" role="dialog" aria-modal="true">'
+      +'<p></p><input type="text" class="txt"/>'
+      +'<div class="row"><button type="button" class="ghost cx"></button>'
+      +'<button type="button" class="ok"></button></div></div>';
+    back.querySelector('p').textContent=message;
+    const inp=back.querySelector('.txt'); inp.value=value;
+    const okBtn=back.querySelector('.ok'), cxBtn=back.querySelector('.cx');
+    okBtn.textContent=ok; cxBtn.textContent=cancel;
+    const close=v=>{ back.remove(); document.removeEventListener('keydown',key); resolve(v); };
+    const key=e=>{
+      if(e.key==='Escape'){ e.preventDefault(); close(null); }
+      else if(e.key==='Enter'){ e.preventDefault(); close(inp.value); }
+    };
+    okBtn.onclick=()=>close(inp.value); cxBtn.onclick=()=>close(null);
+    back.onclick=e=>{ if(e.target===back) close(null); };
+    document.addEventListener('keydown',key);
+    document.body.appendChild(back);
+    inp.focus(); inp.select();
+  });
+}
+
 let toastTimer=null;
 /** Brief, non-blocking confirmation. Silence after an action the user did not
  *  explicitly ask for -- a paste turning into a chip -- reads as a bug. */
@@ -962,6 +1380,7 @@ const hero=document.getElementById('hero');
 // out of sync with whether the transcript actually has content.
 const syncEmpty=()=>thread.classList.toggle('empty', turns.children.length===0);
 let toolsOn=true;
+let knowledgeOn=false;
 // Messages typed while a turn is running. All three reference apps allow this;
 // blocking the composer mid-run makes a user wait to record a thought they
 // already had. Queued prompts send in order as each turn settles.
@@ -985,13 +1404,32 @@ async function refreshChats(){
   if(!PORT) return;
   try{
     const {chats}=await (await fetch(`http://127.0.0.1:${PORT}/chats`)).json();
+    // Standing instructions per project, so the label can show one is set and
+    // clicking it edits it. A failure here must not blank the sidebar.
+    let projInstr={};
+    try{ projInstr=(await (await fetch(`http://127.0.0.1:${PORT}/projects`)).json()).instructions||{}; }catch{}
     chatsEl.innerHTML='';
     const groups={};
     for(const c of chats){ (groups[c.project||'']??=[]).push(c); }
     const order=Object.keys(groups).sort((a,b)=>a===''?1:b===''?-1:a.localeCompare(b));
     for(const g of order){
       if(g){ const lbl=document.createElement('div'); lbl.className='sectlbl';
-             lbl.style.padding='.7rem .75rem .2rem'; lbl.textContent=g;
+             lbl.style.padding='.7rem .75rem .2rem'; lbl.style.cursor='pointer';
+             lbl.textContent=g+(projInstr[g]?' \u2699':'');
+             lbl.title='Edit project instructions';
+             lbl.tabIndex=0; lbl.setAttribute('role','button');
+             const editInstr=async()=>{
+               const text=await askText(
+                 `Instructions for project \u201c${g}\u201d (prepended to every chat here):`,
+                 projInstr[g]||'');
+               if(text===null) return;
+               await fetch('http://127.0.0.1:'+PORT+'/projects',{method:'POST',
+                 headers:{'content-type':'application/json'},
+                 body:JSON.stringify({project:g,instructions:text})});
+               refreshChats();
+             };
+             lbl.onclick=editInstr;
+             lbl.onkeydown=e=>{ if(e.key==='Enter'||e.key===' '){ e.preventDefault(); editInstr(); } };
              chatsEl.appendChild(lbl); }
       for(const c of groups[g]){
       const d=document.createElement('div');
@@ -1015,13 +1453,15 @@ async function refreshChats(){
         ev.stopPropagation();
         if(CFG.confirm_delete!==false && !await askConfirm(
              `Delete \u201c${c.title}\u201d? This cannot be undone.`)) return;
-        await fetch(`http://127.0.0.1:${PORT}/chats/${c.id}`,{method:'DELETE'});
+        const r=await fetch(`http://127.0.0.1:${PORT}/chats/${c.id}`,{method:'DELETE'})
+                  .catch(()=>null);
+        if(!r||!r.ok){ toast('Could not delete that conversation.'); return; }
         if(c.id===chatId){ chatId=rid(); turns.innerHTML=''; syncEmpty(); }
         refreshChats();
       };
       d.oncontextmenu=async ev=>{
         ev.preventDefault();
-        const name=prompt('Move to project (blank to remove):', c.project||'');
+        const name=await askText('Move to project (blank to remove):', c.project||'');
         if(name===null) return;
         await fetch('http://127.0.0.1:'+PORT+'/project/'+c.id,{method:'POST',
           headers:{'content-type':'application/json'},body:JSON.stringify({project:name})});
@@ -1067,7 +1507,9 @@ const stick=()=>{ if(atBottom) thread.scrollTop=thread.scrollHeight; };
 // Compact markdown renderer. Deliberately small and dependency-free: a CDN is
 // unavailable to a packaged app, and the alternative -- shipping a full parser --
 // is a decision to make with measurements, not by default.
-const esc=t=>t.replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+// Quotes included: without them a model-authored URL closes the href built in
+// inline() and injects attributes of its own -- id="f" clobbers getElementById('f').
+const esc=t=>t.replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 // Small tokeniser rather than a highlighter library: a CDN is unreachable from a
 // packaged app, and shipping a grammar engine is a decision to make with
 // measurements. Strings and comments match first, so a keyword inside one is
@@ -1350,7 +1792,20 @@ function gate(){
 }
 
 async function boot(){
-const st=await invoke('engine_status');
+try{ globalThis.__PRAISONAI_DESKTOP_VERSION__=await window.__TAURI__.app.getVersion(); }catch{}
+let st=engineBootPromise ? await engineBootPromise.catch(()=>null) : null;
+engineBootPromise=null;
+if(!st||!st.state) st=await invoke('engine_status');
+// Only poll while the engine is still coming up. A terminal 'failed' state is
+// the shell's final word -- retrying it just spins for 7.5s and buries the
+// failure banner behind a stale "starting engine…", so stop on it at once.
+for(let attempt=0; attempt<3 && st.state!=='ready' && st.state!=='failed' && !needsSetup(st); attempt++){
+  status.textContent='starting engine…';
+  await new Promise(r=>setTimeout(r,2500));
+  st=await invoke('engine_status');
+}
+engineBlocked=st.state!=='ready';
+if(engineBlocked) showView('chat',{persist:false});
 if(st.state==='ready'){
   PORT=st.port; status.textContent=`engine :${PORT}`; status.className='s-ready';
   box.disabled=send.disabled=false; box.focus(); refreshChats(); refreshModelName();
@@ -1359,16 +1814,24 @@ if(st.state==='ready'){
   // so a fine-tune started in an earlier session reappears rather than looking
   // like it never happened.
   if(typeof refreshTraining==='function') refreshTraining();
+  // The engine gate forces Chat (without persisting) so setup is visible when a
+  // restored Train view would otherwise hide it. Now the engine is up, restore
+  // the saved choice so a deliberate Train view returns rather than being stuck
+  // on Chat after setup completes.
+  restoreView();
   try{ CFG={...DEFAULTS,...await (await fetch(
         `http://127.0.0.1:${PORT}/settings`)).json()}; }catch{}
   applyTheme(CFG.theme);
   applyPrefs(CFG);
   if(CFG.check_updates!==false) checkUpdates();
+  await maybeOnboarding();
 }else if(needsSetup(st)){
   // A clean machine has nothing to run the engine with. Offering to build it
   // is the difference between a product and an error message: "No usable
   // Python" is true and useless to someone who has never installed one.
   status.textContent='setup needed'; status.className='s-boot';
+  // engineBlocked forced Chat above, so #thread is visible: a restored Train
+  // view can no longer bury the wizard firstRun() renders there.
   firstRun(st);
 }else{
   status.textContent='engine failed'; status.className='s-fail';
@@ -1481,7 +1944,187 @@ function firstRun(st){
     }finally{ if(un) un(); }
   };
 }
-boot();
+
+/** First-run wizard: API key → Knowledge → Channels (skippable). */
+async function maybeOnboarding(){
+  if(!PORT) return;
+  let ob;
+  try{
+    ob=await (await fetch(`http://127.0.0.1:${PORT}/onboarding`)).json();
+  }catch{ return; }
+  if(ob.complete) return;
+  // Render in its own modal backdrop, not #turns: the transcript belongs to the
+  // chat and shipped UI tests assert on it, so a wizard dropped in there breaks
+  // New-chat and would count as a stray turn.
+  const back=document.createElement('div'); back.className='onboard-back';
+  const w=document.createElement('div');
+  w.className='onboard'; w.setAttribute('role','dialog'); w.setAttribute('aria-modal','true');
+  const envHints=ob.env_hints||{};
+  w.innerHTML='<h3>Welcome to PraisonAI Desktop</h3>'
+    +'<p class="obStepLbl">Step <span id="obStepNum">1</span> of 3</p>'
+    +'<div id="obPane1">'
+    +'<p>Connect the engine with an OpenAI key (or set '
+    +'<code>OPENAI_API_KEY</code> in ~/.praisonai/.env).</p>'
+    +(ob.api_key_set?'<p class="meta">✓ API key detected from settings or environment.</p>':'')
+    +'<label>API key</label><input type="password" id="obKey" autocomplete="off" placeholder="sk-…"/>'
+    +'<div class="row"><button type="button" class="tbtn" id="obTest">Test “Hi”</button>'
+    +'<button type="button" class="ghost" id="obTo2">Next</button></div></div>'
+    +'<div id="obPane2" hidden><p>Optional: index a folder for RAG. Use the '
+    +'<strong>Knowledge</strong> tab later, or set a path now.</p>'
+    +'<label>Folder path</label><input type="text" id="obKnPath" '
+    +'placeholder="C:\\Users\\you\\Documents\\docs"/>'
+    +'<div class="row"><button type="button" class="tbtn" id="obKnSave">Save &amp; build index</button>'
+    +'<button type="button" class="ghost" id="obTo3">Skip</button></div></div>'
+    +'<div id="obPane3" hidden><p><strong>Channels</strong> support Telegram, Slack, and Discord. '
+    +'Put tokens in ~/.praisonai/.env:</p><ul class="obenv">'
+    +`<li>${envHints.telegram||'TELEGRAM_BOT_TOKEN'}</li>`
+    +`<li>${envHints.slack_bot||'SLACK_BOT_TOKEN'} + ${envHints.slack_app||'SLACK_APP_TOKEN'}</li>`
+    +`<li>${envHints.discord||'DISCORD_BOT_TOKEN'}</li></ul>`
+    +'<p class="meta">Then open the Channels tab, add bots, and use Gateway to run them together.</p>'
+    +'<div class="row"><button type="button" class="tbtn" id="obDone">Finish setup</button>'
+    +'<button type="button" class="ghost" id="obSkip">Skip for now</button></div></div>'
+    +'<p class="meta" id="obMsg"></p>';
+  back.appendChild(w); document.body.appendChild(back);
+  const showStep=n=>{
+    w.querySelector('#obStepNum').textContent=String(n);
+    w.querySelector('#obPane1').hidden=n!==1;
+    w.querySelector('#obPane2').hidden=n!==2;
+    w.querySelector('#obPane3').hidden=n!==3;
+  };
+  const finish=async()=>{
+    try{ await fetch(`http://127.0.0.1:${PORT}/onboarding/complete`,{method:'POST'}); }catch{}
+    back.remove(); syncEmpty();
+  };
+  w.querySelector('#obSkip').onclick=finish;
+  w.querySelector('#obDone').onclick=finish;
+  w.querySelector('#obTo2').onclick=()=>showStep(2);
+  w.querySelector('#obTo3').onclick=()=>showStep(3);
+  w.querySelector('#obKnSave').onclick=async()=>{
+    const msg=w.querySelector('#obMsg');
+    const path=w.querySelector('#obKnPath').value.trim();
+    if(!path){ showStep(3); return; }
+    msg.textContent='Indexing…';
+    try{
+      await fetch(`http://127.0.0.1:${PORT}/knowledge/configure`,{
+        method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({paths:[path]})});
+      const r=await fetch(`http://127.0.0.1:${PORT}/knowledge/reindex`,{method:'POST'});
+      const j=await r.json().catch(()=>({}));
+      if(!r.ok||j.ok===false){ msg.textContent=j.error||'Index failed'; return; }
+      msg.textContent='Knowledge index ready.';
+      showStep(3);
+    }catch{ msg.textContent='Engine unreachable'; }
+  };
+  w.querySelector('#obTest').onclick=async()=>{
+    const key=w.querySelector('#obKey').value.trim();
+    const msg=w.querySelector('#obMsg');
+    msg.textContent='';
+    try{
+      if(key){
+        await fetch(`http://127.0.0.1:${PORT}/settings`,{
+          method:'POST',headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({api_key:key})});
+      }
+      const r=await fetch(`http://127.0.0.1:${PORT}/onboarding/test`,{
+        method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({prompt:'Hi'})});
+      const j=await r.json();
+      if(!r.ok||!j.ok){ msg.textContent=j.error||'Test failed'; msg.className='tnote'; return; }
+      msg.textContent='Bot replied: '+String(j.reply||'').slice(0,120);
+      showStep(2);
+    }catch{ msg.textContent='Engine unreachable'; }
+  };
+  if(ob.api_key_set&&!ob.knowledge_ready) showStep(2);
+  else if(ob.api_key_set&&ob.knowledge_ready&&ob.channels_count===0) showStep(3);
+}
+
+const knPaths=document.getElementById('knPaths'),
+      knStatus=document.getElementById('knStatus'),
+      knError=document.getElementById('knError'),
+      knSnippet=document.getElementById('knSnippet'),
+      knTest=document.getElementById('knTest');
+
+async function refreshKnowledge(){
+  if(!PORT) return;
+  knError.textContent='';
+  try{
+    const st=await (await fetch(`http://127.0.0.1:${PORT}/knowledge/status`)).json();
+    if(st.paths&&st.paths.length) knPaths.value=st.paths.join('\n');
+    knStatus.textContent=st.ready
+      ?`Indexed ${st.paths.length} folder(s) · ${st.indexed_at?new Date(st.indexed_at*1000).toLocaleString():''}`
+      :`${st.paths.length||0} folder(s) configured · not indexed`;
+    if(st.error) knError.textContent=st.error;
+  }catch{ knError.textContent='Could not load knowledge status'; }
+}
+
+const knSaveBtn=document.getElementById('knSave'),
+      knIndexBtn=document.getElementById('knIndex');
+
+document.getElementById('knSave').addEventListener('click',async()=>{
+  if(!PORT){ knError.textContent='Engine not ready'; return; }
+  knError.textContent='';
+  const paths=knPaths.value.split('\n').map(s=>s.trim()).filter(Boolean);
+  if(!paths.length){ knError.textContent='Add at least one folder path (must exist on disk)'; return; }
+  knSaveBtn.disabled=true;
+  const prev=knSaveBtn.textContent;
+  knSaveBtn.textContent='Saving…';
+  try{
+    const r=await fetch(`http://127.0.0.1:${PORT}/knowledge/configure`,{
+      method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({paths})});
+    const j=await r.json().catch(()=>({}));
+    if(!r.ok||j.ok===false){
+      knError.textContent=j.error||`Save failed (${r.status})`;
+      if(r.status===403) knError.textContent+=' — restart the app so the engine reloads';
+      return;
+    }
+    toast('Knowledge folders saved');
+    await refreshKnowledge();
+  }catch{ knError.textContent='Engine unreachable — is it still running?'; }
+  finally{ knSaveBtn.disabled=false; knSaveBtn.textContent=prev; }
+});
+document.getElementById('knIndex').addEventListener('click',async()=>{
+  if(!PORT){ knError.textContent='Engine not ready'; return; }
+  knError.textContent='';
+  knIndexBtn.disabled=true;
+  const prev=knIndexBtn.textContent;
+  knIndexBtn.textContent='Building index…';
+  knStatus.textContent='Indexing documents (may take a minute)…';
+  try{
+    const r=await fetch(`http://127.0.0.1:${PORT}/knowledge/reindex`,{method:'POST'});
+    const j=await r.json().catch(()=>({}));
+    if(!r.ok||j.ok===false){
+      knError.textContent=j.error||`Index failed (${r.status})`;
+      if(/ModuleNotFoundError|praisonaiagents|knowledge/i.test(knError.textContent||'')){
+        knError.textContent+=' — try: pip install "praisonaiagents[knowledge]" in %APPDATA%\\PraisonAI\\venv';
+      }
+      return;
+    }
+    toast('Knowledge index ready');
+    await refreshKnowledge();
+  }catch{ knError.textContent='Engine unreachable — is it still running?'; }
+  finally{ knIndexBtn.disabled=false; knIndexBtn.textContent=prev; if(!knError.textContent) refreshKnowledge(); }
+});
+document.getElementById('knTest').addEventListener('click',async()=>{
+  if(!PORT){ knError.textContent='Engine not ready'; return; }
+  knError.textContent='';
+  if(knSnippet) knSnippet.hidden=true;
+  knTest.disabled=true;
+  try{
+    const q='What is the PraisonAI desktop E2E secret code?';
+    const r=await fetch(`http://127.0.0.1:${PORT}/knowledge/query`,{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({query:q})});
+    const j=await r.json().catch(()=>({}));
+    if(!r.ok||j.ok===false){ knError.textContent=j.error||'Query failed'; return; }
+    const ctx=String(j.context||'').trim();
+    if(!ctx){ knError.textContent='No text retrieved — build index or add more documents.'; return; }
+    if(knSnippet){ knSnippet.hidden=false; knSnippet.textContent=ctx.slice(0,1200); }
+    toast('Retrieval OK');
+  }catch{ knError.textContent='Engine unreachable'; }
+  finally{ knTest.disabled=false; }
+});
+
+const initialBoot=boot();
 
 document.getElementById('f').addEventListener('submit',async e=>{
   e.preventDefault();
@@ -1507,7 +2150,7 @@ document.getElementById('f').addEventListener('submit',async e=>{
     // SSE straight from the webview to the engine. Nothing streams through IPC.
     const res=await fetch(`http://127.0.0.1:${PORT}/chat`,{
       method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({prompt:text,chat_id:chatId,session:chatId,run_id:runId,
-      attachments:sent,tools:toolsOn,regenerate_of:regen})});
+      attachments:sent,tools:toolsOn,use_knowledge:knowledgeOn,regenerate_of:regen})});
     const reader=res.body.getReader(); activeReader=reader;
     const dec=new TextDecoder();
     let buf='';
@@ -1687,6 +2330,18 @@ document.getElementById('toolsBtn').addEventListener('click',e=>{
   e.currentTarget.setAttribute('aria-pressed',String(toolsOn));
   e.currentTarget.title = toolsOn ? 'Tools enabled' : 'Tools disabled for this turn';
 });
+document.getElementById('knowledgeBtn').addEventListener('click',e=>{
+  knowledgeOn=!knowledgeOn;
+  e.currentTarget.classList.toggle('on',knowledgeOn);
+  e.currentTarget.setAttribute('aria-pressed',String(knowledgeOn));
+  e.currentTarget.title = knowledgeOn ? 'Knowledge enabled for this turn' : 'Use indexed knowledge';
+  if(knowledgeOn&&toolsOn){
+    toolsOn=false;
+    const tb=document.getElementById('toolsBtn');
+    if(tb){ tb.classList.remove('on'); tb.setAttribute('aria-pressed','false');
+      tb.title='Tools disabled for this turn'; }
+  }
+});
 
 
 // ---- attachments ----
@@ -1698,14 +2353,31 @@ function renderChips(){
     const c=document.createElement('span'); c.className='chip';
     c.innerHTML='<b></b><span></span><span class="x">&times;</span>';
     c.querySelector('b').textContent=a.name;
-    c.querySelector('span').textContent=(a.text.length/1024).toFixed(1)+' kB';
+    const kb=(a.text!=null ? a.text.length : (a.size||0))/1024;
+    c.querySelector('span').textContent=kb.toFixed(1)+' kB';
     c.querySelector('.x').onclick=()=>{ attached.splice(i,1); renderChips(); };
     chips.appendChild(c);
+  });
+}
+function readAsDataURL(f){
+  return new Promise((res,rej)=>{
+    const r=new FileReader();
+    r.onload=()=>res(String(r.result||''));
+    r.onerror=()=>rej(r.error);
+    r.readAsDataURL(f);
   });
 }
 async function addFiles(list){
   for(const f of [...list].slice(0,5)){
     if(f.size>2000000){ fail('File too large', f.name+' is over 2 MB.',''); continue; }
+    // Images (and PDFs) go to the model as bytes, not stringified text, so a
+    // vision model actually sees them. Everything else keeps the text path.
+    const t=(f.type||'').toLowerCase();
+    if(t.startsWith('image/') || t==='application/pdf'){
+      const url=await readAsDataURL(f);
+      attached.push({name:f.name, url, size:f.size});
+      continue;
+    }
     const text=await f.text();
     // Clipped here, while the chip reports the real size, so a truncated file
     // can never be mistaken for a complete one.
@@ -1779,18 +2451,28 @@ function textSizes(){
   const def=SETTINGS.find(d=>d.key==='font_size');
   return def.control.options.map(o=>Number(o.value));
 }
-function setTextSize(px){
-  saveCfg({font_size:px});
-  toast('Text size '+px+' px');
+async function setTextSize(px){
+  // Await the write and only announce the size that actually stuck; toasting
+  // "Text size N px" while every write failed is the same lie as the toggles.
+  const ok=await saveCfg({font_size:px});
+  if(ok) toast('Text size '+px+' px');
+  // Once the queue drains, drop the optimistic target so the next burst starts
+  // from CFG again -- and a failed write does not leave us stepping from a size
+  // that never persisted.
+  if(pendingTextSize===px) pendingTextSize=null;
 }
+// The size a rapid burst of steps is walking toward. saveCfg only updates CFG
+// once the write resolves, so consecutive presses would otherwise read the same
+// stale value and collapse to one step; track the pending target here instead.
+let pendingTextSize=null;
 function stepTextSize(dir){
   const sizes=textSizes();
-  const now=Number(CFG.font_size)||BASE_TEXT_PX;
+  const now=pendingTextSize!=null?pendingTextSize:(Number(CFG.font_size)||BASE_TEXT_PX);
   let i=sizes.indexOf(now);
   if(i<0){ i=sizes.reduce((best,v,k)=>
     Math.abs(v-now)<Math.abs(sizes[best]-now)?k:best,0); }
   const next=sizes[Math.min(sizes.length-1,Math.max(0,i+dir))];
-  if(next!==now) setTextSize(next);
+  if(next!==now){ pendingTextSize=next; setTextSize(next); }
 }
 
 
@@ -1798,11 +2480,46 @@ function stepTextSize(dir){
 let cfg = {};
 const cfgGet = k => (k in cfg ? cfg[k] : DEFAULTS[k]);
 
-async function saveCfg(patch){
-  CFG={...CFG,...patch}; applyPrefs(CFG);
-  cfg = {...cfg, ...patch};
-  await fetch('http://127.0.0.1:'+PORT+'/settings',{method:'POST',
-    headers:{'content-type':'application/json'},body:JSON.stringify(patch)});
+// Writes run one at a time, in the order they were requested. Without this a
+// burst of steps could resolve out of order and leave CFG -- and the persisted
+// value -- at an older selection than the last one the user asked for.
+let saveQueue=Promise.resolve();
+function saveCfg(patch){
+  const run=saveQueue.then(()=>persistCfg(patch));
+  // Keep the chain alive even if one write throws, so later writes still run.
+  saveQueue=run.catch(()=>{});
+  return run;
+}
+async function persistCfg(patch){
+  // Persist first, mutate only on success. Mutating before the write and never
+  // checking it is how a toggle moved in memory, never moved on screen, and
+  // un-flipped itself on the next click.
+  let r=null;
+  try{
+    r=await fetch('http://127.0.0.1:'+PORT+'/settings',{method:'POST',
+      headers:{'content-type':'application/json'},body:JSON.stringify(patch)});
+  }catch(_){}
+  if(!r||!r.ok){
+    // Prefer the engine's own reason (e.g. a model id this build cannot run)
+    // over the generic line, so the user is told what to change, not just that
+    // something failed.
+    let why='';
+    try{ why=(await r.json()).error||''; }catch{}
+    toast(why||'Could not save that setting.'); return false;
+  }
+  let saved=null;
+  try{ saved=await r.json(); }catch{}
+  CFG={...CFG,...patch}; cfg={...cfg,...patch};
+  // The server persists what actually happened, not what we asked. Reconcile
+  // any key it wrote back so the current session never shows a value that was
+  // never saved -- e.g. "Open at login" the OS refused to register.
+  if(saved && typeof saved==='object'){
+    for(const k of Object.keys(patch)) if(k in saved){ CFG[k]=saved[k]; cfg[k]=saved[k]; }
+  }
+  applyPrefs(CFG);
+  // Return the server object (truthy) so callers can both gate on success and
+  // read reconciliation details like launch_at_login_result.
+  return saved && typeof saved==='object' ? saved : true;
 }
 
 function control(def, onChange){
@@ -1869,10 +2586,23 @@ function control(def, onChange){
 
 async function runAction(def){
   if(def.confirm && !await askConfirm(def.confirm.message,{ok:'Continue'})) return;
+  // A failed export that says nothing is worse than no export: the user pastes
+  // a stale clipboard into a file and believes they have a backup. Every branch
+  // is a bare fetch that rejects when the engine is unreachable, so report it.
+  try{ await runActionInner(def); }
+  catch(e){ toast('That did not run: '+(e && e.message ? e.message : e)); }
+}
+async function runActionInner(def){
   if(def.action==='export'){
-    const {chats}=await (await fetch('http://127.0.0.1:'+PORT+'/chats')).json();
+    const cr=await fetch('http://127.0.0.1:'+PORT+'/chats');
+    if(!cr.ok) throw new Error('Could not read conversations ('+cr.status+')');
+    const {chats}=await cr.json();
     const all=[];
-    for(const c of chats) all.push(await (await fetch('http://127.0.0.1:'+PORT+'/chats/'+c.id)).json());
+    for(const c of chats){
+      const dr=await fetch('http://127.0.0.1:'+PORT+'/chats/'+c.id);
+      if(!dr.ok) throw new Error('Could not read a conversation ('+dr.status+')');
+      all.push(await dr.json());
+    }
     // A sandboxed webview blocks a download the page starts itself, so the
     // export goes to the clipboard and says so rather than failing silently.
     await navigator.clipboard.writeText(JSON.stringify(all,null,2));
@@ -1880,8 +2610,20 @@ async function runAction(def){
     closeOverlay();
   } else if(def.action==='clear'){
     const {chats}=await (await fetch('http://127.0.0.1:'+PORT+'/chats')).json();
-    for(const c of chats) await fetch('http://127.0.0.1:'+PORT+'/chats/'+c.id,{method:'DELETE'});
-    chatId=rid(); turns.innerHTML=''; syncEmpty(); refreshChats(); closeOverlay();
+    let failed=0, activeGone=false;
+    for(const c of chats){
+      const r=await fetch('http://127.0.0.1:'+PORT+'/chats/'+c.id,{method:'DELETE'})
+                .catch(()=>null);
+      if(!r||!r.ok) failed++;
+      else if(c.id===chatId) activeGone=true;
+    }
+    // The open transcript follows storage, not the batch result: if the active
+    // conversation was one of the deletes that succeeded, blank it even when a
+    // *different* one failed -- otherwise it lingers on screen while gone on disk.
+    if(activeGone){ chatId=rid(); turns.innerHTML=''; syncEmpty(); }
+    if(failed){ toast(`Could not delete ${failed} conversation(s).`); refreshChats(); closeOverlay(); return; }
+    if(!activeGone){ chatId=rid(); turns.innerHTML=''; syncEmpty(); }
+    refreshChats(); closeOverlay();
   } else if(def.action==='reveal'){
     const where=await actualDataFolder();
     await navigator.clipboard.writeText(where);
@@ -1891,7 +2633,9 @@ async function runAction(def){
     toast(u.message || ('PraisonAI Desktop '+u.current));
   } else if(def.action==='mcp'){
     const {servers}=await (await fetch('http://127.0.0.1:'+PORT+'/mcp')).json();
-    panel.innerHTML='<h2>MCP servers</h2><div id="mcplist"></div>'
+    panel.innerHTML='<h2>MCP servers</h2>'
+      +'<div class="hint">Stored for a future release. The engine does not launch these yet, so the model cannot use them.</div>'
+      +'<div id="mcplist"></div>'
       +'<div class="fld"><label>Name</label><input id="m-name" placeholder="filesystem"/></div>'
       +'<div class="fld"><label>Command</label><input id="m-cmd" placeholder="npx -y @modelcontextprotocol/server-filesystem /tmp"/></div>'
       +'<div class="row"><button class="ghost" id="m-close">Close</button><button id="m-add">Add server</button></div>';
@@ -1923,16 +2667,31 @@ async function runAction(def){
     panel.querySelector('#m-add').onclick=async()=>{
       const name=panel.querySelector('#m-name').value.trim();
       const cmd=panel.querySelector('#m-cmd').value.trim();
-      if(!name){ alert('A name is required.'); return; }
+      // The toast intentionally sits below the settings scrim, so it is dimmed
+      // and unreadable while this overlay is open. Errors that occur here must
+      // surface through the in-app dialog, which paints above the scrim.
+      if(!name){ await askConfirm('A name is required.',{danger:false,ok:'OK',cancel:'Dismiss'}); return; }
       const r=await (await fetch('http://127.0.0.1:'+PORT+'/mcp',{method:'POST',
         headers:{'content-type':'application/json'},
         body:JSON.stringify({action:'add',name,command:cmd,enabled:false})})).json();
-      if(!r.ok){ alert(r.error); return; }
+      if(!r.ok){ await askConfirm(r.error,{danger:false,ok:'OK',cancel:'Dismiss'}); return; }
       runAction(def);
     };
     overlay.classList.add('open');
   } else if(def.action==='logs'){
     closeOverlay(); document.getElementById('logsBtn').click();
+  } else if(def.action==='engine_restart'){
+    closeOverlay();
+    status.textContent='restarting engine…'; status.className='s-boot';
+    try{
+      const st=await invoke('restart_engine');
+      engineBlocked=st.state!=='ready';
+      if(st.state==='ready'){
+        PORT=st.port; status.textContent=`engine :${PORT}`; status.className='s-ready';
+        toast('Engine restarted');
+      }else if(needsSetup(st)){ firstRun(st); }
+      else{ failWithSetup(st); }
+    }catch(e){ toast('Could not restart engine'); }
   }
 }
 
@@ -1954,10 +2713,22 @@ function settingRow(def){
     err.style.display='none';
     if(def.confirm && def.confirm.when(cfgGet(def.key),nv)
        && !await askConfirm(def.confirm.message,{ok:'Continue'})) { renderSettings(); return; }
-    await saveCfg({[def.key]:nv});
+    // Don't advance the visible state on a write that failed: saveCfg has
+    // already told the user, and applying the theme or re-rendering here would
+    // show a value that was never persisted.
+    const saved=await saveCfg({[def.key]:nv});
+    if(!saved) return;
     if(def.key==='theme') applyTheme(nv);
     if(def.key==='model') modelName.textContent=nv;
     renderSettings();
+    // If the OS declined to register the login item, the toggle has already
+    // snapped back to the persisted value above; tell the user why.
+    if(def.key==='launch_at_login' && saved && saved.launch_at_login_result
+       && nv && !saved.launch_at_login_result.enabled){
+      const r=document.getElementById('setting-launch_at_login');
+      const w=r&&r.querySelector('.warn');
+      if(w){ w.textContent=saved.launch_at_login_result.message||'Not available.'; w.style.display=''; }
+    }
   };
 
   const multiline = def.control.kind==='text' && def.control.multiline;
@@ -2043,6 +2814,10 @@ document.getElementById('settings').addEventListener('click',async()=>{
   try{
     cfg = await (await fetch('http://127.0.0.1:'+PORT+'/settings')).json();
   }catch(e){ engineDownPanel('Settings'); return; }
+  try{
+    const health=await (await fetch('http://127.0.0.1:'+PORT+'/health')).json();
+    globalThis.__PRAISONAI_AGENTS_VERSION__=health.agents_version||'unknown';
+  }catch(e){}
   settingsQuery=''; renderSettings(); overlay.classList.add('open');
   panel.querySelector('#setq').focus();
 });
@@ -2144,8 +2919,20 @@ box.addEventListener('keydown',e=>{
  * showing an empty pane next to a job that is still going.
  */
 const trainView=document.getElementById('train'),
+      channelsView=document.getElementById('channels'),
+      gatewayView=document.getElementById('gateway'),
+      knowledgeView=document.getElementById('knowledge'),
+      imagesView=document.getElementById('images'),
+      videoView=document.getElementById('video'),
+      viewImages=document.getElementById('viewImages'),
+      viewVideo=document.getElementById('viewVideo'),
       viewChat=document.getElementById('viewChat'),
       viewTrain=document.getElementById('viewTrain'),
+      viewChannels=document.getElementById('viewChannels'),
+      viewGateway=document.getElementById('viewGateway'),
+      viewKnowledge=document.getElementById('viewKnowledge'),
+      studioView=document.getElementById('studio'),
+      viewStudio=document.getElementById('viewStudio'),
       trainForm=document.getElementById('trainForm'),
       tStart=document.getElementById('tStart'), tStop=document.getElementById('tStop'),
       tState=document.getElementById('tState'), tError=document.getElementById('tError'),
@@ -2173,19 +2960,322 @@ const METHOD_HINTS={
 let trainStream=null, trainCursor=-1, trainRunId=null, lossSeries=[], logLines=[];
 const MAX_LOG_LINES=600;   // the pane is a tail, not an archive; the log file has it all
 
-function showView(name){
+// A restored Train view hides #thread (body.training #thread{display:none}),
+// where the setup wizard and failure banner render. While the engine is not
+// ready, a requested Train view is forced to Chat so that UI stays visible;
+// the deliberate choice is still persisted, and the post-boot restore below
+// returns Train once the engine is up.
+const VIEW_TABS={chat:viewChat,train:viewTrain,channels:viewChannels,gateway:viewGateway,
+  knowledge:viewKnowledge,images:viewImages,video:viewVideo,studio:viewStudio};
+
+function showView(name,{persist=true}={}){
+  const requested=name;
+  if(name!=='chat' && engineBlocked) name='chat';
   const training=name==='train';
+  const studio=name==='studio';
   document.body.classList.toggle('training',training);
+  document.body.classList.toggle('studio',studio);
+  document.body.classList.remove('view-channels','view-gateway','view-knowledge','view-images','view-video');
+  if(name==='channels') document.body.classList.add('view-channels');
+  if(name==='gateway') document.body.classList.add('view-gateway');
+  if(name==='knowledge') document.body.classList.add('view-knowledge');
+  if(name==='images') document.body.classList.add('view-images');
+  if(name==='video') document.body.classList.add('view-video');
   trainView.classList.toggle('on',training);
-  viewTrain.setAttribute('aria-selected',String(training));
-  viewChat.setAttribute('aria-selected',String(!training));
-  viewTrain.classList.toggle('active',training);
-  viewChat.classList.toggle('active',!training);
-  try{ localStorage.setItem('view',name); }catch(e){}
+  channelsView.classList.toggle('on',name==='channels');
+  gatewayView.classList.toggle('on',name==='gateway');
+  knowledgeView.classList.toggle('on',name==='knowledge');
+  imagesView.classList.toggle('on',name==='images');
+  videoView.classList.toggle('on',name==='video');
+  studioView.classList.toggle('on',studio);
+  for(const [v,btn] of Object.entries(VIEW_TABS)){
+    const on=v===name;
+    btn.setAttribute('aria-selected',String(on));
+    btn.classList.toggle('active',on);
+  }
+  if(persist) try{ localStorage.setItem('view',requested); }catch(e){}
   if(training) refreshTraining();
+  if(name==='channels') refreshChannels();
+  if(name==='gateway') refreshGateway();
+  if(name==='knowledge') refreshKnowledge();
+  if(name==='images') refreshImages();
+  if(name==='video') refreshVideo();
+  if(studio) refreshStudio();
 }
 viewChat.addEventListener('click',()=>showView('chat'));
 viewTrain.addEventListener('click',()=>showView('train'));
+viewChannels.addEventListener('click',()=>showView('channels'));
+viewGateway.addEventListener('click',()=>showView('gateway'));
+viewKnowledge.addEventListener('click',()=>showView('knowledge'));
+viewImages.addEventListener('click',()=>showView('images'));
+viewVideo.addEventListener('click',()=>showView('video'));
+viewStudio.addEventListener('click',()=>showView('studio'));
+
+/* --- creative studio --------------------------------------------------- */
+let studioPoll=null, studioJobIds=[];
+const sProject=document.getElementById('sProject'),
+      sModel=document.getElementById('sModel'),
+      sImageModel=document.getElementById('sImageModel'),
+      sImageQuality=document.getElementById('sImageQuality'),
+      sImageSize=document.getElementById('sImageSize'),
+      sImageCost=document.getElementById('sImageCost'),
+      sGenerateImage=document.getElementById('sGenerateImage'),
+      sPrompt=document.getElementById('sPrompt'),
+      sSeconds=document.getElementById('sSeconds'),
+      sVariants=document.getElementById('sVariants'),
+      sRef=document.getElementById('sRef'),
+      sGenerate=document.getElementById('sGenerate'),
+      sUploadRef=document.getElementById('sUploadRef'),
+      sFileIn=document.getElementById('sFileIn'),
+      sExport=document.getElementById('sExport'),
+      sRefresh=document.getElementById('sRefresh'),
+      sNewProject=document.getElementById('sNewProject'),
+      sStatus=document.getElementById('sStatus'),
+      sJobs=document.getElementById('sJobs'),
+      sAssets=document.getElementById('sAssets'),
+      sCredHint=document.getElementById('sCredHint'),
+      sTimelineMeta=document.getElementById('sTimelineMeta');
+
+function studioEsc(s){
+  return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;');
+}
+
+function studioSetStatus(msg,{busy=false,err=false}={}){
+  sStatus.textContent=msg||'';
+  sStatus.classList.toggle('busy',!!busy);
+  sStatus.classList.toggle('err',!!err);
+}
+
+function studioJobPill(status){
+  const s=(status||'').toLowerCase();
+  const cls=s==='completed'?'done':(s==='failed'?'failed':(s==='running'?'running':'stopping'));
+  return `<span class="pill ${cls}">${studioEsc(status||'unknown')}</span>`;
+}
+
+async function studioFetch(path,opts){
+  const res=await fetch(`http://127.0.0.1:${PORT}${path}`,opts);
+  const data=await res.json().catch(()=>({}));
+  if(!res.ok) throw new Error(data.error||res.statusText);
+  return data;
+}
+
+async function loadStudioModels(){
+  try{
+    const data=await studioFetch('/studio/models');
+    sModel.innerHTML='';
+    for(const m of data.video||[]){
+      const o=document.createElement('option');
+      o.value=m.id; o.textContent=m.label;
+      sModel.appendChild(o);
+    }
+    sImageModel.innerHTML='';
+    for(const m of data.image||[]){
+      const o=document.createElement('option');
+      o.value=m.id; o.textContent=m.label;
+      sImageModel.appendChild(o);
+    }
+    const defs=data.image_defaults||{};
+    if(defs.model) sImageModel.value=defs.model;
+    if(defs.quality) sImageQuality.value=defs.quality;
+    if(defs.size) sImageSize.value=defs.size;
+    const notice=data.image_cost_notice||'';
+    if(notice){
+      sImageCost.textContent=notice;
+      sImageCost.hidden=false;
+    }else{
+      sImageCost.hidden=true;
+    }
+    sCredHint.textContent='API keys: Settings → Models (OpenAI for Sora/Flare, Google for Veo, Runway secret for Runway).';
+  }catch(e){
+    sCredHint.textContent='Studio API unavailable — is the engine running?';
+  }
+}
+
+async function refreshStudioProjects(selectId){
+  const {projects}=await studioFetch('/studio/projects');
+  sProject.innerHTML='';
+  for(const p of projects){
+    const o=document.createElement('option');
+    o.value=p.id; o.textContent=p.name;
+    sProject.appendChild(o);
+  }
+  if(selectId) sProject.value=selectId;
+  else if(projects[0]) sProject.value=projects[0].id;
+  await refreshStudioAssets();
+}
+
+async function refreshStudioAssets(){
+  const pid=sProject.value;
+  if(!pid){
+    sAssets.innerHTML='';
+    sTimelineMeta.textContent='0 clips';
+    return;
+  }
+  const project=await studioFetch(`/studio/projects/${encodeURIComponent(pid)}`);
+  sRef.innerHTML='<option value="">— none —</option>';
+  sAssets.innerHTML='';
+  const tl=(project.timeline||[]).length;
+  sTimelineMeta.textContent=tl===1?'1 clip':`${tl} clips`;
+  for(const a of project.assets||[]){
+    if(a.type==='image'){
+      const o=document.createElement('option');
+      o.value=a.id;
+      o.textContent=(a.prompt||'Reference').slice(0,48)||a.id;
+      sRef.appendChild(o);
+    }
+    const div=document.createElement('div');
+    div.className='studio-asset';
+    const meta=document.createElement('div');
+    meta.className='ameta';
+    const promptBit=a.prompt?(' · '+studioEsc(a.prompt.slice(0,72))):'';
+    meta.innerHTML=`<b>${studioEsc(a.type)}</b>${a.model?(' · '+studioEsc(a.model)):''}${promptBit}`;
+    div.appendChild(meta);
+    if(a.type==='video'||a.type==='image'){
+      const url=`http://127.0.0.1:${PORT}/studio/projects/${encodeURIComponent(pid)}/file/${encodeURIComponent(a.id)}`;
+      if(a.type==='video'){
+        const v=document.createElement('video');
+        v.controls=true; v.src=url;
+        div.appendChild(v);
+      }else{
+        const img=document.createElement('img');
+        img.alt=a.prompt||'Generated image'; img.src=url;
+        div.appendChild(img);
+      }
+    }
+    sAssets.appendChild(div);
+  }
+}
+
+function refreshStudio(){
+  loadStudioModels();
+  refreshStudioProjects().catch(e=>{ studioSetStatus(e.message,{err:true}); });
+}
+
+async function pollStudioJobs(){
+  if(!studioJobIds.length) return;
+  sJobs.innerHTML='';
+  let pending=0;
+  let anyFailed=false;
+  for(const id of studioJobIds){
+    const row=document.createElement('div');
+    row.className='studio-job';
+    try{
+      const {job}=await studioFetch(`/studio/jobs/${encodeURIComponent(id)}`);
+      const kind=job.kind||'job';
+      const prompt=(job.prompt||'').slice(0,120);
+      row.innerHTML=`${studioJobPill(job.status)}<span class="pill">${studioEsc(kind)}</span>`
+        +`<span class="jprompt">${studioEsc(prompt||'(no prompt)')}</span>`;
+      if(job.status==='queued'||job.status==='running') pending++;
+      if(job.status==='failed') anyFailed=true;
+      if(job.error){
+        const er=document.createElement('div');
+        er.className='jerr';
+        er.textContent=job.error;
+        row.appendChild(er);
+      }
+    }catch(e){
+      row.innerHTML=`${studioJobPill('failed')}<span class="jprompt">${studioEsc(e.message)}</span>`;
+      anyFailed=true;
+    }
+    sJobs.appendChild(row);
+  }
+  if(pending){
+    studioSetStatus('Generation in progress…',{busy:true});
+  }
+  if(!pending){
+    studioJobIds=[];
+    if(studioPoll){ clearInterval(studioPoll); studioPoll=null; }
+    await refreshStudioAssets();
+    sGenerate.disabled=false;
+    sGenerateImage.disabled=false;
+    studioSetStatus(anyFailed?'Finished with errors — see jobs below.':'Generation finished.',{err:anyFailed});
+  }
+}
+
+sNewProject.addEventListener('click',async()=>{
+  const name=prompt('Project name','My video');
+  if(name===null) return;
+  const {project}=await studioFetch('/studio/projects',{method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({name})});
+  await refreshStudioProjects(project.id);
+});
+
+sRefresh.addEventListener('click',()=>refreshStudio());
+
+sUploadRef.addEventListener('click',()=>sFileIn.click());
+sFileIn.addEventListener('change',async()=>{
+  const f=sFileIn.files&&sFileIn.files[0];
+  if(!f||!sProject.value) return;
+  const reader=new FileReader();
+  reader.onload=async()=>{
+    try{
+      await studioFetch(`/studio/projects/${encodeURIComponent(sProject.value)}/assets`,{
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({filename:f.name,data_base64:reader.result,prompt:''})});
+      await refreshStudioAssets();
+    }catch(e){ toast(e.message); }
+  };
+  reader.readAsDataURL(f);
+  sFileIn.value='';
+});
+
+async function studioStartJobs(body){
+  const pid=sProject.value;
+  if(!pid){ toast('Create a project first'); return; }
+  const prompt=(body.prompt||'').trim();
+  if(!prompt){ toast('Enter a prompt first'); sPrompt.focus(); return; }
+  body.prompt=prompt;
+  sGenerate.disabled=true;
+  sGenerateImage.disabled=true;
+  try{
+    const {jobs}=await studioFetch(`/studio/projects/${encodeURIComponent(pid)}/generate`,{
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(body)});
+    studioJobIds=jobs.map(j=>j.id);
+    studioSetStatus(`Started ${jobs.length} job(s)…`,{busy:true});
+    if(studioPoll) clearInterval(studioPoll);
+    studioPoll=setInterval(pollStudioJobs,2000);
+    pollStudioJobs();
+  }catch(e){
+    sGenerate.disabled=false;
+    sGenerateImage.disabled=false;
+    studioSetStatus(e.message,{err:true});
+    toast(e.message);
+  }
+}
+
+sGenerate.addEventListener('click',()=>studioStartJobs({
+  kind:'video',
+  model:sModel.value,
+  prompt:sPrompt.value,
+  seconds:String(sSeconds.value||8),
+  n_variants:Number(sVariants.value||1),
+  ref_asset_id:sRef.value||null
+}));
+
+sGenerateImage.addEventListener('click',()=>studioStartJobs({
+  kind:'image',
+  model:sImageModel.value,
+  prompt:sPrompt.value,
+  n_variants:1,
+  image_quality:sImageQuality.value,
+  image_size:sImageSize.value
+}));
+
+sExport.addEventListener('click',async()=>{
+  const pid=sProject.value;
+  if(!pid) return;
+  try{
+    const r=await studioFetch(`/studio/projects/${encodeURIComponent(pid)}/export`,{
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({output_name:'timeline_export.mp4'})});
+    studioSetStatus('Timeline exported.');
+    await refreshStudioAssets();
+  }catch(e){ studioSetStatus(e.message,{err:true}); toast(e.message); }
+});
+
+sProject.addEventListener('change',()=>refreshStudioAssets());
 
 function setTrainState(state){
   const live=state && !['done','failed','cancelled'].includes(state);
@@ -2218,6 +3308,21 @@ function trainConfig(){
     train:true, ollama_save:false, huggingface_save:false};
   const steps=num('max_steps',0);
   if(steps>0) config.max_steps=steps;   // omitted, not zero: 0 means "no cap"
+
+  // Where it runs, expressed the same way the CLI and a hand-written YAML
+  // express it -- a `remote` block, or its absence. There is no separate mode
+  // flag to fall out of step with the block, and the engine passes the config
+  // through untouched, so `praisonai-train llm --config` does the routing.
+  if(get('run_on')==='remote'){
+    // get() already trims; the extra .trim() calls that were here implied
+    // otherwise.
+    const host=get('remote_host');
+    if(host){
+      config.remote={host,
+        python:get('remote_python')||'python3',
+        workdir:get('remote_workdir')||'~/.praisonai-train'};
+    }
+  }
   return config;
 }
 
@@ -2411,10 +3516,325 @@ document.getElementById('tMethod').addEventListener('change',e=>{
   document.getElementById('tMethodHint').textContent=METHOD_HINTS[e.target.value]||'';
 });
 
+document.getElementById('tRunOn').addEventListener('change',e=>{
+  const remote=e.target.value==='remote';
+  document.querySelectorAll('.remote-only').forEach(el=>{
+    el.classList.toggle('is-hidden',!remote); });
+  // Said plainly rather than discovered an hour in: fine-tuning needs CUDA,
+  // and a Mac does not have it, so "this computer" is not an option here on
+  // most of the machines this app runs on.
+  document.getElementById('tRunOnHint').textContent=remote
+    ? 'Runs over SSH. Uses your ssh agent — no password is stored.'
+    : 'Needs an NVIDIA GPU on this machine.';
+  document.getElementById('tRemoteHost').required=remote;
+});
+
 // Always go through showView, including for the default: it is what sets the
 // selected state on the nav, and skipping it for 'chat' left neither tab
-// looking selected on first launch.
-let startView='chat';
-try{ if(localStorage.getItem('view')==='train') startView='train'; }catch(e){}
-showView(startView);
+// looking selected on first launch. Re-applies the *saved* choice, so calling
+// it after the engine is ready undoes the engine gate's temporary Chat and
+// brings a deliberate Train view back without inventing a new selection. While
+// the engine is not ready showView forces Chat, so restoreView() is safe to run
+// at startup too: it selects the tab and setup stays visible.
+/* --- channels & gateway ------------------------------------------------ */
+const chList=document.getElementById('chList'),
+      chAddForm=document.getElementById('chAddForm'),
+      chError=document.getElementById('chError'),
+      chPlatform=document.getElementById('chPlatform'),
+      chAppTokenWrap=document.getElementById('chAppTokenWrap'),
+      gwState=document.getElementById('gwState'),
+      gwMeta=document.getElementById('gwMeta'),
+      gwStart=document.getElementById('gwStart'),
+      gwStop=document.getElementById('gwStop'),
+      gwError=document.getElementById('gwError'),
+      gwLog=document.getElementById('gwLog'),
+      chLog=document.getElementById('chLog');
+
+async function loadChannelLog(id){
+  if(!PORT||!chLog) return;
+  try{
+    const r=await fetch(`http://127.0.0.1:${PORT}/bots/logs?target=${encodeURIComponent(id)}`);
+    const j=await r.json();
+    chLog.textContent=(j.lines||[]).join('\n')||'(empty log)';
+  }catch{ chLog.textContent='Could not load log'; }
+}
+
+function syncChPlatform(){
+  const plat=chPlatform.value;
+  const slack=plat==='slack';
+  chAppTokenWrap.classList.toggle('is-hidden',!slack);
+  const tok=chAddForm.querySelector('[name=token_ref]');
+  if(!tok.value || tok.dataset.auto==='1'){
+    const ref=plat==='slack'?'env:SLACK_BOT_TOKEN'
+      :plat==='discord'?'env:DISCORD_BOT_TOKEN':'env:TELEGRAM_BOT_TOKEN';
+    tok.value=ref;
+    tok.dataset.auto='1';
+  }
+}
+chPlatform.addEventListener('change',syncChPlatform);
+syncChPlatform();
+
+async function refreshChannels(){
+  if(!PORT) return;
+  chError.textContent='';
+  try{
+    const [chRes,gwRes]=await Promise.all([
+      fetch(`http://127.0.0.1:${PORT}/bots/channels`),
+      fetch(`http://127.0.0.1:${PORT}/bots/gateway`),
+    ]);
+    const {channels}=await chRes.json();
+    const gw=await gwRes.json().catch(()=>({state:'stopped'}));
+    const gatewayLive=gw.state==='running';
+    chList.textContent='';
+    if(!channels.length){
+      chList.innerHTML='<p class="meta">No channels yet. Add Telegram, Slack, or Discord above.</p>';
+      return;
+    }
+    if(gatewayLive){
+      chError.textContent='Gateway is running — stop it on the Gateway tab before starting an individual channel bot.';
+    }
+    channels.forEach(ch=>{
+      const row=document.createElement('div');
+      row.className='chrow';
+      const st=document.createElement('span');
+      st.className='st'+(ch.state==='running'?' run':'');
+      st.textContent=ch.state;
+      const nm=document.createElement('span');
+      nm.className='nm';
+      nm.textContent=`${ch.name} (${ch.platform})`;
+      const meta=document.createElement('span');
+      meta.className='meta';
+      meta.textContent=[ch.token_set?'token ok':'token missing',
+        ch.platform==='slack'?(ch.app_token_set?'app ok':'app missing'):null]
+        .filter(Boolean).join(' · ');
+      const logBtn=document.createElement('button');
+      logBtn.className='ghost tbtn';
+      logBtn.type='button';
+      logBtn.textContent='View log';
+      logBtn.onclick=()=>loadChannelLog(ch.id);
+      const startBtn=document.createElement('button');
+      startBtn.className='tbtn';
+      startBtn.type='button';
+      startBtn.textContent=ch.state==='running'?'Running':'Start';
+      startBtn.disabled=ch.state==='running'||gatewayLive;
+      startBtn.title=gatewayLive?'Stop Gateway first (one poller per token)':'Start this channel bot alone';
+      startBtn.onclick=async()=>{
+        chError.textContent='';
+        startBtn.disabled=true;
+        try{
+          const r=await fetch(`http://127.0.0.1:${PORT}/bots/channels/${ch.id}/start`,{method:'POST'});
+          const j=await r.json().catch(()=>({}));
+          if(!r.ok||j.ok===false){ chError.textContent=j.error||`start failed (${r.status})`; return; }
+          refreshChannels();
+        }catch(e){ chError.textContent='Engine unreachable — is it still running?'; }
+        finally{ startBtn.disabled=ch.state==='running'; }
+      };
+      const stopBtn=document.createElement('button');
+      stopBtn.className='tbtn danger';
+      stopBtn.type='button';
+      stopBtn.textContent='Stop';
+      stopBtn.hidden=ch.state!=='running';
+      stopBtn.onclick=async()=>{
+        chError.textContent='';
+        try{
+          const r=await fetch(`http://127.0.0.1:${PORT}/bots/channels/${ch.id}/stop`,{method:'POST'});
+          if(!r.ok){
+            const j=await r.json().catch(()=>({}));
+            chError.textContent=j.error||`stop failed (${r.status})`;
+          }
+          refreshChannels();
+        }catch(e){ chError.textContent='Engine unreachable — is it still running?'; }
+      };
+      const delBtn=document.createElement('button');
+      delBtn.className='ghost';
+      delBtn.type='button';
+      delBtn.textContent='Delete';
+      delBtn.onclick=async()=>{
+        if(ch.state==='running'){ chError.textContent='Stop the bot first, then Delete will work'; return; }
+        chError.textContent='';
+        try{
+          const r=await fetch(`http://127.0.0.1:${PORT}/bots/channels/${ch.id}`,{method:'DELETE'});
+          if(!r.ok){
+            const j=await r.json().catch(()=>({}));
+            chError.textContent=j.error||`delete failed (${r.status})`;
+          }
+          refreshChannels();
+        }catch(e){ chError.textContent='Engine unreachable — is it still running?'; }
+      };
+      row.append(st,nm,meta,logBtn,startBtn,stopBtn,delBtn);
+      chList.appendChild(row);
+    });
+  }catch(e){ chError.textContent='Could not load channels'; }
+}
+
+chAddForm.addEventListener('submit',async e=>{
+  e.preventDefault();
+  if(!PORT){ chError.textContent='Engine not ready yet'; return; }
+  chError.textContent='';
+  const btn=chAddForm.querySelector('[type=submit]');
+  if(btn) btn.disabled=true;
+  try{
+    const data=new FormData(chAddForm);
+    const body={platform:data.get('platform'),name:data.get('name'),token_ref:data.get('token_ref')};
+    if(data.get('platform')==='slack') body.app_token_ref=data.get('app_token_ref');
+    body.unknown_user_policy='allow';
+    const r=await fetch(`http://127.0.0.1:${PORT}/bots/channels`,{
+      method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const j=await r.json().catch(()=>({}));
+    if(!r.ok){ chError.textContent=j.error||`add failed (${r.status})`; return; }
+    chAddForm.reset();
+    syncChPlatform();
+    refreshChannels();
+  }catch(err){ chError.textContent='Engine unreachable — is it still running?'; }
+  finally{ if(btn) btn.disabled=false; }
+});
+
+async function refreshGateway(){
+  if(!PORT) return;
+  gwError.textContent='';
+  try{
+    const [gwRes,chRes]=await Promise.all([
+      fetch(`http://127.0.0.1:${PORT}/bots/gateway`),
+      fetch(`http://127.0.0.1:${PORT}/bots/channels`),
+    ]);
+    const g=await gwRes.json();
+    const {channels}=await chRes.json().catch(()=>({channels:[]}));
+    const anyChannelRunning=(channels||[]).some(c=>c.state==='running');
+    const live=g.state==='running';
+    gwState.textContent=g.state;
+    gwState.className='pill '+(live?'run':'');
+    gwMeta.textContent=live?`pid ${g.pid} · port ${g.port} · ${g.channels_configured} channel(s)`:
+      `${g.channels_configured} channel(s) configured`;
+    gwStart.hidden=live;
+    gwStop.hidden=!live;
+    if(!live&&anyChannelRunning){
+      gwError.textContent='A channel bot is running — click Stop on the Channels tab, then Start gateway here.';
+    }
+    gwStart.disabled=live||anyChannelRunning;
+    if(g.log_tail&&g.log_tail.length){
+      gwLog.hidden=false;
+      gwLog.textContent=g.log_tail.join('\n');
+    }
+  }catch(e){ gwError.textContent='Could not load gateway status'; }
+}
+
+gwStart.addEventListener('click',async()=>{
+  if(!PORT){ gwError.textContent='Engine not ready yet'; return; }
+  gwError.textContent='';
+  gwStart.disabled=true;
+  try{
+    const r=await fetch(`http://127.0.0.1:${PORT}/bots/gateway/start`,{
+      method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+    const j=await r.json().catch(()=>({}));
+    if(!r.ok||j.ok===false) gwError.textContent=j.error||`start failed (${r.status})`;
+  }catch(e){ gwError.textContent='Engine unreachable — is it still running?'; }
+  finally{ gwStart.disabled=false; refreshGateway(); }
+});
+gwStop.addEventListener('click',async()=>{
+  gwError.textContent='';
+  gwStop.disabled=true;
+  try{
+    const r=await fetch(`http://127.0.0.1:${PORT}/bots/gateway/stop`,{method:'POST'});
+    if(!r.ok){
+      const j=await r.json().catch(()=>({}));
+      gwError.textContent=j.error||`stop failed (${r.status})`;
+    }
+  }catch(e){ gwError.textContent='Engine unreachable — is it still running?'; }
+  finally{ gwStop.disabled=false; refreshGateway(); }
+});
+
+/* --- images & video ---------------------------------------------------- */
+const imgPrompt=document.getElementById('imgPrompt'),
+      imgModel=document.getElementById('imgModel'),
+      imgSize=document.getElementById('imgSize'),
+      imgGen=document.getElementById('imgGen'),
+      imgError=document.getElementById('imgError'),
+      imgPreview=document.getElementById('imgPreview'),
+      imgRecent=document.getElementById('imgRecent'),
+      vidPrompt=document.getElementById('vidPrompt'),
+      vidModel=document.getElementById('vidModel'),
+      vidGen=document.getElementById('vidGen'),
+      vidError=document.getElementById('vidError'),
+      vidPreview=document.getElementById('vidPreview'),
+      vidHint=document.getElementById('vidHint');
+
+async function refreshImages(){
+  if(!PORT) return;
+  imgError.textContent='';
+  try{
+    const r=await fetch(`http://127.0.0.1:${PORT}/media/recent?kind=image`);
+    const j=await r.json();
+    imgRecent.textContent='';
+    (j.items||[]).forEach(it=>{
+      const sp=document.createElement('span');
+      sp.className='meta'; sp.textContent=it.name;
+      sp.title=it.path;
+      imgRecent.appendChild(sp);
+    });
+  }catch{}
+}
+async function refreshVideo(){
+  if(!PORT) return;
+  vidError.textContent='';
+  try{
+    const c=await (await fetch(`http://127.0.0.1:${PORT}/media/capabilities`)).json();
+    if(vidHint) vidHint.textContent=c.video_hint||vidHint.textContent;
+    if(vidModel){
+      vidModel.textContent='';
+      (c.video_models||[]).forEach(m=>{
+        const o=document.createElement('option');
+        o.value=m.id;
+        o.textContent=m.display_name+(m.configured?'':' (key needed)');
+        o.disabled=!m.configured;
+        vidModel.appendChild(o);
+      });
+      const first=(c.video_models||[]).find(m=>m.configured);
+      if(first) vidModel.value=first.id;
+    }
+  }catch{}
+}
+imgGen.addEventListener('click',async()=>{
+  if(!PORT){ imgError.textContent='Engine not ready'; return; }
+  const prompt=imgPrompt.value.trim();
+  if(!prompt){ imgError.textContent='Enter a prompt'; return; }
+  imgError.textContent=''; imgGen.disabled=true;
+  try{
+    const r=await fetch(`http://127.0.0.1:${PORT}/media/image`,{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({prompt,model:imgModel.value,size:imgSize.value})});
+    const j=await r.json().catch(()=>({}));
+    if(!r.ok||j.ok===false){ imgError.textContent=j.error||'Generation failed'; return; }
+    if(j.data_url){ imgPreview.hidden=false; imgPreview.src=j.data_url; }
+    toast('Image saved to '+ (j.path||'media folder'));
+    refreshImages();
+  }catch{ imgError.textContent='Engine unreachable'; }
+  finally{ imgGen.disabled=false; }
+});
+vidGen.addEventListener('click',async()=>{
+  if(!PORT){ vidError.textContent='Engine not ready'; return; }
+  const prompt=vidPrompt.value.trim();
+  if(!prompt){ vidError.textContent='Enter a prompt'; return; }
+  vidError.textContent=''; vidGen.disabled=true; vidGen.textContent='Generating…';
+  try{
+    const r=await fetch(`http://127.0.0.1:${PORT}/media/video`,{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({prompt,model:vidModel&&vidModel.value?vidModel.value:undefined})});
+    const j=await r.json().catch(()=>({}));
+    if(!r.ok||j.ok===false){ vidError.textContent=j.error||'Generation failed'; return; }
+    const src=j.url||j.data_url;
+    if(src){ vidPreview.hidden=false; vidPreview.src=src; }
+    toast('Video saved to '+ (j.path||'media folder'));
+  }catch{ vidError.textContent='Engine unreachable'; }
+  finally{ vidGen.disabled=false; vidGen.textContent='Generate video'; }
+});
+
+function restoreView(){
+  let saved='chat';
+  try{
+    const v=localStorage.getItem('view');
+    if(v&&['train','channels','gateway','knowledge','images','video','studio'].includes(v)) saved=v;
+  }catch(e){}
+  showView(saved);
+}
+initialBoot.then(restoreView);
 </script></body></html>

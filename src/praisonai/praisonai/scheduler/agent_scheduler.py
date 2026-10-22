@@ -122,6 +122,8 @@ class AgentScheduler(_BaseAgentScheduler):
         self._execution_count = 0
         self._success_count = 0
         self._failure_count = 0
+        self._undelivered_count = 0
+        self._delivered_count = 0
         self._total_cost = 0.0
         self._start_time = None
         self._stats_lock = threading.Lock()
@@ -350,6 +352,16 @@ class AgentScheduler(_BaseAgentScheduler):
     
     def _execute_with_retry(self, max_retries: int):
         """Execute agent with retry logic and timeout."""
+        # Guard here too (not just in the schedule loop) so the
+        # run_immediately path cannot bill past max_cost. Mirrors the async
+        # scheduler.
+        if self._budget_exceeded():
+            logger.warning(f"Budget limit reached: ${self._total_cost:.4f} >= ${self.max_cost}")
+            logger.warning("Stopping scheduler to prevent additional costs")
+            # Signal only; teardown happens in _run_schedule's finally.
+            self._stop_event.set()
+            return
+
         with self._stats_lock:
             self._execution_count += 1
         success = False
@@ -402,16 +414,31 @@ class AgentScheduler(_BaseAgentScheduler):
                 success = True
 
                 # Deliver the result to the configured chat target (if any)
-                # through the shared resilient router. Best-effort — a delivery
-                # failure must not fail the run or block the callback.
-                self._deliver_result(result)
+                # through the shared resilient router, and fold the delivery
+                # outcome into truthful accounting (Issue #4454): a run whose
+                # delivery ultimately fails is recorded ``undelivered`` and
+                # fires ``on_failure`` — it is no longer a silent success.
+                delivered_ok = self._finalize_delivery(result)
 
-                if self.on_success:
-                    try:
-                        self.on_success(result)
-                    except Exception as e:
-                        logger.error(f"Callback error in on_success: {e}")
-                
+                if delivered_ok:
+                    if self.on_success:
+                        try:
+                            self.on_success(result)
+                        except Exception as e:
+                            logger.error(f"Callback error in on_success: {e}")
+                else:
+                    logger.error(
+                        "Scheduled run executed but its result could not be "
+                        "delivered to the configured target"
+                    )
+                    if self.on_failure:
+                        try:
+                            self.on_failure(
+                                "scheduled result could not be delivered"
+                            )
+                        except Exception as e:
+                            logger.error(f"Callback error in on_failure: {e}")
+
                 # Update state file after successful execution
                 self._update_state_if_daemon()
                     
@@ -451,18 +478,36 @@ class AgentScheduler(_BaseAgentScheduler):
             Agent execution result
         """
         logger.debug("Executing agent once")
+        if self._budget_exceeded():
+            logger.warning(f"Budget limit reached: ${self._total_cost:.4f} >= ${self.max_cost}; skipping run")
+            return None
         try:
             result = self._executor.execute(self.task)
             logger.debug(f"One-time execution successful: {result}")
 
-            self._deliver_result(result)
+            # Fold the delivery outcome in so a one-time run is not silently
+            # undelivered either (Issue #4454).
+            delivered_ok = self._finalize_delivery(result)
 
-            if self.on_success:
-                try:
-                    self.on_success(result)
-                except Exception as e:
-                    logger.error(f"Callback error in on_success: {e}")
-            
+            if delivered_ok:
+                if self.on_success:
+                    try:
+                        self.on_success(result)
+                    except Exception as e:
+                        logger.error(f"Callback error in on_success: {e}")
+            else:
+                logger.error(
+                    "One-time run executed but its result could not be "
+                    "delivered to the configured target"
+                )
+                if self.on_failure:
+                    try:
+                        self.on_failure(
+                            "scheduled result could not be delivered"
+                        )
+                    except Exception as e:
+                        logger.error(f"Callback error in on_failure: {e}")
+
             return result
         except Exception as e:
             logger.error(f"One-time execution failed: {e}")

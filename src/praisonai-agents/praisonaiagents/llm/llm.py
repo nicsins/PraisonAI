@@ -2,10 +2,14 @@ import logging
 from praisonaiagents._logging import get_logger
 import os
 import copy
+import contextvars
 import warnings
 import re
 import inspect
 import asyncio
+import threading
+from contextlib import contextmanager
+from functools import wraps
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Union, Literal, Callable, TYPE_CHECKING, Protocol
 
@@ -23,6 +27,7 @@ import time
 import json
 import xml.etree.ElementTree as ET
 from ..errors import AgentErrorKind, FailoverDecision, IdleTimeoutBreaker, ToolExecutionError
+from ..model_harness.guard import check_model_request
 # Gap 2: Tool call execution imports
 from ..tools.call_executor import ToolCall, create_tool_call_executor
 from ..tools.schema import build_tool_definition
@@ -34,6 +39,52 @@ from ..tools.schema import build_tool_definition
 # with the WRONG arguments and report success. Callers must detect this sentinel
 # and surface a tool-error so the model can re-emit the call instead.
 _TOOL_ARGUMENTS_PARSE_FAILED = object()
+
+# Bounded shrink-and-retry steps after a provider context-overflow rejection.
+_CONTEXT_OVERFLOW_SHRINK_STEPS = 3
+
+
+# ``litellm.success_callback``/``_async_success_callback``/``callbacks`` are
+# process-global lists shared by every LLM instance. Guard the read-modify-write
+# in ``_setup_event_tracking`` so concurrent instances don't corrupt them.
+_EVENT_TRACKING_LOCK = threading.Lock()
+
+
+def _request_stop_reason(method):
+    """Keep nested response calls from replacing their caller's outcome."""
+    if inspect.iscoroutinefunction(method):
+        @wraps(method)
+        async def async_call(self, *args, **kwargs):
+            with self._stop_reason_scope():
+                return await method(self, *args, **kwargs)
+        return async_call
+
+    @wraps(method)
+    def sync_call(self, *args, **kwargs):
+        with self._stop_reason_scope():
+            return method(self, *args, **kwargs)
+    return sync_call
+
+
+def _ollama_tool_result_is_successful(tool_result: Any) -> bool:
+    """Return whether a raw Ollama callback result is safe to chain.
+
+    The sync executor exposes failures as ``ToolResult.error`` while direct
+    callbacks use an ``{"error": ...}`` payload.  Keep the guard at every
+    recording call site so custom provider adapters cannot accidentally turn a
+    failed first call into a value for a dependent call.
+    """
+    if getattr(tool_result, "error", None) is not None:
+        return False
+    if isinstance(tool_result, dict):
+        return "error" not in tool_result
+    if (
+        isinstance(tool_result, list)
+        and tool_result
+        and isinstance(tool_result[0], dict)
+    ):
+        return "error" not in tool_result[0]
+    return True
 
 
 def _durable_iteration_kwargs(execute_tool_fn: Callable, index: int) -> Dict[str, int]:
@@ -124,6 +175,9 @@ except ImportError:
 # NOTE: The custom-LLM path (Agent.chat → get_response) and OpenAI path
 # (Agent.chat → _chat_completion) are separate code paths, not duplicate
 # API calls per request. This is a DRY/maintenance concern, not a billing issue.
+from ..tools.hosted import is_hosted_tool  # noqa: E402
+
+
 class LLMResponseError(Exception):
     """Raised when the LLM tool-calling loop fails and cannot produce a response.
 
@@ -188,6 +242,24 @@ class LLM:
     
     # Class-level flag for one-time logging configuration
     _logging_configured = False
+
+    # Current agent name for per-call token/cost attribution is stored in a
+    # PER-INSTANCE ContextVar (see __init__: self._current_agent_name_var).
+    #
+    # ContextVar, not a plain attribute: a single LLM instance can back two
+    # different Agents (Agent(llm=<shared LLM>) is supported), and
+    # PraisonAIAgents.arun_all_tasks dispatches tasks concurrently via
+    # asyncio.gather on one thread. With a plain attribute, task A sets
+    # "Researcher", awaits the network call, task B sets "Writer" on the SAME
+    # object, and when A's response returns it reads "Writer" -- A's tokens get
+    # attributed to B. A ContextVar is copied per task at gather/create_task
+    # time, so each concurrently-gathered coroutine keeps its own value across
+    # the await (same reasoning as _tools_scope_depths in agents/agents.py).
+    #
+    # Per-instance (not class-level): two distinct LLM instances -- including an
+    # original and its clone -- must keep independent attribution state within
+    # the same context, otherwise the last writer's agent name leaks across LLMs.
+
     
     # Class-level cache for LiteLLM module (avoids repeated import overhead)
     _litellm_module = None
@@ -250,6 +322,14 @@ class LLM:
         "results already gathered."
     )
     STEP_LIMIT_FALLBACK_MESSAGE = "Reached the step limit before finishing this task."
+
+    # Stalled-tool-loop finalisation: used when a provider re-emits an
+    # identical tool call with no prose, so the loop cannot make progress.
+    TOOL_LOOP_STALL_PROMPT = (
+        "The tools have already been called and their results are above. "
+        "Do not call any tools. Answer the original question now using "
+        "those results."
+    )
     
     # Force tool usage prompt template (used when model ignores tools)
     FORCE_TOOL_USAGE_PROMPT = """You MUST use one of the available tools to answer this question.
@@ -483,15 +563,31 @@ Respond with ONLY a valid JSON tool call in this format:
         # Structured stop reason for the last tool-execution loop:
         # "completed" | "max_steps" | "error". Lets callers distinguish a finished
         # task from one truncated by the step budget (see ExecutionConfig.max_steps).
-        self._last_stop_reason = "completed"
+        self._last_stop_reason_var = contextvars.ContextVar("last_stop_reason", default=None)
+        self._stop_reason_active_var = contextvars.ContextVar("stop_reason_active", default=None)
+        self._last_stop_reason_fallback = (None, "completed")
         self._idle_timeout_breaker = IdleTimeoutBreaker()  # Circuit breaker for idle timeouts
-        self.chat_history = []
+        # Optional Agent-supplied thread-safe append for deferred re-injection.
+        # When an Agent owns this LLM it wires its own locked, bounded history
+        # append here so a background-resolved defer(...) result replays on a
+        # follow-up turn. The LLM layer itself is stateless w.r.t. conversation
+        # history (it has no readers of its own list), so no list is kept here.
+        # Left None for standalone LLM usage.
+        self._agent_history_append = None
         self.verbose = extra_settings.get('verbose', True)
         self.markdown = extra_settings.get('markdown', True)
         self.self_reflect = extra_settings.get('self_reflect', False)
         self.max_reflect = extra_settings.get('max_reflect', 3)
         self.min_reflect = extra_settings.get('min_reflect', 1)
         self.reasoning_steps = extra_settings.get('reasoning_steps', False)
+        # Unified, provider-portable reasoning-effort control (Issue #4452).
+        # Accepts a graded level (off|minimal|low|medium|high) or a legacy
+        # ``thinking_budget`` int; both normalise to one internal value that is
+        # translated to each provider's native parameter in
+        # ``_build_completion_params``. ``None``/``off`` is a zero-overhead no-op.
+        self.reasoning_effort = extra_settings.get(
+            'reasoning_effort', extra_settings.get('thinking_budget')
+        )
         self.metrics = extra_settings.get('metrics', False)
         # Auto-detect XML tool format for known models, or allow manual override
         self.xml_tool_format = extra_settings.get('xml_tool_format', 'auto')
@@ -525,7 +621,18 @@ Respond with ONLY a valid JSON tool call in this format:
         # Token tracking
         self.last_token_metrics: Optional[TokenMetrics] = None
         self.session_token_metrics: Optional[TokenMetrics] = None
-        self.current_agent_name: Optional[str] = None
+        # Agent attribution is task-local: a single LLM instance is often shared
+        # by several concurrently-running agents (gateway channels, asyncio.gather),
+        # so a plain attribute would let one agent's set_current_agent() clobber
+        # another's mid-await and misattribute token spend (issues #5052/#3933).
+        # A ContextVar keeps each task's value isolated; the ``current_agent_name``
+        # property below preserves the historical attribute-style read/write API.
+        self._current_agent_name_var: contextvars.ContextVar[Optional[str]] = (
+            contextvars.ContextVar("praison_llm_current_agent_name", default=None)
+        )
+        self._current_agent_id_var: contextvars.ContextVar[Optional[str]] = (
+            contextvars.ContextVar("current_agent_id", default=None)
+        )
 
         # Rate limiting and retry settings
         self._rate_limiter = extra_settings.get('rate_limiter', None)
@@ -622,14 +729,39 @@ Respond with ONLY a valid JSON tool call in this format:
         # Parse route prefix for explicit provider routing
         provider_prefix = model_lower.split("/", 1)[0] if "/" in model_lower else None
         
-        # Explicit provider prefixes take priority
-        if provider_prefix == "ollama":
+        # Explicit provider prefixes take priority.
+        # "ollama_chat" is litellm's recommended prefix for Ollama tool calling
+        # and must not be treated as a different provider than "ollama".
+        if provider_prefix in {"ollama", "ollama_chat"}:
             return "ollama"
+        # Local servers that speak real OpenAI over HTTP. They keep the standard
+        # tool-message shape (unlike Ollama) but serve locally-hosted weights
+        # that benefit from a tool-call repair budget. "huggingface" is
+        # deliberately absent: that prefix is the hosted Inference API.
+        if provider_prefix in {"lm_studio", "lmstudio", "vllm", "hosted_vllm",
+                               "llamacpp", "llama_cpp"}:
+            return "local"
         if provider_prefix in {"anthropic", "claude"}:
             return "anthropic"
         if provider_prefix in {"gemini", "google"} and "gemini" in model_lower:
             return "gemini"
-        
+
+        # A custom/plugin provider registered via ``add_provider_adapter`` or
+        # the ``praisonai.providers`` entry-point group, addressed explicitly as
+        # ``myprovider/model``, must route to its own adapter rather than silently
+        # falling through to "openai". Lazy + failure-tolerant: discovery never
+        # breaks detection, and built-ins are handled above so this only ever
+        # matches a genuinely custom prefix.
+        if provider_prefix:
+            try:
+                from .adapters import _provider_adapters, load_provider_entry_points
+                if provider_prefix not in _provider_adapters:
+                    load_provider_entry_points()
+                if provider_prefix in _provider_adapters:
+                    return provider_prefix
+            except Exception:  # noqa: BLE001 - detection must never raise
+                pass
+
         # Use existing robust Ollama detection logic first
         if self._is_ollama_provider():
             return "ollama"
@@ -641,11 +773,12 @@ Respond with ONLY a valid JSON tool call in this format:
         if model_lower.startswith("gemini") or model_lower.startswith("google/gemini"):
             return "gemini"
         
-        # Check base_url for provider hints
-        base_urls = [self.base_url, os.getenv("OPENAI_BASE_URL", ""), os.getenv("OPENAI_API_BASE", "")]
-        if any(url and ("ollama" in url.lower() or ":11434" in url) for url in base_urls):
-            return "ollama"
-        
+        # NOTE: the base_url hint that used to live here checked exactly the
+        # same three URLs for exactly the same two patterns as
+        # _is_ollama_provider() above, so it was an unguarded duplicate -- and
+        # it re-captured hosted models that _is_ollama_provider() had just
+        # correctly declined. Detection now happens once, in one place.
+
         # Substring fallback for routed models whose provider is not the first
         # path segment (e.g. bedrock/anthropic.claude-*, vertex_ai/claude-*,
         # openrouter/anthropic/*, vertex_ai/gemini-*). Mirrors the substring
@@ -689,10 +822,25 @@ Respond with ONLY a valid JSON tool call in this format:
         if not self.model:
             return False
         
-        # Direct ollama/ prefix
-        if self.model.startswith("ollama/"):
+        # An explicit Ollama route prefix -- the user speaking, always wins.
+        # "ollama_chat/" is litellm's recommended prefix for Ollama tool calling
+        # and resolves to provider "ollama" in _detect_provider, so omitting it
+        # here made this predicate disagree with the adapter that gets selected.
+        if self.model.startswith(("ollama/", "ollama_chat/")):
             return True
-        
+
+        # A base_url says WHERE the server is, not WHAT it serves. Only let it
+        # imply Ollama for a model that could plausibly be running locally.
+        # Without this, the README's own local-model recipe
+        # (OPENAI_BASE_URL=http://localhost:11434/v1) gave gpt-4o and
+        # claude-* the Ollama adapter: tool results downgraded to
+        # natural-language user turns, streaming-with-tools disabled, and
+        # forced-tool prompts injected into a conversation that never needed
+        # them.
+        from .model_providers import is_hosted_only_model
+        if is_hosted_only_model(self.model):
+            return False
+
         # Check base_url if provided
         if self.base_url and "ollama" in self.base_url.lower():
             return True
@@ -707,6 +855,17 @@ Respond with ONLY a valid JSON tool call in this format:
             return True
         
         return False
+
+    def _is_local_openai_provider(self) -> bool:
+        """Detect local OpenAI-compatible servers (LM Studio, vLLM, llama.cpp).
+
+        These speak the standard OpenAI protocol, so well-formed tool calls
+        arrive as ``message.tool_calls``. But after a tool-call *repair* prompt
+        the model is asked to reply with a bare JSON tool call as text content;
+        like Ollama, that text must be reconstructed into a dispatchable tool
+        call rather than returned as the final answer.
+        """
+        return self._detect_provider() == "local"
 
     def _is_qwen_provider(self) -> bool:
         """Detect if this is a Qwen provider"""
@@ -736,29 +895,15 @@ Respond with ONLY a valid JSON tool call in this format:
         Returns:
             Retry delay in seconds, or default if not found
         """
-        # Try to find retry delay patterns like "retryDelay: 58s" or "retry after 58 seconds"
-        patterns = [
-            r'"retryDelay":\s*"(\d+)s"',  # JSON format: "retryDelay": "58s"
-            r'retryDelay:\s*"?(\d+)s"?',  # retryDelay: 58s or retryDelay: "58s"
-            r'retry.{0,10}?(\d+)\s*second',  # retry after 58 seconds (non-greedy)
-            r'wait\s+(\d+)\s*second',  # wait 58 seconds
-            r'try again in (\d+)',  # try again in 58
-            r'Retry-After:\s*(\d+)',  # HTTP Retry-After header
-        ]
-
         # Max delay cap to prevent unbounded sleep (5 minutes default)
         max_delay = 300
         if self._rate_limiter is not None and hasattr(self._rate_limiter, 'max_retry_delay'):
             max_delay = self._rate_limiter.max_retry_delay
 
-        for pattern in patterns:
-            match = re.search(pattern, error_message, re.IGNORECASE)
-            if match:
-                delay = float(match.group(1))
-                # Clamp to safe bounds [0, max_delay] to prevent unbounded sleep
-                return max(0, min(delay, max_delay))
+        from .error_classifier import extract_retry_after
 
-        return self._retry_delay
+        delay = extract_retry_after(Exception(error_message), cap_seconds=max_delay)
+        return self._retry_delay if delay is None else delay
 
     def _is_rate_limit_error(self, error: Exception) -> bool:
         """Check if an exception is a rate limit error.
@@ -772,13 +917,20 @@ Respond with ONLY a valid JSON tool call in this format:
         error_str = str(error).lower()
         error_type = type(error).__name__.lower()
 
-        # Check for common rate limit indicators
+        # Check for common rate limit indicators. This helper has no production
+        # callers (the runtime retry path uses classify_error_kind() /
+        # resolve_failover_decision()); it exists only for tests and is kept in
+        # step with error_classifier.classify_error() via
+        # test_rate_limit_backward_compat. The two silently diverged when that
+        # classifier learned 'quota exceeded' (Gemini's phrasing for a
+        # per-minute limit) and this list did not.
         indicators = [
             '429',
             'rate limit',
             'ratelimit',
             'too many request',
             'resource_exhausted',
+            'quota exceeded',
             'tokens per minute',
         ]
 
@@ -818,7 +970,8 @@ Respond with ONLY a valid JSON tool call in this format:
         # Billing/quota issues (must be checked before generic 429/rate-limit)
         if any(indicator in error_str for indicator in [
             "insufficient quota", "quota exceeded", "billing", "credit",
-            "payment required", "subscription required", "plan limit"
+            "payment required", "subscription required", "subscription expired",
+            "plan limit"
         ]):
             return "billing"
         
@@ -833,8 +986,9 @@ Respond with ONLY a valid JSON tool call in this format:
         if any(indicator in error_str for indicator in [
             "maximum context length", "context window is too long", 
             "context length exceeded", "context_length_exceeded",
-            "input too long", "prompt too long"
-        ]):
+            "input too long", "prompt too long", "prompt is too long",
+            "contextwindowexceeded",
+        ]) or "contextwindowexceeded" in error_type:
             return "context_overflow"
         
         # Model not found/available
@@ -844,17 +998,27 @@ Respond with ONLY a valid JSON tool call in this format:
         ]):
             return "model_not_found"
         
-        # Empty or malformed responses
+        # Format errors (checked before empty_response so "malformed response"
+        # and "*parse error*" are classified as format rather than empty output)
         if any(indicator in error_str for indicator in [
-            "empty response", "no response", "invalid response format",
-            "json decode error", "unexpected end of json", "malformed response"
+            "validation error", "invalid format", "parse error", "parsing error",
+            "malformed", "invalid json", "schema error", "decode error"
+        ]):
+            return "format_error"
+        
+        # Empty or missing response content
+        if any(indicator in error_str for indicator in [
+            "empty response", "no response", "no content", "blank output",
+            "null response", "invalid response format",
+            "json decode error", "unexpected end of json"
         ]):
             return "empty_response"
         
         # Service overloaded
         if any(indicator in error_str for indicator in [
             "overloaded", "service unavailable", "temporarily unavailable",
-            "server overloaded", "503", "502", "500"
+            "server overloaded", "server busy", "try again later",
+            "503", "502", "500"
         ]):
             return "overloaded"
         
@@ -864,13 +1028,6 @@ Respond with ONLY a valid JSON tool call in this format:
             "request timeout", "deadline exceeded"
         ]):
             return "idle_timeout"
-        
-        # Format errors
-        if any(indicator in error_str for indicator in [
-            "validation error", "invalid format", "parse error",
-            "malformed", "invalid json", "schema error"
-        ]):
-            return "format_error"
         
         # Default fallback
         return "unknown"
@@ -954,13 +1111,21 @@ Respond with ONLY a valid JSON tool call in this format:
                 is_retryable=True
             )
         
-        # Auth errors - try profile rotation if available
-        if error_kind == "auth" and self._failover_manager:
+        # Auth errors - try profile rotation if available, else surface.
+        # Without a failover manager there is no alternate credential to try,
+        # so blind retry cannot succeed — surface the auth failure immediately.
+        if error_kind == "auth":
+            if self._failover_manager:
+                return FailoverDecision(
+                    action="rotate_profile",
+                    reason=error_kind,
+                    backoff_ms=1000,  # Brief delay before trying new profile
+                    is_retryable=True
+                )
             return FailoverDecision(
-                action="rotate_profile",
+                action="surface_error",
                 reason=error_kind,
-                backoff_ms=1000,  # Brief delay before trying new profile
-                is_retryable=True
+                is_retryable=False
             )
         
         # Overloaded/timeout - retry with exponential backoff
@@ -1039,6 +1204,33 @@ Respond with ONLY a valid JSON tool call in this format:
             model = getattr(response, "model", None)
         return model or self.model
 
+    def _select_active_profile(self, kwargs: dict):
+        """Pick the profile a fresh call should start on, honoring rotation.
+
+        Defaults to the construction-time ``self._current_profile`` so existing
+        behaviour and multi-agent safety are unchanged (the shared instance
+        state is never mutated). Only when the manager is configured with
+        ``rotate_on_success`` do we re-select via ``get_next_profile()`` so a
+        long-lived, shared ``LLM`` actually spreads successful traffic across
+        the equal-priority tier instead of pinning its first profile forever.
+        The chosen profile travels in per-call kwargs, never on ``self``.
+        """
+        profile = self._current_profile
+        manager = self._failover_manager
+        if manager is None:
+            return profile, kwargs
+        rotate = getattr(getattr(manager, "config", None), "rotate_on_success", False)
+        if not rotate:
+            return profile, kwargs
+        try:
+            rotated = manager.get_next_profile()
+        except Exception:  # pragma: no cover - defensive
+            return profile, kwargs
+        if rotated and rotated != profile:
+            profile = rotated
+            kwargs = self._apply_profile_to_kwargs(rotated, kwargs)
+        return profile, kwargs
+
     def _apply_profile_to_kwargs(self, profile: "AuthProfile", kwargs: dict) -> dict:
         """Return a new kwargs dict with profile overrides applied.
 
@@ -1048,12 +1240,21 @@ Respond with ONLY a valid JSON tool call in this format:
         values fill in the gaps.
         """
         kwargs = dict(kwargs)
+        if profile.model:
+            # Params were already built, so route nvidia/ ids to NIM here too.
+            from .model_providers import to_litellm_nvidia_nim
+            new_model = to_litellm_nvidia_nim(profile.model) or profile.model
+            if self._crosses_nim_boundary(kwargs.get("model"), new_model):
+                # A key or endpoint carried over across the NIM boundary is the
+                # wrong vendor's; the profile's own values are re-applied below.
+                for key in ("api_key", "base_url", "api_base"):
+                    kwargs.pop(key, None)
+            kwargs["model"] = new_model
         if profile.api_key:
             kwargs["api_key"] = profile.api_key
         if profile.base_url:
             kwargs["base_url"] = profile.base_url
-        if profile.model:
-            kwargs["model"] = profile.model
+        self._apply_nvidia_nim_credentials(kwargs)
         return kwargs
 
     def _resolve_subscription_creds(self):
@@ -1277,8 +1478,10 @@ Respond with ONLY a valid JSON tool call in this format:
         last_error = None
         # Track the failover profile per call (never self._current_profile) so
         # concurrent calls on one shared LLM cannot corrupt each other's
-        # failover bookkeeping (issue #3613 gap 2).
-        active_profile = self._current_profile
+        # failover bookkeeping (issue #3613 gap 2). When rotate_on_success is
+        # configured, pick the next profile in the tier so a shared instance
+        # actually rotates instead of pinning its construction-time profile.
+        active_profile, kwargs = self._select_active_profile(kwargs)
 
         for attempt in range(self._max_retries + 1):
             try:
@@ -1361,8 +1564,10 @@ Respond with ONLY a valid JSON tool call in this format:
         last_error = None
         # Track the failover profile per call (never self._current_profile) so
         # concurrent coroutines on one shared LLM cannot corrupt each other's
-        # failover bookkeeping (issue #3613 gap 2).
-        active_profile = self._current_profile
+        # failover bookkeeping (issue #3613 gap 2). When rotate_on_success is
+        # configured, pick the next profile in the tier so a shared instance
+        # actually rotates instead of pinning its construction-time profile.
+        active_profile, kwargs = self._select_active_profile(kwargs)
 
         for attempt in range(self._max_retries + 1):
             try:
@@ -1434,6 +1639,40 @@ Respond with ONLY a valid JSON tool call in this format:
 
         raise last_error
 
+    def _shrink_on_context_overflow(self, error, completion_params, step) -> bool:
+        """Shrink the request after a provider context-overflow rejection.
+
+        Reactive recovery for when proactive compaction was disabled or its
+        estimate was wrong: halves the estimated prompt size per step (dropping
+        old turns, then trimming oversized tool results) and updates
+        ``completion_params["messages"]`` in place so the rest of the turn
+        keeps the smaller context. Returns True when a retry is worthwhile;
+        False leaves the caller to raise the original error, as before.
+        """
+        if step >= _CONTEXT_OVERFLOW_SHRINK_STEPS:
+            return False
+        messages = completion_params.get("messages")
+        if not isinstance(messages, list) or self.classify_error_kind(error) != "context_overflow":
+            return False
+        try:
+            from ..compaction import ContextCompactor
+            compactor = ContextCompactor()
+            before = compactor.count_total_tokens(messages)
+            shrunk = compactor.shrink_to_fit(messages, before // 2)
+            after = compactor.count_total_tokens(shrunk)
+        except Exception as shrink_error:
+            logging.debug(f"Context overflow recovery skipped: {shrink_error}")
+            return False
+        if after >= before:
+            return False
+        logging.warning(
+            f"Context window exceeded for {self.model}; shrank prompt "
+            f"{before}→{after} tokens and retrying "
+            f"({step + 1}/{_CONTEXT_OVERFLOW_SHRINK_STEPS})"
+        )
+        messages[:] = shrunk
+        return True
+
     def _completion_with_retry(self, **completion_params):
         """Execute litellm.completion with automatic retry on rate limit errors.
         
@@ -1445,9 +1684,22 @@ Respond with ONLY a valid JSON tool call in this format:
             
         Returns:
             The completion response from litellm
+
+        Raises:
+            ModelRequestBlocked: If a test suite turned real model requests off
+                via ``praisonaiagents.model_harness.allow_model_requests(False)``.
         """
+        # Last gate before the network. A ScriptedModel overrides this method
+        # entirely, so scripted turns never reach (or trip) the guard.
+        check_model_request(self.model, "litellm.completion")
         import litellm
-        response = self._call_with_retry(litellm.completion, **completion_params)
+        for step in range(_CONTEXT_OVERFLOW_SHRINK_STEPS + 1):
+            try:
+                response = self._call_with_retry(litellm.completion, **completion_params)
+                break
+            except Exception as e:
+                if not self._shrink_on_context_overflow(e, completion_params, step):
+                    raise
         if not completion_params.get("stream"):
             self._track_token_usage(response, self._response_model_for_tracking(response))
         return response
@@ -1463,12 +1715,23 @@ Respond with ONLY a valid JSON tool call in this format:
             
         Returns:
             The completion response from litellm
+
+        Raises:
+            ModelRequestBlocked: If a test suite turned real model requests off
+                via ``praisonaiagents.model_harness.allow_model_requests(False)``.
         """
+        check_model_request(self.model, "litellm.acompletion")
         import litellm
-        response = await self._call_with_retry_async(
-            litellm.acompletion,
-            **completion_params,
-        )
+        for step in range(_CONTEXT_OVERFLOW_SHRINK_STEPS + 1):
+            try:
+                response = await self._call_with_retry_async(
+                    litellm.acompletion,
+                    **completion_params,
+                )
+                break
+            except Exception as e:
+                if not self._shrink_on_context_overflow(e, completion_params, step):
+                    raise
         if not completion_params.get("stream"):
             self._track_token_usage(response, self._response_model_for_tracking(response))
         return response
@@ -1690,6 +1953,112 @@ Respond with ONLY a valid JSON tool call in this format:
             adapter = OllamaAdapter()
         return adapter.format_tool_result_message(function_name, tool_result)
 
+    def _ollama_correlation_id(self) -> str:
+        """Return the active trace/session id for Ollama chaining diagnostics."""
+        try:
+            from ..trace.context_events import get_context_emitter
+
+            session_id = getattr(get_context_emitter(), "_session_id", None)
+            if session_id:
+                return str(session_id)
+        except Exception:
+            pass
+        # A stable per-LLM fallback still lets interleaved debug logs be grouped.
+        return f"llm:{id(self):x}"
+
+    def _resolve_ollama_chained_args(
+        self,
+        arguments: Dict[str, Any],
+        tool_result_mapping: Dict[str, Any],
+        function_name: Optional[str] = None,
+        tools: Optional[List] = None,
+    ) -> Dict[str, Any]:
+        """Delegate Ollama function-name substitution to the provider adapter.
+
+        When ``function_name``/``tools`` are supplied, a parameter the target
+        tool declares as string-accepting is left untouched even if its literal
+        value happens to match an earlier tool's name (e.g. ``city="get_weather"``).
+        Otherwise a legitimate string argument would be silently overwritten with
+        an unrelated prior result. The substitution only ever targets values the
+        model meant as result references, never declared string inputs.
+        """
+        adapter = getattr(self, "_provider_adapter", None)
+        if adapter is not None:
+            try:
+                resolved = adapter.resolve_chained_arguments(
+                    arguments,
+                    tool_result_mapping,
+                    correlation_id=self._ollama_correlation_id(),
+                )
+            except (AttributeError, TypeError):
+                # Keep compatibility with lightweight test/custom adapters.
+                resolver = getattr(adapter, "resolve_chained_arguments", None)
+                if resolver is not None:
+                    resolved = resolver(arguments, tool_result_mapping)
+                else:
+                    resolved = None
+            if resolved is not None:
+                return self._preserve_declared_string_args(
+                    arguments, resolved, tool_result_mapping, function_name, tools
+                )
+        from .adapters import resolve_ollama_chained_arguments
+
+        resolved = resolve_ollama_chained_arguments(
+            arguments,
+            tool_result_mapping,
+            correlation_id=self._ollama_correlation_id(),
+        )
+        return self._preserve_declared_string_args(
+            arguments, resolved, tool_result_mapping, function_name, tools
+        )
+
+    def _preserve_declared_string_args(
+        self,
+        original: Dict[str, Any],
+        resolved: Dict[str, Any],
+        tool_result_mapping: Dict[str, Any],
+        function_name: Optional[str],
+        tools: Optional[List],
+    ) -> Dict[str, Any]:
+        """Undo result-reference substitution for declared string parameters.
+
+        Only acts when schema info is available and a value was actually changed
+        by the resolver. A no-op for callers that pass no tools (backward
+        compatible with every existing call site).
+        """
+        if not function_name or not tools or resolved is original:
+            return resolved
+        for arg_name, orig_value in original.items():
+            if not (isinstance(orig_value, str) and orig_value in tool_result_mapping):
+                continue
+            if resolved.get(arg_name) is orig_value:
+                continue  # resolver left it alone already
+            if self._param_accepts_string(function_name, arg_name, tools):
+                resolved[arg_name] = orig_value
+        return resolved
+
+    def _record_ollama_tool_result(
+        self,
+        tool_result_mapping: Dict[str, Any],
+        function_name: str,
+        tool_result: Any,
+    ) -> None:
+        """Delegate exact Ollama result recording to the provider adapter."""
+        adapter = getattr(self, "_provider_adapter", None)
+        if adapter is not None:
+            try:
+                adapter.record_tool_result(
+                    tool_result_mapping, function_name, tool_result
+                )
+                return
+            except AttributeError:
+                # Lightweight custom adapters may not implement this optional
+                # hook; retain the module-level fallback below.
+                pass
+        from .adapters import record_ollama_tool_result
+
+        record_ollama_tool_result(tool_result_mapping, function_name, tool_result)
+
     def _try_append_multimodal_tool_result(
         self,
         messages: List[Dict[str, Any]],
@@ -1756,15 +2125,92 @@ Respond with ONLY a valid JSON tool call in this format:
             return False
         if tool_calls:
             return False
-        
-        if self.force_tool_usage == 'never':
+
+        force_tool_usage = getattr(self, 'force_tool_usage', 'never')
+        if force_tool_usage == 'never':
             return False
-        elif self.force_tool_usage == 'always':
+        elif force_tool_usage == 'always':
             return True
-        elif self.force_tool_usage == 'auto':
+        elif force_tool_usage == 'auto':
             # Auto mode: only for Ollama on first iteration when model ignores tools
             return self._is_ollama_provider() and iteration_count == 0
         return False
+
+    def _force_tool_usage_message(self, response_text: str, tool_calls: Optional[List], formatted_tools: Optional[List], iteration_count: int) -> Optional[str]:
+        """Return the force-tool-usage nudge, or None when no nudge is due.
+
+        Shared by both the sync and async tool loops so a `force_tool_usage`
+        setting an agent accepted is honoured identically whether it calls or
+        awaits. Returns the user-message content string (containing the tool
+        names) when the model ignored the tools, else None.
+        """
+        if not self._should_force_tool_usage(response_text, tool_calls, formatted_tools, iteration_count):
+            return None
+        tool_names = self._get_tool_names_for_prompt(formatted_tools)
+        return self.FORCE_TOOL_USAGE_PROMPT.format(tool_names=tool_names)
+
+    def _tool_repair_message(self, tool_calls: Optional[List], formatted_tools: Optional[List]) -> Optional[str]:
+        """Return a repair nudge for malformed tool calls, or None.
+
+        Charges the `max_tool_repairs` budget once per repair attempt (via
+        `_current_repair_count`). Returns None when the budget is spent or the
+        tool calls validate cleanly. Shared by the sync and async loops.
+        """
+        max_tool_repairs = getattr(self, 'max_tool_repairs', 0)
+        if not tool_calls or max_tool_repairs <= 0:
+            return None
+        repair_attempt_count = getattr(self, '_current_repair_count', 0)
+        if repair_attempt_count >= max_tool_repairs:
+            return None
+        validation_errors = []
+        for tc in tool_calls:
+            error = self._validate_tool_call(tc, formatted_tools)
+            if error:
+                validation_errors.append(error)
+        if not validation_errors:
+            return None
+        error_msg = "; ".join(validation_errors)
+        tool_schemas = self._get_tool_schemas_for_prompt(formatted_tools)
+        self._current_repair_count = repair_attempt_count + 1
+        return self.TOOL_CALL_REPAIR_PROMPT.format(error=error_msg, tool_schemas=tool_schemas)
+
+    @staticmethod
+    def _param_accepts_string(tool_name: str, param: str, formatted_tools: Optional[List]) -> bool:
+        """True if the named parameter's declared schema accepts a string.
+
+        Used to narrow `tool_result_mapping` substitution: a declared string
+        parameter must keep the value the model sent, even when that value
+        happens to match a prior tool's name. Recognises plain `type`,
+        list-typed `type` unions, and `anyOf` unions. Never raises on a
+        malformed schema - an unreadable schema simply returns False.
+        """
+        try:
+            if not formatted_tools:
+                return False
+            for tool in formatted_tools:
+                if not isinstance(tool, dict):
+                    continue
+                func = tool.get('function')
+                if not isinstance(func, dict) or func.get('name') != tool_name:
+                    continue
+                props = func.get('parameters', {}).get('properties', {})
+                schema = props.get(param)
+                if not isinstance(schema, dict):
+                    return False
+                ptype = schema.get('type')
+                if ptype == 'string':
+                    return True
+                if isinstance(ptype, list) and 'string' in ptype:
+                    return True
+                any_of = schema.get('anyOf')
+                if isinstance(any_of, list):
+                    for member in any_of:
+                        if isinstance(member, dict) and member.get('type') == 'string':
+                            return True
+                return False
+            return False
+        except Exception:
+            return False
 
     def _validate_tool_call(self, tool_call: Dict, formatted_tools: Optional[List]) -> Optional[str]:
         """
@@ -1939,10 +2385,24 @@ Respond with ONLY a valid JSON tool call in this format:
                 logging.debug(f"[OLLAMA_FIX] Filtered arguments: {filtered_args}")
                 
             return filtered_args
-            
+
         except Exception as e:
             logging.debug(f"[OLLAMA_FIX] Error validating arguments for {function_name}: {e}")
             return arguments
+
+    def _filter_ollama_dispatch_arguments(
+        self, function_name: str, arguments: Dict[str, Any], available_tools: List
+    ) -> Dict[str, Any]:
+        """Re-validate arguments after same-turn result substitution.
+
+        The streaming fallback resolves dependent arguments immediately before
+        each sequential dispatch. Keep this wrapper separate so the source has
+        one obvious pre-dispatch filter per streaming/fallback phase while the
+        post-substitution pass still enforces the target signature.
+        """
+        return self._validate_and_filter_ollama_arguments(
+            function_name, arguments, available_tools
+        )
 
     def _handle_ollama_sequential_logic(self, iteration_count: int, accumulated_tool_results: List[Any], 
                                       response_text: str, messages: List[Dict]) -> tuple:
@@ -2012,14 +2472,19 @@ Respond with ONLY a valid JSON tool call in this format:
 
             def _reinject(handle_id: str, value: Any, session_id: Optional[str]) -> None:
                 # Best-effort: this closure is invoked from a background worker
-                # thread; appending to the LLM's persistent ``chat_history``
-                # (the same list follow-up turns replay via _build_messages)
-                # makes the resolved value available on the next turn.
-                self.chat_history.append({
+                # thread. When driven by an Agent, follow-up turns replay the
+                # Agent's own locked, bounded history (passed as a parameter into
+                # _build_messages) via the thread-safe callback wired here. For
+                # standalone LLM usage no history is kept, so this is a no-op —
+                # the LLM layer is stateless w.r.t. conversation history.
+                message = {
                     "role": "tool",
                     "tool_call_id": tool_call_id,
                     "content": f"[deferred:{function_name}] {value}",
-                })
+                }
+                history_append = getattr(self, "_agent_history_append", None)
+                if history_append is not None:
+                    history_append(message)
 
             # Atomic: only register when not already pending, so a gateway that
             # registered its own resolver for this handle first is never
@@ -2029,7 +2494,8 @@ Respond with ONLY a valid JSON tool call in this format:
             logging.debug("Deferred registration skipped (non-fatal): %s", e)
 
     def _finalise_on_limit(self, messages: List[Dict], response_text: str,
-                           temperature: float = 0.2, **kwargs) -> str:
+                           temperature: float = 0.2,
+                           wrap_up_prompt: Optional[str] = None, **kwargs) -> str:
         """
         Force a final tools-disabled answer when the tool-calling loop hits max_iter.
 
@@ -2049,7 +2515,8 @@ Respond with ONLY a valid JSON tool call in this format:
         Returns:
             The synthesised final answer, or a safe fallback string.
         """
-        wrap_up = {"role": "user", "content": self.STEP_LIMIT_WRAP_UP_PROMPT}
+        wrap_up = {"role": "user",
+                   "content": wrap_up_prompt or self.STEP_LIMIT_WRAP_UP_PROMPT}
         try:
             safe_kwargs = {k: v for k, v in kwargs.items() if k != 'reasoning_steps'}
             final_params = self._build_completion_params(
@@ -2343,7 +2810,16 @@ Respond with ONLY a valid JSON tool call in this format:
         # Create a simple hash based on tool names/content
         tool_parts = []
         for tool in tools:
-            if isinstance(tool, dict) and 'type' in tool and tool['type'] == 'function':
+            # A hosted tool must contribute its FULL spec to the cache key, or
+            # two tool lists differing only by hosted config (e.g. file_search
+            # over vs_1 vs vs_2, or different MCP server_urls) would share a key
+            # and the second call would reuse the first's formatted definition.
+            if isinstance(tool, dict) and is_hosted_tool(tool):
+                try:
+                    tool_parts.append(f"hosted:{json.dumps(tool, sort_keys=True)}")
+                except (TypeError, ValueError):
+                    tool_parts.append(f"hosted:{tool.get('type')}:{id(tool)}")
+            elif isinstance(tool, dict) and 'type' in tool and tool['type'] == 'function':
                 if 'function' in tool and isinstance(tool['function'], dict) and 'name' in tool['function']:
                     tool_parts.append(f"openai:{tool['function']['name']}")
             elif callable(tool) and hasattr(tool, '__name__'):
@@ -2384,7 +2860,16 @@ Respond with ONLY a valid JSON tool call in this format:
         formatted_tools = []
         for tool in tools:
             # Check if the tool is already in OpenAI format (e.g. from MCP.to_openai_tool())
-            if isinstance(tool, dict) and 'type' in tool and tool['type'] == 'function':
+            # Provider-hosted tools (web search, code interpreter, file search,
+            # hosted MCP) have no local callable: the provider runs them, so
+            # they carry no 'function' block and fell through to the "malformed"
+            # branch below -- the tool vanished from the request and the model
+            # simply never had it. Forward them untouched, allowlisted by type
+            # so a genuinely malformed tool is still reported.
+            if isinstance(tool, dict) and is_hosted_tool(tool):
+                logging.debug(f"Forwarding provider-hosted tool: {tool.get('type')}")
+                formatted_tools.append(tool)
+            elif isinstance(tool, dict) and 'type' in tool and tool['type'] == 'function':
                 # Validate nested dictionary structure before accessing
                 if 'function' in tool and isinstance(tool['function'], dict) and 'name' in tool['function']:
                     logging.debug(f"Using pre-formatted OpenAI tool: {tool['function']['name']}")
@@ -2398,7 +2883,10 @@ Respond with ONLY a valid JSON tool call in this format:
             # Handle lists of tools (e.g. from MCP.to_openai_tool())
             elif isinstance(tool, list):
                 for subtool in tool:
-                    if isinstance(subtool, dict) and 'type' in subtool and subtool['type'] == 'function':
+                    if isinstance(subtool, dict) and is_hosted_tool(subtool):
+                        logging.debug(f"Forwarding provider-hosted tool from list: {subtool.get('type')}")
+                        formatted_tools.append(subtool)
+                    elif isinstance(subtool, dict) and 'type' in subtool and subtool['type'] == 'function':
                         # Validate nested dictionary structure before accessing
                         if 'function' in subtool and isinstance(subtool['function'], dict) and 'name' in subtool['function']:
                             logging.debug(f"Using pre-formatted OpenAI tool from list: {subtool['function']['name']}")
@@ -2438,6 +2926,18 @@ Respond with ONLY a valid JSON tool call in this format:
                 logging.error(f"Tools are not JSON serializable: {e}")
                 return None
         
+        # Let the provider adapter rewrite anything its server cannot parse.
+        # Ollama 400s the entire request on a union-typed parameter, which is
+        # what an Optional[str] tool argument produces; hosted providers get
+        # the schema untouched.
+        if formatted_tools:
+            try:
+                adapter = getattr(self, '_provider_adapter', None)
+                if adapter is not None:
+                    formatted_tools = adapter.format_tools(formatted_tools)
+            except Exception as e:  # noqa: BLE001 -- never break tool formatting
+                logging.debug(f"Adapter tool formatting skipped: {e}")
+
         # Cache the formatted tools
         result = formatted_tools if formatted_tools else None
         if len(self._formatted_tools_cache) < self._max_cache_size:
@@ -2525,6 +3025,7 @@ Respond with ONLY a valid JSON tool call in this format:
             logging.debug(f"In-loop context management skipped: {e}")
             return messages
 
+    @_request_stop_reason
     def get_response(
         self,
         prompt: Union[str, List[Dict]],
@@ -2564,6 +3065,8 @@ Respond with ONLY a valid JSON tool call in this format:
         # Mid-run steering: optional callable() -> list[str] draining pending
         # steering notes so they can be injected as user messages between iterations.
         steering_drain = kwargs.pop("steering_drain", None)
+        # Bounded auto-continuation on output-token truncation (True/False/int cap).
+        output_continuation = kwargs.pop("output_continuation", True)
 
         def _is_cancelled() -> bool:
             return cancel_token is not None and getattr(cancel_token, "is_set", lambda: False)()
@@ -2706,8 +3209,14 @@ Respond with ONLY a valid JSON tool call in this format:
             # Structured stop reason so callers can distinguish completion from
             # truncation (unified with the OpenAI-native path). "completed" default.
             self._last_stop_reason = "completed"
+            from ._continuation import OutputContinuation, is_structured
+            # Schema-enforced output cannot be continued as a text suffix.
+            _continuation = OutputContinuation(False if (output_json or output_pydantic or is_structured(getattr(self, "response_format", None))) else output_continuation)
 
             while iteration_count < max_iterations:
+                # Continue only when *this* response hit the length limit, not on a
+                # sticky truncation left by an earlier (e.g. repaired) tool call.
+                _stop_before = self._last_stop_reason
                 # G2: Check for cancellation at the top of each tool iteration so a
                 # /stop request promptly halts a mid-flight run on every provider.
                 if _is_cancelled():
@@ -2732,6 +3241,11 @@ Respond with ONLY a valid JSON tool call in this format:
                     # OpenAI models use the Responses API which returns text
                     # and tool calls as separate output items — no content:null.
                     if self._supports_responses_api():
+                        # A refusal belongs to one provider response. If that
+                        # response also requested tools, classify the follow-up
+                        # independently without clearing stronger loop outcomes.
+                        if iteration_count > 0 and self._last_stop_reason == "refused":
+                            self._last_stop_reason = "completed"
                         responses_params = self._build_responses_params(
                             messages=messages,
                             tools=formatted_tools,
@@ -2742,13 +3256,28 @@ Respond with ONLY a valid JSON tool call in this format:
                         )
 
                         if stream:
-                            response_text, tool_calls = self._stream_responses_api(
+                            response_text, tool_calls, stream_response = self._stream_responses_api(
                                 responses_params,
                                 verbose=verbose,
                                 stream_callback=stream_callback,
                                 emit_events=emit_events,
                                 current_time=current_time,
                             )
+                            # Streamed calls still incur real token cost; track
+                            # usage from the final response.completed event so
+                            # the public collector isn't silently zeroed.
+                            if stream_response is not None:
+                                self._track_token_usage(stream_response, self.model)
+                                if self.metrics and getattr(stream_response, 'usage', None):
+                                    usage = stream_response.usage
+                                    tokens_in = getattr(usage, 'input_tokens', 0) or 0
+                                    tokens_out = getattr(usage, 'output_tokens', 0) or 0
+                                    llm_latency_ms = (time.time() - current_time) * 1000
+                                    _get_display_functions()['execute_sync_callback'](
+                                        'llm_end', model=self.model,
+                                        tokens_in=tokens_in, tokens_out=tokens_out,
+                                        cost=None, latency_ms=llm_latency_ms,
+                                    )
                         else:
                             resp = self._call_responses_api(**responses_params)
                             response_text, tool_calls, _reasoning = self._extract_from_responses_output(resp)
@@ -2873,6 +3402,7 @@ Respond with ONLY a valid JSON tool call in this format:
                             tool_results_batch = executor.execute_batch(
                                 tool_calls_batch, execute_tool_fn,
                                 timeout_ms=self.tool_timeout_ms,
+                                cancel_token=cancel_token,
                             )
                             
                             tool_results = []
@@ -2917,19 +3447,9 @@ Respond with ONLY a valid JSON tool call in this format:
                                 )
 
                                 # Append tool result as standard tool message
-                                if tool_result is None:
-                                    content = "Function returned an empty output"
-                                elif isinstance(tool_result, dict) and 'error' in tool_result:
-                                    content = f"Error: {tool_result.get('error', 'Unknown error')}. Please inform the user."
-                                elif isinstance(tool_result, list) and tool_result and isinstance(tool_result[0], dict) and 'error' in tool_result[0]:
-                                    content = f"Error: {tool_result[0].get('error', 'Unknown error')}. Please inform the user."
-                                else:
-                                    content = json.dumps(tool_result)
-                                messages.append({
-                                    "role": "tool",
-                                    "tool_call_id": tool_result_obj.tool_call_id,
-                                    "content": content,
-                                })
+                                messages.append(self._create_tool_message(
+                                    function_name, tool_result,
+                                    tool_result_obj.tool_call_id, is_ollama=False))
 
                             # Report any unparseable tool-call arguments so the
                             # model can re-emit them (never dispatched with {}).
@@ -2950,10 +3470,12 @@ Respond with ONLY a valid JSON tool call in this format:
                             continue
                         else:
                             # No tool calls — we have a final answer
-                            if iteration_count > 0:
-                                final_response_text = response_text.strip() if response_text else ""
-                            else:
-                                final_response_text = response_text.strip() if response_text else ""
+                            if _continuation.take(messages, response_text, self._last_stop_reason == "length_truncated" and _stop_before != "length_truncated"):
+                                self._last_stop_reason = "completed"
+                                response_text = ""
+                                continue
+                            response_text = _continuation.stitch(response_text)
+                            final_response_text = response_text.strip() if response_text else ""
                             break
 
                     # ── Chat Completions path (unchanged) ───────────────────
@@ -2974,6 +3496,7 @@ Respond with ONLY a valid JSON tool call in this format:
                         response_text = resp["choices"][0]["message"]["content"]
                         final_response = resp
                         _final_llm_response = resp  # Store for token usage extraction
+                        self._record_finish_reason(resp)
                         
                         # Emit StreamEvent for reasoning content if callback provided
                         if _emit and reasoning_content:
@@ -3087,12 +3610,7 @@ Respond with ONLY a valid JSON tool call in this format:
                         if formatted_tools and not self._supports_streaming_tools():
                             # Provider doesn't support streaming with tools, use non-streaming
                             use_streaming = False
-                        
-                        # Gemini has issues with streaming + tools, disable streaming for Gemini when tools are present
-                        if use_streaming and formatted_tools and self._is_gemini_model():
-                            logging.debug("Disabling streaming for Gemini model with tools due to JSON parsing issues")
-                            use_streaming = False
-                        
+
                         # Track whether fallback was successful to avoid duplicate API calls
                         fallback_completed = False
                         
@@ -3118,6 +3636,7 @@ Respond with ONLY a valid JSON tool call in this format:
                                                 **kwargs
                                             )
                                         ):
+                                            self._record_stream_finish(chunk)
                                             if chunk and chunk.choices and chunk.choices[0].delta:
                                                 delta = chunk.choices[0].delta
                                                 response_text, tool_calls = self._process_stream_delta(
@@ -3137,6 +3656,7 @@ Respond with ONLY a valid JSON tool call in this format:
                                             **kwargs
                                         )
                                     ):
+                                        self._record_stream_finish(chunk)
                                         if chunk and chunk.choices and chunk.choices[0].delta:
                                             delta = chunk.choices[0].delta
                                             response_text, tool_calls = self._process_stream_delta(
@@ -3168,6 +3688,7 @@ Respond with ONLY a valid JSON tool call in this format:
                                                         **kwargs
                                                     )
                                                 ):
+                                                    self._record_stream_finish(chunk)
                                                     if chunk and chunk.choices and chunk.choices[0].delta:
                                                         delta = chunk.choices[0].delta
                                                         response_text, tool_calls = self._process_stream_delta(
@@ -3201,6 +3722,7 @@ Respond with ONLY a valid JSON tool call in this format:
                                                 )
                                             )
                                             _final_llm_response = final_response  # Store for token usage extraction
+                                            self._record_finish_reason(final_response)
                                             # Handle None content from Gemini
                                             response_content = final_response["choices"][0]["message"].get("content")
                                             response_text = response_content if response_content is not None else ""
@@ -3267,7 +3789,9 @@ Respond with ONLY a valid JSON tool call in this format:
                                     raise streaming_error
                             
                             if streaming_success:
-                                response_text = response_text.strip() if response_text else ""
+                                # Keep whitespace at a continuation seam; the stitched answer is stripped later.
+                                if not (self._last_stop_reason == "length_truncated" and _stop_before != "length_truncated") and not _continuation.text:
+                                    response_text = response_text.strip() if response_text else ""
                                 
                                 # Execute callbacks after streaming completes (only if not verbose, since verbose will call display_interaction later)
                                 if not verbose and not callback_executed:
@@ -3316,6 +3840,7 @@ Respond with ONLY a valid JSON tool call in this format:
                                             **kwargs
                                         )
                                     ):
+                                        self._record_stream_finish(chunk)
                                         if chunk and chunk.choices and chunk.choices[0].delta:
                                             delta = chunk.choices[0].delta
                                             response_text, tool_calls = self._process_stream_delta(
@@ -3363,6 +3888,7 @@ Respond with ONLY a valid JSON tool call in this format:
                                             **kwargs
                                         )
                                     ):
+                                        self._record_stream_finish(chunk)
                                         if chunk and chunk.choices and chunk.choices[0].delta:
                                             delta = chunk.choices[0].delta
                                             response_text, tool_calls = self._process_stream_delta(
@@ -3390,6 +3916,7 @@ Respond with ONLY a valid JSON tool call in this format:
                                         )
                                     )
                                     _final_llm_response = final_response  # Store for token usage extraction
+                                    self._record_finish_reason(final_response)
                                 # Handle None content from Gemini
                                 response_content = final_response["choices"][0]["message"].get("content")
                                 response_text = response_content if response_content is not None else ""
@@ -3433,39 +3960,16 @@ Respond with ONLY a valid JSON tool call in this format:
                     tool_calls = final_response["choices"][0]["message"].get("tool_calls")
                     
                     
-                    # For Ollama, parse tool calls from response text if not in tool_calls field
-                    if self._is_ollama_provider() and not tool_calls and response_text and formatted_tools:
-                        # Try to parse JSON tool call from response text
-                        try:
-                            response_json = json.loads(response_text.strip())
-                            if isinstance(response_json, dict) and "name" in response_json:
-                                # Convert Ollama format to standard tool_calls format
-                                tool_calls = [{
-                                    "id": f"tool_{iteration_count}",
-                                    "type": "function",
-                                    "function": {
-                                        "name": response_json["name"],
-                                        "arguments": json.dumps(response_json.get("arguments", {}))
-                                    }
-                                }]
-                                logging.debug(f"Parsed Ollama tool call from response: {tool_calls}")
-                            elif isinstance(response_json, list):
-                                # Handle multiple tool calls
-                                tool_calls = []
-                                for idx, tool_json in enumerate(response_json):
-                                    if isinstance(tool_json, dict) and "name" in tool_json:
-                                        tool_calls.append({
-                                            "id": f"tool_{iteration_count}_{idx}",
-                                            "type": "function",
-                                            "function": {
-                                                "name": tool_json["name"],
-                                                "arguments": json.dumps(tool_json.get("arguments", {}))
-                                            }
-                                        })
-                                if tool_calls:
-                                    logging.debug(f"Parsed multiple Ollama tool calls from response: {tool_calls}")
-                        except (json.JSONDecodeError, KeyError) as e:
-                            logging.debug(f"Could not parse Ollama tool call from response: {e}")
+                    # Recover a tool call the provider emitted as response text
+                    # instead of in the tool_calls field. Which providers do this
+                    # is the adapter's business, not this loop's; DefaultAdapter
+                    # returns None so no other provider is affected.
+                    if not tool_calls and response_text and formatted_tools:
+                        recovered = self._provider_adapter.recover_tool_calls_from_text(
+                            response_text, formatted_tools)
+                        if recovered:
+                            tool_calls = recovered
+                            logging.debug(f"Recovered tool calls from response text: {tool_calls}")
                     
                     # Parse tool calls from XML format in response text 
                     # Try for known XML models first, or fallback for any model that might output XML
@@ -3526,13 +4030,12 @@ Respond with ONLY a valid JSON tool call in this format:
                                 logging.debug(f"Parsed {len(tool_calls)} tool call(s) from XML format")
                     
                     # Force tool usage logic: if model ignores tools but should use them
-                    if self._should_force_tool_usage(response_text, tool_calls, formatted_tools, iteration_count):
-                        tool_names = self._get_tool_names_for_prompt(formatted_tools)
-                        force_prompt = self.FORCE_TOOL_USAGE_PROMPT.format(tool_names=tool_names)
-                        logging.debug(f"[OLLAMA_RELIABILITY] Force tool usage triggered. Adding prompt for tools: {tool_names}")
+                    _force = self._force_tool_usage_message(response_text, tool_calls, formatted_tools, iteration_count)
+                    if _force is not None:
+                        logging.debug(f"[OLLAMA_RELIABILITY] Force tool usage triggered. Adding prompt for tools: {self._get_tool_names_for_prompt(formatted_tools)}")
                         messages.append({
                             "role": "user",
-                            "content": force_prompt
+                            "content": _force
                         })
                         iteration_count += 1
                         continue
@@ -3547,32 +4050,16 @@ Respond with ONLY a valid JSON tool call in this format:
                         continue
                     
                     # Tool call repair logic: validate and repair malformed tool calls
-                    repair_attempt_count = getattr(self, '_current_repair_count', 0)
-                    if tool_calls and self.max_tool_repairs > 0 and repair_attempt_count < self.max_tool_repairs:
-                        # Validate each tool call
-                        validation_errors = []
-                        for tc in tool_calls:
-                            error = self._validate_tool_call(tc, formatted_tools)
-                            if error:
-                                validation_errors.append(error)
-                        
-                        if validation_errors:
-                            # Tool call is invalid, attempt repair
-                            error_msg = "; ".join(validation_errors)
-                            tool_schemas = self._get_tool_schemas_for_prompt(formatted_tools)
-                            repair_prompt = self.TOOL_CALL_REPAIR_PROMPT.format(
-                                error=error_msg,
-                                tool_schemas=tool_schemas
-                            )
-                            logging.debug(f"[OLLAMA_RELIABILITY] Tool call repair attempt {repair_attempt_count + 1}/{self.max_tool_repairs}: {error_msg}")
-                            messages.append({
-                                "role": "user",
-                                "content": repair_prompt
-                            })
-                            self._current_repair_count = repair_attempt_count + 1
-                            iteration_count += 1
-                            tool_calls = None  # Clear invalid tool calls
-                            continue
+                    _repair = self._tool_repair_message(tool_calls, formatted_tools)
+                    if _repair is not None:
+                        logging.debug(f"[OLLAMA_RELIABILITY] Tool call repair attempt {self._current_repair_count}/{self.max_tool_repairs}")
+                        messages.append({
+                            "role": "user",
+                            "content": _repair
+                        })
+                        iteration_count += 1
+                        tool_calls = None  # Clear invalid tool calls
+                        continue
                     
                     # Reset repair count on successful tool call
                     self._current_repair_count = 0
@@ -3644,17 +4131,14 @@ Respond with ONLY a valid JSON tool call in this format:
                                 messages.append(self._tool_parse_error_message(function_name, tool_call_id))
                                 continue
 
+                            # First resolve any reference to a previous tool
+                            # result, then filter unknown argument keys.
+                            if is_ollama:
+                                arguments = self._resolve_ollama_chained_args(
+                                    arguments, tool_result_mapping, function_name, tools
+                                )
                             # Validate and filter arguments for Ollama provider
                             if is_ollama and tools:
-                                # First check if any argument references a previous tool result
-                                if is_ollama and tool_result_mapping:
-                                    # Replace function names with their results in arguments
-                                    for arg_name, arg_value in list(arguments.items()):
-                                        if isinstance(arg_value, str) and arg_value in tool_result_mapping:
-                                            # Replace function name with its result
-                                            arguments[arg_name] = tool_result_mapping[arg_value]
-                                            logging.debug(f"[OLLAMA_FIX] Replaced {arg_value} with {tool_result_mapping[arg_value]} in {function_name} arguments")
-                                
                                 arguments = self._validate_and_filter_ollama_arguments(function_name, arguments, tools)
 
                             logging.debug(f"[TOOL_EXEC_DEBUG] About to execute tool {function_name} with args: {arguments}")
@@ -3690,17 +4174,10 @@ Respond with ONLY a valid JSON tool call in this format:
                             accumulated_tool_results.append(tool_result)  # Accumulate across iterations
                             
                             # For Ollama, store the result for potential chaining
-                            if is_ollama:
-                                # Extract numeric value from result if it contains one
-                                if isinstance(tool_result, (int, float)):
-                                    tool_result_mapping[function_name] = tool_result
-                                elif isinstance(tool_result, str):
-                                    import re
-                                    match = re.search(r'\b(\d+)\b', tool_result)
-                                    if match:
-                                        tool_result_mapping[function_name] = int(match.group(1))
-                                    else:
-                                        tool_result_mapping[function_name] = tool_result
+                            if is_ollama and _ollama_tool_result_is_successful(tool_result):
+                                self._record_ollama_tool_result(
+                                    tool_result_mapping, function_name, tool_result
+                                )
 
                             if verbose:
                                 display_message = f"Agent {agent_name} called function '{function_name}' with arguments: {arguments}\n"
@@ -3737,20 +4214,8 @@ Respond with ONLY a valid JSON tool call in this format:
                                 pass
                             else:
                                 # For other providers, use tool role with tool_call_id
-                                # Format error results more clearly
-                                if tool_result is None:
-                                    content = "Function returned an empty output"
-                                elif isinstance(tool_result, dict) and 'error' in tool_result:
-                                    content = f"Error: {tool_result.get('error', 'Unknown error')}. Please inform the user that the operation could not be completed."
-                                elif isinstance(tool_result, list) and len(tool_result) > 0 and isinstance(tool_result[0], dict) and 'error' in tool_result[0]:
-                                    content = f"Error: {tool_result[0].get('error', 'Unknown error')}. Please inform the user that the operation could not be completed."
-                                else:
-                                    content = json.dumps(tool_result)
-                                messages.append({
-                                    "role": "tool",
-                                    "tool_call_id": tool_call_id,
-                                    "content": content
-                                })
+                                messages.append(self._create_tool_message(
+                                    function_name, tool_result, tool_call_id, is_ollama=False))
 
                             # Check if we should continue (for tools like sequential thinking)
                             # This mimics the logic from agent.py lines 1004-1007
@@ -3762,8 +4227,8 @@ Respond with ONLY a valid JSON tool call in this format:
                         if _deferred_media_followups:
                             messages.extend(_deferred_media_followups)
 
-                        # If we should continue, increment iteration and continue loop
-                        if should_continue:
+                        # Continuations must still reach the budget finalizer on the last step.
+                        if should_continue and iteration_count + 1 < max_iterations:
                             iteration_count += 1
                             continue
 
@@ -3786,9 +4251,6 @@ Respond with ONLY a valid JSON tool call in this format:
                             # Reset interaction_displayed to ensure final summary is shown
                             interaction_displayed = False
                             break
-                        elif tool_summary_text is None and iteration_count > self.OLLAMA_SUMMARY_ITERATION_THRESHOLD:
-                            # Continue iteration after adding final answer prompt
-                            continue
                         
                         # Safety check: prevent infinite loops for any provider
                         if iteration_count + 1 >= max_iterations:
@@ -3809,8 +4271,11 @@ Respond with ONLY a valid JSON tool call in this format:
                         
                         # Special early stopping logic for Ollama when tool results are available
                         # Ollama often provides empty responses after successful tool execution
-                        if (self._is_ollama_provider() and accumulated_tool_results and iteration_count >= 1 and 
-                            (not response_text or response_text.strip() == "")):
+                        if self._provider_adapter.handle_empty_response_with_tools({
+                            'iteration_count': iteration_count,
+                            'accumulated_tool_results': accumulated_tool_results,
+                            'response_text': response_text or '',
+                        }):
                             # Generate coherent response from tool results
                             tool_summary = self._generate_ollama_tool_summary(accumulated_tool_results, response_text)
                             if tool_summary:
@@ -3819,12 +4284,11 @@ Respond with ONLY a valid JSON tool call in this format:
                                 interaction_displayed = False
                                 break
                         
-                        # If we've executed tools in previous iterations, this response contains the final answer
-                        if iteration_count > 0:
-                            final_response_text = response_text.strip() if response_text else ""
-                            break
-                        
-                        # First iteration with no tool calls - just return the response
+                        if _continuation.take(messages, response_text, self._last_stop_reason == "length_truncated" and _stop_before != "length_truncated"):
+                            self._last_stop_reason = "completed"
+                            response_text = ""
+                            continue
+                        response_text = _continuation.stitch(response_text)
                         final_response_text = response_text.strip() if response_text else ""
                         break
                         
@@ -3938,9 +4402,6 @@ Respond with ONLY a valid JSON tool call in this format:
             
             # Handle output formatting
             if output_json or output_pydantic:
-                self.chat_history.append({"role": "user", "content": original_prompt})
-                self.chat_history.append({"role": "assistant", "content": response_text})
-                
                 if verbose and not interaction_displayed:
                     _get_display_functions()['display_interaction'](original_prompt, response_text, markdown=markdown,
                                      generation_time=time.time() - start_time, console=self.console,
@@ -4110,7 +4571,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                              agent_name=agent_name, agent_role=agent_role, agent_tools=agent_tools,
                                              task_name=task_name, task_description=task_description, task_id=task_id)
                             interaction_displayed = True
-                        return response_text
+                        return _prepare_return_value(response_text)
 
                     if reflection_count >= max_reflect - 1:
                         if verbose and not interaction_displayed:
@@ -4119,7 +4580,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                              agent_name=agent_name, agent_role=agent_role, agent_tools=agent_tools,
                                              task_name=task_name, task_description=task_description, task_id=task_id)
                             interaction_displayed = True
-                        return response_text
+                        return _prepare_return_value(response_text)
 
                     reflection_count += 1
                     messages.extend([
@@ -4252,6 +4713,17 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
         Raises:
             Exception: If streaming fails or LLM call encounters an error
         """
+        # Extract the optional cancel token before building completion params
+        # so it is forwarded to the tool batch executor (not leaked to litellm).
+        cancel_token = kwargs.pop("cancel_token", None)
+
+        def _stream_is_cancelled() -> bool:
+            return cancel_token is not None and getattr(
+                cancel_token, "is_set", lambda: False)()
+
+        def _stream_cancel_reason() -> str:
+            return getattr(cancel_token, "reason", None) or "user"
+
         try:
             import litellm
             
@@ -4278,6 +4750,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                 try:
                     tool_calls = []
                     response_text = ""
+                    ollama_tool_result_mapping: Dict[str, Any] = {}
                     consecutive_errors = 0
                     max_consecutive_errors = 3  # Fallback to non-streaming after 3 consecutive errors
                     
@@ -4399,6 +4872,17 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                     self._tool_parse_error_message(function_name, tool_call_id)
                                 )
                                 continue
+                            # Resolve any same-turn result reference first.
+                            if is_ollama:
+                                arguments = self._resolve_ollama_chained_args(
+                                    arguments, ollama_tool_result_mapping, function_name, tools
+                                )
+                            # Validate and filter before dispatch. Nothing has
+                            # been yielded yet, so streaming consumers remain
+                            # framed even when a weak model emits extra keys.
+                            if is_ollama and tools:
+                                arguments = self._validate_and_filter_ollama_arguments(
+                                    function_name, arguments, tools)
                             tool_calls_batch.append(ToolCall(
                                 function_name=function_name,
                                 arguments=arguments, 
@@ -4412,15 +4896,90 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                         
                         # Execute batch and add results to conversation
                         # (forward optional per-tool timeout)
-                        tool_results = executor.execute_batch(
-                            tool_calls_batch, execute_tool_fn,
-                            timeout_ms=self.tool_timeout_ms,
-                        )
+                        # ``time`` is re-imported locally further down this
+                        # function, which makes the module-level name unbound
+                        # here; use a distinct alias.
+                        from time import perf_counter as _perf_counter
+                        _batch_started = _perf_counter()
+                        if is_ollama and not parallel_tool_calls:
+                            # Ollama models commonly emit a later call whose
+                            # argument is the name of an earlier call. Execute
+                            # these calls one at a time so each result can be
+                            # resolved before the next dispatch.
+                            tool_results = []
+                            for _tool_call in tool_calls_batch:
+                                _tool_call.arguments = self._resolve_ollama_chained_args(
+                                    _tool_call.arguments, ollama_tool_result_mapping,
+                                    _tool_call.function_name, tools
+                                )
+                                # The batch-preparation filter above has
+                                # already removed unknown keys. Re-validate
+                                # after substitution so dependent values follow
+                                # the same signature contract as other paths.
+                                _tool_call.arguments = self._filter_ollama_dispatch_arguments(
+                                    _tool_call.function_name,
+                                    _tool_call.arguments,
+                                    tools,
+                                )
+                                _result = executor.execute_batch(
+                                    [_tool_call], execute_tool_fn,
+                                    timeout_ms=self.tool_timeout_ms,
+                                    cancel_token=cancel_token,
+                                )
+                                tool_results.extend(_result)
+                                if _result and _result[0].error is None:
+                                    self._record_ollama_tool_result(
+                                        ollama_tool_result_mapping,
+                                        _tool_call.function_name,
+                                        _result[0].result,
+                                    )
+                        else:
+                            tool_results = executor.execute_batch(
+                                tool_calls_batch, execute_tool_fn,
+                                timeout_ms=self.tool_timeout_ms,
+                                cancel_token=cancel_token,
+                            )
+                            if is_ollama:
+                                for _tool_call, _result in zip(
+                                    tool_calls_batch, tool_results
+                                ):
+                                    if _result.error is None:
+                                        self._record_ollama_tool_result(
+                                            ollama_tool_result_mapping,
+                                            _tool_call.function_name,
+                                            _result.result,
+                                        )
+                        _batch_elapsed = _perf_counter() - _batch_started
                         
                         for tool_result in tool_results:
                             # Register any deferred handle so its eventual
                             # background result is re-injected, not lost.
                             self._register_deferred_if_any(tool_result)
+                            # Fire the 'tool_call' display callback exactly as
+                            # the non-streaming loop does, so streaming UIs
+                            # see tool activity (Issue #4716). Best-effort: a
+                            # callback error must never break the stream.
+                            try:
+                                if tool_result.result is None:
+                                    _result_str = None
+                                else:
+                                    try:
+                                        _result_str = json.dumps(tool_result.result)
+                                    except (TypeError, ValueError):
+                                        _result_str = str(tool_result.result)
+                                _get_display_functions()['execute_sync_callback'](
+                                    'tool_call',
+                                    message=f"Calling function: {tool_result.function_name}",
+                                    tool_name=tool_result.function_name,
+                                    tool_input=tool_result.arguments,
+                                    tool_output=_result_str[:200] if _result_str else None,
+                                    # Only the batch is timed; per-tool timing
+                                    # is not available from the executor.
+                                    elapsed_time=_batch_elapsed if len(tool_results) == 1 else None,
+                                    success=tool_result.error is None,
+                                )
+                            except Exception as _cb_error:
+                                logging.debug(f"tool_call callback failed for '{tool_result.function_name}': {_cb_error}")
                             if tool_result.error is None:
                                 # Successful execution
                                 tool_message = self._create_tool_message(
@@ -4443,24 +5002,191 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                         # model can re-emit them (never dispatched with {}).
                         for _err_msg in parse_error_messages:
                             messages.append(_err_msg)
-                        
-                        # Continue conversation after tool execution - get follow-up response
-                        try:
-                            follow_up_response = self._completion_with_retry(
-                                **self._build_completion_params(
-                                    messages=messages,
-                                    tools=formatted_tools,
-                                    temperature=temperature,
-                                    stream=False,
-                                    **kwargs
-                                )
+
+                        # A cancellation may arrive while the tool batch is
+                        # running.  The executor returns promptly with
+                        # cancellation results, but must not trigger another
+                        # model request for a turn the caller has already
+                        # stopped (Issue #5073).
+                        if _stream_is_cancelled():
+                            reason = _stream_cancel_reason()
+                            logging.debug(
+                                "Streaming LLM cancelled before follow-up: %s",
+                                reason,
                             )
-                            
-                            if follow_up_response and follow_up_response.choices:
-                                follow_up_content = follow_up_response.choices[0].message.content
-                                if follow_up_content:
-                                    # Yield the follow-up response after tool execution
-                                    yield follow_up_content
+                            yield f"Task interrupted: {reason}"
+                            return
+                         
+                        # Trim the conversation before the follow-up request so
+                        # the stream loop bounds its context like the sync and
+                        # async loops do (each tool turn appends an assistant
+                        # message plus one tool reply per call).
+                        messages = self._manage_context_in_loop(messages)
+
+                        # Continue conversation after tool execution. The model
+                        # may answer the follow-up with *another* tool call (any
+                        # multi-step task): the previous single-shot follow-up
+                        # only read `content`, so that second call was silently
+                        # dropped, nothing was executed, and nothing was yielded.
+                        # Loop the follow-up, executing any further tool calls,
+                        # until the model returns plain content -- matching the
+                        # sync/async non-streaming loops. The follow-up stays
+                        # non-streaming so the assembled tool_calls are read
+                        # directly off the completed message.
+                        try:
+                            follow_up_iterations = 0
+                            max_follow_up = kwargs.get("max_iterations", getattr(self, "max_iter", 20))
+                            # The guardrail must bound the *total* tools executed
+                            # across every follow-up batch, not each batch alone;
+                            # otherwise several sub-limit batches together run more
+                            # (repeated side-effecting) calls than configured. Seed
+                            # with the first streamed batch already executed above.
+                            total_tool_calls_executed = len(tool_calls)
+                            while follow_up_iterations < max_follow_up:
+                                follow_up_iterations += 1
+                                if _stream_is_cancelled():
+                                    yield f"Task interrupted: {_stream_cancel_reason()}"
+                                    return
+
+                                follow_up_response = self._completion_with_retry(
+                                    **self._build_completion_params(
+                                        messages=messages,
+                                        tools=formatted_tools,
+                                        temperature=temperature,
+                                        stream=False,
+                                        **kwargs
+                                    )
+                                )
+
+                                if not (follow_up_response and follow_up_response.choices):
+                                    break
+                                follow_message = follow_up_response.choices[0].message
+                                follow_content = getattr(follow_message, "content", None)
+                                follow_tool_calls = getattr(follow_message, "tool_calls", None)
+
+                                # Terminal turn: no further tool calls. Yield the
+                                # final answer and stop.
+                                if not (follow_tool_calls and execute_tool_fn):
+                                    if follow_content:
+                                        yield follow_content
+                                    break
+
+                                if (total_tool_calls_executed + len(follow_tool_calls)
+                                        > max_tool_calls_per_turn):
+                                    logging.warning(
+                                        f"Tool call limit reached ({max_tool_calls_per_turn}). "
+                                        "Stopping to prevent infinite loop.")
+                                    if follow_content:
+                                        yield follow_content
+                                    break
+                                total_tool_calls_executed += len(follow_tool_calls)
+
+                                # Any prose emitted alongside the calls is part
+                                # of the answer.
+                                if follow_content:
+                                    yield follow_content
+
+                                # Record the assistant turn, then execute the new
+                                # tool calls with the same executor path as the
+                                # first turn.
+                                if is_ollama:
+                                    messages.append({"role": "assistant", "content": follow_content or ""})
+                                else:
+                                    messages.append({
+                                        "role": "assistant",
+                                        "content": follow_content or "",
+                                        "tool_calls": self._serialize_tool_calls(follow_tool_calls),
+                                    })
+
+                                follow_batch = []
+                                follow_parse_errors = []
+                                for tool_call in follow_tool_calls:
+                                    function_name, arguments, tool_call_id = self._extract_tool_call_info(tool_call, is_ollama)
+                                    if self._tool_arguments_parse_failed(arguments):
+                                        follow_parse_errors.append(
+                                            self._tool_parse_error_message(function_name, tool_call_id))
+                                        continue
+                                    if is_ollama:
+                                        arguments = self._resolve_ollama_chained_args(
+                                            arguments, ollama_tool_result_mapping, function_name, tools)
+                                    if is_ollama and tools:
+                                        arguments = self._validate_and_filter_ollama_arguments(
+                                            function_name, arguments, tools)
+                                    follow_batch.append(ToolCall(
+                                        function_name=function_name,
+                                        arguments=arguments,
+                                        tool_call_id=tool_call_id,
+                                        is_ollama=is_ollama,
+                                        iteration_index=0,
+                                    ))
+
+                                if is_ollama and not parallel_tool_calls:
+                                    # Mirror the first streamed batch: an Ollama
+                                    # follow-up batch can also contain a call whose
+                                    # argument names an earlier call in the *same*
+                                    # batch. Execute one at a time so each result is
+                                    # recorded before the next call's args are
+                                    # resolved; otherwise the dependent call runs
+                                    # with an unresolved placeholder.
+                                    follow_results = []
+                                    for _tool_call in follow_batch:
+                                        _tool_call.arguments = self._resolve_ollama_chained_args(
+                                            _tool_call.arguments, ollama_tool_result_mapping,
+                                            _tool_call.function_name, tools,
+                                        )
+                                        _tool_call.arguments = self._filter_ollama_dispatch_arguments(
+                                            _tool_call.function_name,
+                                            _tool_call.arguments,
+                                            tools,
+                                        )
+                                        _result = executor.execute_batch(
+                                            [_tool_call], execute_tool_fn,
+                                            timeout_ms=self.tool_timeout_ms,
+                                            cancel_token=cancel_token,
+                                        )
+                                        follow_results.extend(_result)
+                                        if _result and _result[0].error is None:
+                                            self._record_ollama_tool_result(
+                                                ollama_tool_result_mapping,
+                                                _tool_call.function_name,
+                                                _result[0].result,
+                                            )
+                                    for tool_result in follow_results:
+                                        self._register_deferred_if_any(tool_result)
+                                        messages.append(self._create_tool_message(
+                                            tool_result.function_name,
+                                            tool_result.result,
+                                            tool_result.tool_call_id,
+                                            tool_result.is_ollama,
+                                        ))
+                                else:
+                                    follow_results = executor.execute_batch(
+                                        follow_batch, execute_tool_fn,
+                                        timeout_ms=self.tool_timeout_ms,
+                                        cancel_token=cancel_token,
+                                    )
+                                    for tool_result in follow_results:
+                                        self._register_deferred_if_any(tool_result)
+                                        if is_ollama and tool_result.error is None:
+                                            self._record_ollama_tool_result(
+                                                ollama_tool_result_mapping,
+                                                tool_result.function_name,
+                                                tool_result.result,
+                                            )
+                                        messages.append(self._create_tool_message(
+                                            tool_result.function_name,
+                                            tool_result.result,
+                                            tool_result.tool_call_id,
+                                            tool_result.is_ollama,
+                                        ))
+                                for _err_msg in follow_parse_errors:
+                                    messages.append(_err_msg)
+
+                                messages = self._manage_context_in_loop(messages)
+                            else:
+                                logging.warning(
+                                    f"Follow-up iteration limit reached ({max_follow_up}) "
+                                    "on the streaming path.")
                         except Exception as e:
                             import time
                             error_ref = f"followup-{int(time.time() * 1000)}"
@@ -4483,31 +5209,208 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                         logging.warning(f"Streaming failed due to connection issues: {e}")
                     else:
                         logging.error(f"Streaming failed with unexpected error: {e}")
+
+                    # Replay-safety gate (#3860): switching response mode is still
+                    # a provider replay. The retry driver already surfaces a
+                    # post-dispatch failure (read timeout, connection reset
+                    # mid-response) on a side-effecting turn rather than replaying
+                    # it — a tool call may already have run server-side. Reissuing
+                    # the same request with stream=False here would silently bypass
+                    # that decision. The streaming path re-raises wrapping the
+                    # cause (raise Exception(...) from read_timeout), so inspect
+                    # the whole chain. Only block when the turn exposes tools; a
+                    # pure text turn (or a pre-dispatch failure) stays falling back.
+                    from .error_classifier import is_replay_unsafe_chain
+                    side_effecting = bool(formatted_tools) or execute_tool_fn is not None
+                    if side_effecting and is_replay_unsafe_chain(e):
+                        logging.warning(
+                            "Not falling back to non-streaming on a tool turn: the "
+                            "streaming failure is replay-unsafe (post-dispatch); "
+                            "surfacing the original error to avoid re-executing the turn."
+                        )
+                        raise
                     
                     # Fall back to non-streaming if streaming fails
                     use_streaming = False
             
             if not use_streaming:
-                # Fall back to non-streaming and yield the complete response
+                # Fall back to non-streaming. This branch is taken whenever the
+                # provider cannot stream WITH tools -- Anthropic, Gemini and
+                # Ollama all report False from _supports_streaming_tools() --
+                # and also whenever the streaming attempt above failed.
+                #
+                # It used to read message.content and nothing else. The request
+                # carried `tools`, so the model answered with tool_calls and an
+                # empty content, and every one of those calls was dropped: the
+                # tool never ran, nothing was yielded, and no warning was
+                # raised. A turn that needed a tool produced an empty stream.
+                #
+                # Run the tool loop here too, bounded by max_iter the same way
+                # the non-streaming path is.
                 try:
-                    response = self._completion_with_retry(
-                        **self._build_completion_params(
-                            messages=messages,
-                            tools=formatted_tools,
-                            temperature=temperature,
-                            stream=False,
-                            output_json=output_json,
-                            output_pydantic=output_pydantic,
-                            **kwargs
+                    is_ollama = self._is_ollama_provider()
+                    fallback_iterations = 0
+                    tool_call_count = 0
+                    last_tool_call_fingerprint = None
+                    stall_reason = None
+                    max_fallback_iterations = kwargs.pop("max_iterations", self.max_iter)
+                    while fallback_iterations < max_fallback_iterations:
+                        fallback_iterations += 1
+                        messages = self._manage_context_in_loop(messages)
+                        # Chaining references are scoped to one assistant turn;
+                        # do not let a later turn reuse an earlier result.
+                        ollama_tool_result_mapping = {}
+                        response = self._completion_with_retry(
+                            **self._build_completion_params(
+                                messages=messages,
+                                tools=formatted_tools,
+                                temperature=temperature,
+                                stream=False,
+                                output_json=output_json,
+                                output_pydantic=output_pydantic,
+                                **kwargs
+                            )
                         )
-                    )
-                    
-                    if response and response.choices:
-                        content = response.choices[0].message.content
+
+                        if not (response and response.choices):
+                            break
+
+                        message = response.choices[0].message
+                        content = getattr(message, "content", None)
+                        tool_calls = getattr(message, "tool_calls", None)
+
+                        if not tool_calls or not execute_tool_fn:
+                            # Nothing to dispatch: emit whatever prose we have.
+                            if content:
+                                yield content
+                            elif tool_call_count:
+                                # Tools ran, but the provider ended the turn
+                                # without writing an answer.
+                                stall_reason = "empty final answer"
+                            break
+
+                        # A provider that re-emits the identical tool call with
+                        # no prose is not making progress: those results are
+                        # already in `messages`, so running the tool again
+                        # cannot add information. Stop before dispatching.
+                        fingerprint = self._tool_call_fingerprint(tool_calls, is_ollama)
+                        if (not content and tool_call_count
+                                and fingerprint == last_tool_call_fingerprint):
+                            logging.warning(
+                                "Provider repeated the same tool call with no answer at "
+                                f"fallback iteration {fallback_iterations}; finalising "
+                                "with tools disabled.")
+                            stall_reason = "repeated tool call"
+                            break
+                        last_tool_call_fingerprint = fingerprint
+
+                        # Record the assistant turn before the tool replies, so
+                        # the follow-up request is a valid conversation.
+                        if is_ollama:
+                            messages.append({"role": "assistant", "content": content or ""})
+                        else:
+                            messages.append({
+                                "role": "assistant",
+                                "content": content or "",
+                                "tool_calls": self._serialize_tool_calls(tool_calls),
+                            })
+
+                        # Any prose the model emitted alongside the calls is
+                        # still part of the answer.
                         if content:
-                            # Yield the complete response as a single chunk
                             yield content
-                            
+
+                        # Enforce the same per-turn guardrail the streaming and
+                        # non-streaming loops apply, so the fallback cannot run
+                        # tools past the caller's configured limit.
+                        if tool_call_count >= max_tool_calls_per_turn:
+                            logging.warning(
+                                f"Tool call limit reached ({max_tool_calls_per_turn}). "
+                                "Stopping to prevent infinite loop.")
+                            stall_reason = "tool call limit"
+                            break
+                        if tool_call_count + len(tool_calls) > max_tool_calls_per_turn:
+                            remaining_calls = max_tool_calls_per_turn - tool_call_count
+                            tool_calls = tool_calls[:remaining_calls]
+                            logging.warning(
+                                f"Limiting batch to {remaining_calls} tool calls to stay "
+                                f"within limit of {max_tool_calls_per_turn}.")
+
+                        for tool_call in tool_calls:
+                            tool_call_count += 1
+                            function_name, arguments, tool_call_id = (
+                                self._extract_tool_call_info(tool_call, is_ollama))
+                            if self._tool_arguments_parse_failed(arguments):
+                                messages.append(
+                                    self._tool_parse_error_message(function_name, tool_call_id))
+                                continue
+                            # Validate and filter arguments for Ollama provider.
+                            # Pre-dispatch, so this is streaming-safe: nothing has
+                            # been yielded that would need retracting. Weak local
+                            # models routinely emit arguments belonging to a
+                            # different function, and dispatching those calls the
+                            # user's tool with parameters it never declared.
+                            if is_ollama and tools:
+                                arguments = self._resolve_ollama_chained_args(
+                                    arguments, ollama_tool_result_mapping, function_name, tools
+                                )
+                                arguments = self._validate_and_filter_ollama_arguments(
+                                    function_name, arguments, tools)
+                            try:
+                                tool_result = execute_tool_fn(function_name, arguments)
+                            except Exception as tool_error:  # noqa: BLE001
+                                # Report the failure to the model rather than
+                                # aborting the run, matching the streaming loop.
+                                logging.warning(
+                                    f"Tool '{function_name}' failed: {tool_error}")
+                                tool_result = {"error": str(tool_error)}
+                            if is_ollama and _ollama_tool_result_is_successful(tool_result):
+                                self._record_ollama_tool_result(
+                                    ollama_tool_result_mapping,
+                                    function_name,
+                                    tool_result,
+                                )
+                            try:
+                                _get_display_functions()['execute_sync_callback'](
+                                    'tool_call',
+                                    message=f"Calling function: {function_name}",
+                                    tool_name=function_name,
+                                    tool_input=arguments,
+                                    tool_output=str(tool_result)[:200],
+                                    success=not (isinstance(tool_result, dict)
+                                                 and 'error' in tool_result),
+                                )
+                            except Exception as cb_error:  # noqa: BLE001
+                                logging.debug(
+                                    f"tool_call callback failed for '{function_name}': {cb_error}")
+                            messages.append(self._create_tool_message(
+                                function_name, tool_result, tool_call_id, is_ollama))
+                        # Loop: ask again now the results are in the messages.
+                    else:
+                        logging.warning(
+                            f"Iteration limit reached ({max_fallback_iterations}) on the "
+                            "non-streaming fallback.")
+                        stall_reason = "iteration limit"
+
+                    # The loop ended without the provider ever writing an answer,
+                    # but every tool result is in `messages`. Ask once more with
+                    # tools disabled: the provider cannot emit another tool call,
+                    # so it has to answer. This is the same bounded finalisation
+                    # get_response and get_response_async already perform -- the
+                    # stream path was the only one that skipped it.
+                    if stall_reason and tool_call_count:
+                        final_text = self._finalise_on_limit(
+                            messages, "", temperature=temperature,
+                            wrap_up_prompt=self.TOOL_LOOP_STALL_PROMPT,
+                            **kwargs)
+                        if (final_text and final_text.strip()
+                                and final_text != self.STEP_LIMIT_FALLBACK_MESSAGE):
+                            yield final_text
+                        else:
+                            raise LLMResponseError(
+                                f"Provider produced no answer after {tool_call_count} "
+                                f"tool call(s) on the streaming path ({stall_reason}).")
+
                 except Exception as e:
                     logging.error(f"Non-streaming fallback failed: {e}")
                     raise
@@ -4516,11 +5419,12 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
             logging.error(f"Error in get_response_stream: {e}")
             raise
 
-    def _is_gemini_model(self) -> bool:
+    def _is_gemini_model(self, model: Optional[str] = None) -> bool:
         """Check if the model is a Gemini model."""
-        if not self.model:
+        model = self.model if model is None else model
+        if not model:
             return False
-        return any(prefix in self.model.lower() for prefix in ['gemini', 'gemini/', 'google/gemini'])
+        return any(prefix in model.lower() for prefix in ['gemini', 'gemini/', 'google/gemini'])
     
     def _is_anthropic_model(self) -> bool:
         """Check if the model is an Anthropic Claude model."""
@@ -4545,6 +5449,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
         # Other errors are generally not recoverable
         return False
 
+    @_request_stop_reason
     async def get_response_async(
         self,
         prompt: Union[str, List[Dict]],
@@ -4569,8 +5474,10 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
         execute_tool_fn: Optional[Callable] = None,
         max_tool_calls_per_turn: int = 10,  # Loop guardrails
         stream: bool = True,
+        parallel_tool_calls: bool = False,
+        return_token_usage: bool = False,
         **kwargs
-    ) -> str:
+    ) -> Union[str, tuple[str, TokenUsage]]:
         """Async version of get_response with identical functionality."""
         # G2: Cooperative cancellation - honour InterruptController between tool iterations
         # so /stop (and cancellation generally) halts mid-flight runs on every provider.
@@ -4578,6 +5485,8 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
         # Mid-run steering: optional callable() -> list[str] draining pending
         # steering notes so they can be injected as user messages between iterations.
         steering_drain = kwargs.pop("steering_drain", None)
+        # Bounded auto-continuation on output-token truncation (True/False/int cap).
+        output_continuation = kwargs.pop("output_continuation", True)
 
         def _is_cancelled() -> bool:
             return cancel_token is not None and getattr(cancel_token, "is_set", lambda: False)()
@@ -4594,6 +5503,36 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                         msgs.append({"role": "user", "content": f"[steering] {note}"})
             except Exception as _steer_err:
                 logging.debug(f"Steering drain failed (ignored): {_steer_err}")
+
+        async def _dispatch_tool_batch(dispatch_specs, iteration_index):
+            """Run a batch of (function_name, arguments, tool_call_id) dispatches.
+
+            When ``parallel_tool_calls`` is set, the independent tool coroutines
+            are awaited concurrently via ``asyncio.gather`` (mirroring the sync
+            path's ``create_tool_call_executor(parallel=True)``); otherwise they
+            run one-at-a-time. Results are always returned in the original call
+            order so the existing message-building loop stays unchanged.
+            """
+            if parallel_tool_calls and len(dispatch_specs) > 1:
+                # return_exceptions=True so a single failing tool does not cancel
+                # its still-in-flight siblings and orphan their coroutines (the
+                # exact leak class this PR fixes). We then re-raise the first
+                # error after every sibling has settled, preserving the
+                # sequential path's fail-fast propagation semantics.
+                gathered = await asyncio.gather(*(
+                    _dispatch_async_tool(execute_tool_fn, fn, args, tc_id, iteration_index)
+                    for (fn, args, tc_id) in dispatch_specs
+                ), return_exceptions=True)
+                for item in gathered:
+                    if isinstance(item, BaseException):
+                        raise item
+                return gathered
+            results = []
+            for (fn, args, tc_id) in dispatch_specs:
+                results.append(await _dispatch_async_tool(
+                    execute_tool_fn, fn, args, tc_id, iteration_index
+                ))
+            return results
 
         try:
             import litellm
@@ -4673,18 +5612,38 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
             iteration_count = 0
             tool_call_count = 0  # Track total tool calls for guardrails
             final_response_text = ""
+            # Track the final raw LLM response so return_token_usage can extract
+            # usage, mirroring the sync get_response path.
+            _final_llm_response = None
+
+            def _prepare_return_value(text: str) -> Union[str, tuple]:
+                if not return_token_usage:
+                    return text
+                token_usage = (
+                    self._extract_token_usage(_final_llm_response)
+                    if _final_llm_response else None
+                )
+                if token_usage is None:
+                    token_usage = TokenUsage()
+                return text, token_usage
             stored_reasoning_content = None  # Store reasoning content from tool execution
             accumulated_tool_results = []  # Store all tool results across iterations
             # Structured stop reason (unified with the OpenAI-native path).
             self._last_stop_reason = "completed"
+            from ._continuation import OutputContinuation, is_structured
+            # Schema-enforced output cannot be continued as a text suffix.
+            _continuation = OutputContinuation(False if (output_json or output_pydantic or is_structured(getattr(self, "response_format", None))) else output_continuation)
 
             while iteration_count < max_iterations:
+                # Continue only when *this* response hit the length limit, not on a
+                # sticky truncation left by an earlier (e.g. repaired) tool call.
+                _stop_before = self._last_stop_reason
                 # G2: Check for cancellation at the top of each tool iteration so a
                 # /stop request promptly halts a mid-flight run on every provider.
                 if _is_cancelled():
                     reason = _cancel_reason()
                     logging.debug(f"Async LLM tool loop cancelled: {reason}")
-                    return f"Task interrupted: {reason}"
+                    return _prepare_return_value(f"Task interrupted: {reason}")
                 # G2: Mid-run steering - drain any pending steering notes and inject
                 # them as user messages so the model sees them on its next step.
                 _inject_steering(messages)
@@ -4694,9 +5653,14 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                 response_text = ""
                 reasoning_content = None
                 tool_calls = []
+                # Chaining references are scoped to one assistant turn;
+                # do not let a later turn reuse an earlier result.
+                ollama_tool_result_mapping: Dict[str, Any] = {}
                 
                 # ── Responses API path (async) ──────────────────────────
                 if self._supports_responses_api():
+                    if iteration_count > 0 and self._last_stop_reason == "refused":
+                        self._last_stop_reason = "completed"
                     responses_params = self._build_responses_params(
                         messages=messages,
                         tools=formatted_tools,
@@ -4708,14 +5672,20 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                     current_time = time.time()
 
                     if stream:
-                        response_text, tool_calls = await self._stream_responses_api_async(
+                        response_text, tool_calls, stream_response = await self._stream_responses_api_async(
                             responses_params,
                             stream_callback=kwargs.get('stream_callback'),
                             emit_events=kwargs.get('emit_events', False),
                         )
+                        # Streamed calls still incur real token cost; track
+                        # usage from the final response.completed event.
+                        if stream_response is not None:
+                            self._track_token_usage(stream_response, self.model)
+                            _final_llm_response = stream_response
                     else:
                         resp = await self._call_responses_api_async(**responses_params)
                         response_text, tool_calls, _reasoning = self._extract_from_responses_output(resp)
+                        _final_llm_response = resp
 
                     # Build Chat-Completions-compatible final_response
                     final_response = {
@@ -4756,7 +5726,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                         if _is_cancelled():
                             reason = _cancel_reason()
                             logging.debug(f"Async LLM tool loop cancelled before tool dispatch: {reason}")
-                            return f"Task interrupted: {reason}"
+                            return _prepare_return_value(f"Task interrupted: {reason}")
                         serializable_tool_calls = self._serialize_tool_calls(tool_calls)
                         messages.append({
                             "role": "assistant",
@@ -4778,6 +5748,10 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                             tool_calls = tool_calls[:remaining_calls]
                             logging.warning(f"Limiting batch to {remaining_calls} tool calls to stay within limit of {max_tool_calls_per_turn}.")
                         
+                        # Pre-resolve each tool call, then dispatch the valid ones
+                        # as a batch (concurrently when parallel_tool_calls is set).
+                        _parsed_calls = []
+                        _dispatch_specs = []
                         for tool_call in tool_calls:
                             function_name, arguments, tool_call_id = self._extract_tool_call_info(tool_call)
                             if self._tool_arguments_parse_failed(arguments):
@@ -4785,13 +5759,10 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                 messages.append(self._tool_parse_error_message(function_name, tool_call_id))
                                 continue
                             logging.debug(f"[RESPONSES_API_ASYNC] Executing tool {function_name}")
-                            tool_result = await _dispatch_async_tool(
-                                execute_tool_fn,
-                                function_name,
-                                arguments,
-                                tool_call_id,
-                                iteration_count,
-                            )
+                            _parsed_calls.append((function_name, arguments, tool_call_id))
+                            _dispatch_specs.append((function_name, arguments, tool_call_id))
+                        _batch_results = await _dispatch_tool_batch(_dispatch_specs, iteration_count)
+                        for (function_name, arguments, tool_call_id), tool_result in zip(_parsed_calls, _batch_results):
                             tool_call_count += 1  # Increment tool call counter for guardrails
                             accumulated_tool_results.append(tool_result)
 
@@ -4801,17 +5772,8 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                 _get_display_functions()['display_tool_call'](display_message, console=self.console)
 
                             # Append tool result
-                            if tool_result is None:
-                                content = "Function returned an empty output"
-                            elif isinstance(tool_result, dict) and 'error' in tool_result:
-                                content = f"Error: {tool_result.get('error', 'Unknown error')}. Please inform the user."
-                            else:
-                                content = json.dumps(tool_result)
-                            messages.append({
-                                "role": "tool",
-                                "tool_call_id": tool_call_id,
-                                "content": content,
-                            })
+                            messages.append(self._create_tool_message(
+                                function_name, tool_result, tool_call_id, is_ollama=False))
 
                         if iteration_count + 1 >= max_iterations:
                             self._last_stop_reason = "max_steps"
@@ -4824,6 +5786,11 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                         iteration_count += 1
                         continue
                     else:
+                        if _continuation.take(messages, response_text, self._last_stop_reason == "length_truncated" and _stop_before != "length_truncated"):
+                            self._last_stop_reason = "completed"
+                            response_text = ""
+                            continue
+                        response_text = _continuation.stitch(response_text)
                         final_response_text = response_text.strip() if response_text else ""
                         break
 
@@ -4840,6 +5807,8 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                             **{k:v for k,v in kwargs.items() if k != 'reasoning_steps'}
                         )
                     )
+                    self._record_finish_reason(resp)
+                    _final_llm_response = resp
                     reasoning_content = resp["choices"][0]["message"].get("provider_specific_fields", {}).get("reasoning_content")
                     response_text = resp["choices"][0]["message"]["content"]
                     
@@ -4900,6 +5869,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                     **kwargs
                                 )
                             ):
+                                self._record_stream_finish(chunk)
                                 if chunk and chunk.choices and chunk.choices[0].delta:
                                     delta = chunk.choices[0].delta
                                     response_text, tool_calls = self._process_stream_delta(
@@ -4922,6 +5892,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                     **kwargs
                                 )
                             ):
+                                self._record_stream_finish(chunk)
                                 if chunk and chunk.choices and chunk.choices[0].delta:
                                     delta = chunk.choices[0].delta
                                     if delta.content:
@@ -4931,7 +5902,9 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                     if formatted_tools and self._supports_streaming_tools():
                                         tool_calls = self._process_tool_calls_from_stream(delta, tool_calls)
                         
-                        response_text = response_text.strip() if response_text else ""
+                        # Keep whitespace at a continuation seam; the stitched answer is stripped later.
+                        if not (self._last_stop_reason == "length_truncated" and _stop_before != "length_truncated") and not _continuation.text:
+                            response_text = response_text.strip() if response_text else ""
                         
                         # We already have tool_calls from streaming if supported
                         # No need for a second API call!
@@ -4948,10 +5921,25 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                 **{k:v for k,v in kwargs.items() if k != 'reasoning_steps'}
                             )
                         )
+                        self._record_finish_reason(tool_response)
+                        _final_llm_response = tool_response
                         # Handle None content from Gemini
                         response_content = tool_response.choices[0].message.get("content")
                         response_text = response_content if response_content is not None else ""
                         tool_calls = tool_response.choices[0].message.get("tool_calls", [])
+
+                        # Recover a tool call the provider emitted as response
+                        # text instead of in the tool_calls field. The sync path
+                        # has done this since the adapter seam landed; without it
+                        # here, the same agent silently loses tool calling the
+                        # moment the caller awaits instead of calling.
+                        if not tool_calls and response_text and formatted_tools:
+                            recovered = self._provider_adapter.recover_tool_calls_from_text(
+                                response_text, formatted_tools)
+                            if recovered:
+                                tool_calls = recovered
+                                logging.debug(
+                                    f"Recovered tool calls from response text: {tool_calls}")
                         
                         # Debug logging for Gemini responses
                         if self._is_gemini_model():
@@ -4975,6 +5963,35 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                             )
                             interaction_displayed = True
 
+                    # Force tool usage / repair: applied AFTER both the streaming
+                    # and non-streaming branches converge so a streaming-with-tools
+                    # provider still honours the policy the sync path applies. Both
+                    # lived inline in get_response only, so `max_tool_repairs` and
+                    # `force_tool_usage` were accepted from the caller -- and set by
+                    # OllamaAdapter for every Ollama LLM -- then silently ignored the
+                    # moment the agent was awaited.
+                    _force = self._force_tool_usage_message(response_text, tool_calls, formatted_tools, iteration_count)
+                    if _force is not None:
+                        logging.debug(f"[OLLAMA_RELIABILITY] Force tool usage triggered (async). Adding prompt for tools: {self._get_tool_names_for_prompt(formatted_tools)}")
+                        messages.append({
+                            "role": "user",
+                            "content": _force
+                        })
+                        iteration_count += 1
+                        continue
+
+                    _repair = self._tool_repair_message(tool_calls, formatted_tools)
+                    if _repair is not None:
+                        logging.debug(f"[OLLAMA_RELIABILITY] Tool call repair attempt (async) {self._current_repair_count}/{self.max_tool_repairs}")
+                        messages.append({
+                            "role": "user",
+                            "content": _repair
+                        })
+                        iteration_count += 1
+                        tool_calls = None  # Clear invalid tool calls
+                        continue
+                    self._current_repair_count = 0
+
                 # For Ollama, if response is empty but we have tools, prompt for tool usage
                 if self._is_ollama_provider() and (not response_text or response_text.strip() == "") and formatted_tools and iteration_count == 0:
                     messages.append({
@@ -4991,7 +6008,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                     if _is_cancelled():
                         reason = _cancel_reason()
                         logging.debug(f"Async LLM tool loop cancelled before tool dispatch: {reason}")
-                        return f"Task interrupted: {reason}"
+                        return _prepare_return_value(f"Task interrupted: {reason}")
                     # Convert tool_calls to a serializable format for all providers
                     serializable_tool_calls = self._serialize_tool_calls(tool_calls)
                     # Check if it's Ollama provider
@@ -5028,6 +6045,12 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                     # flushed only AFTER every tool reply for this assistant
                     # turn, keeping all tool replies consecutive (provider contract).
                     _deferred_media_followups: List[Dict[str, Any]] = []
+                    # First pass: parse/validate every call and record a plan so
+                    # the valid dispatches can be batched (concurrently when
+                    # parallel_tool_calls is set) while preserving call order.
+                    _call_plan = []  # ('error', msg) | ('call', fn, args, tc_id)
+                    _dispatch_specs = []
+                    _batch_results = []
                     for tool_call in tool_calls:
                         # Handle both object and dict access patterns
                         is_ollama = self._is_ollama_provider()
@@ -5035,23 +6058,68 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
 
                         if self._tool_arguments_parse_failed(arguments):
                             # Do NOT dispatch with {}: surface a retryable error.
-                            messages.append(self._tool_parse_error_message(function_name, tool_call_id))
+                            _call_plan.append(('error', self._tool_parse_error_message(function_name, tool_call_id)))
                             continue
 
-                        # Validate and filter arguments for Ollama provider
+                        # Validate and filter arguments for Ollama provider.
+                        # In the sequential Ollama path, defer resolution and
+                        # validation until immediately before dispatch; this
+                        # lets a later call consume an earlier result from the
+                        # same assistant turn.
                         if is_ollama and tools:
-                            arguments = self._validate_and_filter_ollama_arguments(function_name, arguments, tools)
+                            if parallel_tool_calls:
+                                arguments = self._resolve_ollama_chained_args(
+                                    arguments, ollama_tool_result_mapping, function_name, tools
+                                )
+                                arguments = self._validate_and_filter_ollama_arguments(
+                                    function_name, arguments, tools
+                                )
 
-                        tool_result = await _dispatch_async_tool(
-                            execute_tool_fn,
-                            function_name,
-                            arguments,
-                            tool_call_id,
-                            iteration_count,
+                        if is_ollama and not parallel_tool_calls:
+                            arguments = self._resolve_ollama_chained_args(
+                                arguments, ollama_tool_result_mapping, function_name, tools
+                            )
+                            if tools:
+                                arguments = self._validate_and_filter_ollama_arguments(
+                                    function_name, arguments, tools
+                                )
+
+                        _call_plan.append(('call', function_name, arguments, tool_call_id))
+                        if is_ollama and not parallel_tool_calls:
+                            _batch_results.append(await _dispatch_async_tool(
+                                execute_tool_fn,
+                                function_name,
+                                arguments,
+                                tool_call_id,
+                                iteration_count,
+                            ))
+                            if _ollama_tool_result_is_successful(_batch_results[-1]):
+                                self._record_ollama_tool_result(
+                                    ollama_tool_result_mapping, function_name,
+                                    _batch_results[-1],
+                                )
+                        else:
+                            _dispatch_specs.append((function_name, arguments, tool_call_id))
+
+                    if not (is_ollama and not parallel_tool_calls):
+                        _batch_results = await _dispatch_tool_batch(
+                            _dispatch_specs, iteration_count
                         )
+                    _result_iter = iter(_batch_results)
+                    for _plan in _call_plan:
+                        if _plan[0] == 'error':
+                            messages.append(_plan[1])
+                            continue
+                        _, function_name, arguments, tool_call_id = _plan
+                        tool_result = next(_result_iter)
                         tool_call_count += 1  # Increment tool call counter for guardrails
                         tool_results.append(tool_result)  # Store the result
                         accumulated_tool_results.append(tool_result)  # Accumulate across iterations
+
+                        if is_ollama and _ollama_tool_result_is_successful(tool_result):
+                            self._record_ollama_tool_result(
+                                ollama_tool_result_mapping, function_name, tool_result
+                            )
 
                         if verbose:
                             display_message = f"Agent {agent_name} called function '{function_name}' with arguments: {arguments}\n"
@@ -5073,20 +6141,8 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                             pass
                         else:
                             # For other providers, use tool role with tool_call_id
-                            # Format error results more clearly
-                            if tool_result is None:
-                                content = "Function returned an empty output"
-                            elif isinstance(tool_result, dict) and 'error' in tool_result:
-                                content = f"Error: {tool_result.get('error', 'Unknown error')}. Please inform the user that the operation could not be completed."
-                            elif isinstance(tool_result, list) and len(tool_result) > 0 and isinstance(tool_result[0], dict) and 'error' in tool_result[0]:
-                                content = f"Error: {tool_result[0].get('error', 'Unknown error')}. Please inform the user that the operation could not be completed."
-                            else:
-                                content = json.dumps(tool_result)
-                            messages.append({
-                                "role": "tool",
-                                "tool_call_id": tool_call_id,
-                                "content": content
-                            })
+                            messages.append(self._create_tool_message(
+                                function_name, tool_result, tool_call_id, is_ollama=False))
 
                     # Flush deferred media follow-ups after all tool replies
                     # for this turn have been appended (provider contract).
@@ -5118,6 +6174,8 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                 **{k:v for k,v in kwargs.items() if k != 'reasoning_steps'}
                             )
                         )
+                        self._record_finish_reason(resp)
+                        _final_llm_response = resp
                         reasoning_content = resp["choices"][0]["message"].get("provider_specific_fields", {}).get("reasoning_content")
                         response_text = resp["choices"][0]["message"]["content"]
                         
@@ -5169,6 +6227,8 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                     **{k:v for k,v in kwargs.items() if k != 'reasoning_steps'}
                                 )
                             )
+                            self._record_finish_reason(resp)
+                            _final_llm_response = resp
                             response_text = resp["choices"][0]["message"].get("content") or ""
                             # If the response also contains new tool_calls, treat this as a
                             # tool-calling round rather than a final answer (Anthropic pattern)
@@ -5240,9 +6300,6 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                         # Reset interaction_displayed to ensure final summary is shown
                         interaction_displayed = False
                         break
-                    elif tool_summary_text is None and iteration_count > self.OLLAMA_SUMMARY_ITERATION_THRESHOLD:
-                        # Continue iteration after adding final answer prompt
-                        continue
                     
                     # Safety check: prevent infinite loops for any provider
                     if iteration_count + 1 >= max_iterations:
@@ -5261,8 +6318,11 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                     
                     # Special early stopping logic for Ollama when tool results are available
                     # Ollama often provides empty responses after successful tool execution
-                    if (self._is_ollama_provider() and accumulated_tool_results and iteration_count >= 1 and 
-                        (not response_text or response_text.strip() == "")):
+                    if self._provider_adapter.handle_empty_response_with_tools({
+                        'iteration_count': iteration_count,
+                        'accumulated_tool_results': accumulated_tool_results,
+                        'response_text': response_text or '',
+                    }):
                         # Generate coherent response from tool results
                         tool_summary = self._generate_ollama_tool_summary(accumulated_tool_results, response_text)
                         if tool_summary:
@@ -5271,22 +6331,28 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                             interaction_displayed = False
                             break
                     
+                    if _continuation.take(messages, response_text, self._last_stop_reason == "length_truncated" and _stop_before != "length_truncated"):
+                        self._last_stop_reason = "completed"
+                        response_text = ""
+                        continue
+                    response_text = _continuation.stitch(response_text)
                     # If we've executed tools in previous iterations, this response contains the final answer
                     if iteration_count > 0 and not final_response_text:
                         final_response_text = response_text.strip()
                     break
 
+            # Preserve tool-loop finalization for structured output and reflection.
+            response_text = final_response_text or response_text
+
             # Handle output formatting
             if output_json or output_pydantic:
-                self.chat_history.append({"role": "user", "content": original_prompt})
-                self.chat_history.append({"role": "assistant", "content": response_text})
                 if verbose and not interaction_displayed:
                     _get_display_functions()['display_interaction'](original_prompt, response_text, markdown=markdown,
                                      generation_time=time.time() - start_time, console=self.console,
                                      agent_name=agent_name, agent_role=agent_role, agent_tools=agent_tools,
                                      task_name=task_name, task_description=task_description, task_id=task_id)
                     interaction_displayed = True
-                return response_text
+                return _prepare_return_value(response_text)
 
             if not self_reflect:
                 # Use final_response_text if we went through tool iterations
@@ -5317,8 +6383,8 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                 
                 # Return reasoning content if reasoning_steps is True and we have it
                 if reasoning_steps and stored_reasoning_content:
-                    return stored_reasoning_content
-                return display_text
+                    return _prepare_return_value(stored_reasoning_content)
+                return _prepare_return_value(display_text)
 
             # Handle self-reflection
             reflection_prompt = f"""
@@ -5433,7 +6499,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                              agent_name=agent_name, agent_role=agent_role, agent_tools=agent_tools,
                                              task_name=task_name, task_description=task_description, task_id=task_id)
                             interaction_displayed = True
-                        return response_text
+                        return _prepare_return_value(response_text)
 
                     if reflection_count >= max_reflect - 1:
                         if verbose and not interaction_displayed:
@@ -5442,7 +6508,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                              agent_name=agent_name, agent_role=agent_role, agent_tools=agent_tools,
                                              task_name=task_name, task_description=task_description, task_id=task_id)
                             interaction_displayed = True
-                        return response_text
+                        return _prepare_return_value(response_text)
 
                     reflection_count += 1
                     messages.extend([
@@ -5456,7 +6522,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                 except json.JSONDecodeError:
                     reflection_count += 1
                     if reflection_count >= max_reflect:
-                        return response_text
+                        return _prepare_return_value(response_text)
                     continue  # Now properly in a loop
             
         except Exception as error:
@@ -5512,11 +6578,16 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
     def _setup_event_tracking(self, events: List[Any]) -> None:
         """Setup callback functions for tracking model usage.
 
-        ``litellm.callbacks`` is a process-global list shared by every LLM
-        instance. Overwriting it wipes callbacks registered by other concurrent
-        agents, so we merge into it instead: only the callbacks *this* instance
-        previously registered are removed, and unrelated instances' callbacks
-        are never touched. An empty ``events`` list is a no-op.
+        ``litellm.success_callback``, ``litellm._async_success_callback`` and
+        ``litellm.callbacks`` are process-global lists shared by every LLM
+        instance. Overwriting (or type-based stripping of) them wipes callbacks
+        registered by other concurrent agents — or by the application itself via
+        litellm's documented ``litellm.success_callback.append(...)`` extension
+        point. So we merge into each list instead: only the callbacks *this*
+        instance previously registered are removed, and unrelated instances'
+        callbacks are never touched. An empty ``events`` list is a no-op. The
+        whole read-modify-write is guarded by a module-level lock so concurrent
+        instances can't corrupt the shared lists.
         """
         if not events:
             return
@@ -5529,29 +6600,37 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                 "Please install it with: pip install 'praisonaiagents[llm]'"
             )
 
-        event_types = [type(event) for event in events]
-        
-        # Remove old events of same type
-        for event in litellm.success_callback[:]:
-            if type(event) in event_types:
-                litellm.success_callback.remove(event)
-                
-        for event in litellm._async_success_callback[:]:
-            if type(event) in event_types:
-                litellm._async_success_callback.remove(event)
+        with _EVENT_TRACKING_LOCK:
+            # Only remove the success callbacks *this* instance registered on a
+            # prior call — never strip by type, which would delete another
+            # instance's or the application's own callbacks of the same class
+            # (e.g. an app-registered ``litellm.success_callback.append(...)``).
+            for cb in getattr(self, "_registered_success_callbacks", []):
+                if cb in litellm.success_callback:
+                    litellm.success_callback.remove(cb)
+            for cb in getattr(self, "_registered_async_success_callbacks", []):
+                if cb in litellm._async_success_callback:
+                    litellm._async_success_callback.remove(cb)
+            for event in events:
+                if event not in litellm.success_callback:
+                    litellm.success_callback.append(event)
+                if event not in litellm._async_success_callback:
+                    litellm._async_success_callback.append(event)
+            self._registered_success_callbacks = list(events)
+            self._registered_async_success_callbacks = list(events)
 
-        # Merge into the global list rather than replacing it. Only remove the
-        # callbacks this instance registered on a prior call, then append the
-        # current ones, preserving other instances' callbacks.
-        if litellm.callbacks is None:
-            litellm.callbacks = []
-        for cb in getattr(self, "_registered_callbacks", []):
-            if cb in litellm.callbacks:
-                litellm.callbacks.remove(cb)
-        for event in events:
-            if event not in litellm.callbacks:
-                litellm.callbacks.append(event)
-        self._registered_callbacks = list(events)
+            # Merge into the global list rather than replacing it. Only remove the
+            # callbacks this instance registered on a prior call, then append the
+            # current ones, preserving other instances' callbacks.
+            if litellm.callbacks is None:
+                litellm.callbacks = []
+            for cb in getattr(self, "_registered_callbacks", []):
+                if cb in litellm.callbacks:
+                    litellm.callbacks.remove(cb)
+            for event in events:
+                if event not in litellm.callbacks:
+                    litellm.callbacks.append(event)
+            self._registered_callbacks = list(events)
 
     def _track_token_usage(self, response: Any, model: str) -> Optional[TokenMetrics]:
         """Extract and track token usage from LLM response."""
@@ -5633,7 +6712,8 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                 metadata={
                     "provider": provider,
                     "stream": False
-                }
+                },
+                agent_id=self.current_agent_id,
             )
             
             return metrics
@@ -5643,6 +6723,61 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                 logging.warning(f"Failed to track token usage: {e}")
             return None
     
+    def _record_finish_reason(self, response: Union[Dict[str, Any], Any]) -> None:
+        """Classify the provider ``finish_reason``/refusal and record it.
+
+        Sets ``self._last_stop_reason`` to a distinct provider block/refusal/
+        truncation reason (``content_filtered | refused | length_truncated``)
+        when the last completion was blocked, so a blocked/refused/truncated turn
+        is surfaced as an explicit terminal reason instead of a silent empty
+        ``completed``. A known Responses incomplete reason also replaces an
+        earlier refusal delta so tool continuation cannot clear that outcome.
+        Other prior terminal reasons, including ``max_steps``, remain sticky. Absent or
+        unrecognised finish reasons are a no-op — zero overhead on success.
+        """
+        try:
+            finish_reason = None
+            refusal = None
+            if isinstance(response, dict):
+                choices = response.get("choices") or []
+                if choices:
+                    choice = choices[0]
+                    finish_reason = choice.get("finish_reason")
+                    msg = choice.get("message") or {}
+                    if isinstance(msg, dict):
+                        refusal = msg.get("refusal")
+                    else:
+                        refusal = getattr(msg, "refusal", None)
+            else:
+                choices = getattr(response, "choices", None) or []
+                if choices:
+                    choice = choices[0]
+                    finish_reason = getattr(choice, "finish_reason", None)
+                    msg = getattr(choice, "message", None)
+                    refusal = getattr(msg, "refusal", None) if msg is not None else None
+            if not choices:
+                from .openai_client import OpenAIClient
+                finish_reason = OpenAIClient._responses_incomplete_finish_reason(response)
+                refusal = OpenAIClient._extract_responses_refusal(response)
+            if finish_reason is None and not refusal:
+                return
+            from ..agent.run_outcome import classify_finish_reason
+            responses_incomplete = not choices and finish_reason is not None
+            reason = classify_finish_reason(finish_reason, None if responses_incomplete else refusal)
+            if reason is not None and (
+                self._last_stop_reason == "completed"
+                or (responses_incomplete and self._last_stop_reason == "refused")
+            ):
+                self._last_stop_reason = reason
+        except Exception:
+            # Never let outcome classification break the response path.
+            return
+
+    def _record_stream_finish(self, chunk: Any) -> None:
+        """Record a streamed chunk's ``finish_reason`` (e.g. ``length``) if present."""
+        if chunk and getattr(chunk, "choices", None) and getattr(chunk.choices[0], "finish_reason", None):
+            self._record_finish_reason(chunk)
+
     def _extract_token_usage(self, response: Union[Dict[str, Any], Any]) -> Optional[TokenUsage]:
         """Extract token usage from LiteLLM response for public API."""
         try:
@@ -5657,43 +6792,307 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
             
             if not usage:
                 return None
-            
-            # Extract token counts with support for both dict and object access
-            if isinstance(usage, dict):
-                return TokenUsage(
-                    prompt_tokens=usage.get("prompt_tokens", 0),
-                    completion_tokens=usage.get("completion_tokens", 0),
-                    total_tokens=usage.get("total_tokens", 0),
-                    cached_tokens=usage.get("cached_tokens", 0),
-                    reasoning_tokens=usage.get("reasoning_tokens", 0),
-                    audio_input_tokens=usage.get("audio_input_tokens", 0),
-                    audio_output_tokens=usage.get("audio_output_tokens", 0),
-                )
-            else:
-                # Object-style access
-                return TokenUsage(
-                    prompt_tokens=getattr(usage, 'prompt_tokens', 0) or 0,
-                    completion_tokens=getattr(usage, 'completion_tokens', 0) or 0,
-                    total_tokens=getattr(usage, 'total_tokens', 0) or 0,
-                    cached_tokens=getattr(usage, 'cached_tokens', 0) or 0,
-                    reasoning_tokens=getattr(usage, 'reasoning_tokens', 0) or 0,
-                    audio_input_tokens=getattr(usage, 'audio_input_tokens', 0) or 0,
-                    audio_output_tokens=getattr(usage, 'audio_output_tokens', 0) or 0,
-                )
+
+            # Read a value under any of the given names, supporting both dict and
+            # object usage. The Responses API reports input_tokens/output_tokens
+            # instead of prompt_tokens/completion_tokens, so accept both spellings
+            # (mirroring _track_token_usage) to avoid returning zero counts.
+            def _usage_value(*names: str) -> int:
+                for name in names:
+                    value = (
+                        usage.get(name)
+                        if isinstance(usage, dict)
+                        else getattr(usage, name, None)
+                    )
+                    if value is not None:
+                        return int(value or 0)
+                return 0
+
+            return TokenUsage(
+                prompt_tokens=_usage_value("prompt_tokens", "input_tokens"),
+                completion_tokens=_usage_value("completion_tokens", "output_tokens"),
+                total_tokens=_usage_value("total_tokens"),
+                cached_tokens=_usage_value("cached_tokens"),
+                reasoning_tokens=_usage_value("reasoning_tokens"),
+                audio_input_tokens=_usage_value("audio_input_tokens"),
+                audio_output_tokens=_usage_value("audio_output_tokens"),
+            )
                 
         except Exception as e:
             if self.verbose:
                 logging.warning(f"Failed to extract token usage: {e}")
             return None
     
-    def set_current_agent(self, agent_name: Optional[str]):
-        """Set the current agent name for token tracking."""
+    @staticmethod
+    def _stop_reason_context():
+        """Identify the calling thread and, when present, asyncio task."""
+        try:
+            task = asyncio.current_task()
+        except RuntimeError:
+            task = None
+        return threading.get_ident(), id(task) if task is not None else None
+
+    @contextmanager
+    def _stop_reason_scope(self):
+        """Restore an active parent's binding when a nested call returns."""
+        owner = self._stop_reason_context()
+        active = getattr(self, "_stop_reason_active_var", None)
+        if active is None:
+            active = contextvars.ContextVar("stop_reason_active", default=None)
+            self._stop_reason_active_var = active
+        nested = active.get() == owner
+        active_token = active.set(owner)
+        reason = getattr(self, "_last_stop_reason_var", None)
+        if reason is None:
+            reason = contextvars.ContextVar("last_stop_reason", default=None)
+            self._last_stop_reason_var = reason
+        reason_token = reason.set((owner, "completed"))
+        try:
+            yield
+        finally:
+            result = reason.get()
+            reason.reset(reason_token)
+            active.reset(active_token)
+            if nested:
+                self._last_stop_reason_fallback = reason.get()
+            else:
+                reason.set(result)
+                self._last_stop_reason_fallback = result
+
+    @property
+    def _last_stop_reason(self) -> str:
+        """Terminal outcome in the calling task or thread.
+
+        Concurrent request callers retain their own reason. A synchronous
+        observer after asyncio.run on the same thread reads the latest async
+        result, rather than a stale reason left in its outer context.
+        """
+        var = getattr(self, "_last_stop_reason_var", None)
+        binding = var.get() if var is not None else None
+        owner = self._stop_reason_context()
+        latest_owner, latest_reason = getattr(
+            self, "_last_stop_reason_fallback", (None, "completed")
+        )
+        if binding is None or binding[0] != owner:
+            return latest_reason
+        active = getattr(self, "_stop_reason_active_var", None)
+        if active is not None and active.get() == owner:
+            return binding[1]
+        if (
+            owner[1] is None and latest_owner is not None
+            and latest_owner[0] == owner[0] and latest_owner[1] is not None
+        ):
+            return latest_reason
+        return binding[1]
+
+    @_last_stop_reason.setter
+    def _last_stop_reason(self, reason: str) -> None:
+        """Record an outcome without changing concurrent callers' bindings."""
+        var = getattr(self, "_last_stop_reason_var", None)
+        if var is None:
+            var = contextvars.ContextVar("last_stop_reason", default=None)
+            self._last_stop_reason_var = var
+        binding = (self._stop_reason_context(), reason)
+        var.set(binding)
+        self._last_stop_reason_fallback = binding
+
+    @property
+    def current_agent_name(self) -> Optional[str]:
+        """Task-local name of the agent currently driving this LLM.
+
+        Backed by a per-instance ContextVar so concurrent agents sharing one
+        LLM instance each read/write their own value instead of racing on a
+        shared attribute (issues #5052/#3933).
+        """
+        var = getattr(self, "_current_agent_name_var", None)
+        if var is None:
+            return None
+        return var.get()
+
+    @current_agent_name.setter
+    def current_agent_name(self, agent_name: Optional[str]) -> None:
+        var = getattr(self, "_current_agent_name_var", None)
+        if var is None:
+            var = contextvars.ContextVar(
+                "current_agent_name", default=None
+            )
+            self._current_agent_name_var = var
+        var.set(agent_name)
+
+    @property
+    def current_agent_id(self) -> Optional[str]:
+        """Stable per-agent identity for token aggregation (issue #5052)."""
+        var = getattr(self, "_current_agent_id_var", None)
+        if var is None:
+            return None
+        return var.get()
+
+    @current_agent_id.setter
+    def current_agent_id(self, agent_id: Optional[str]) -> None:
+        var = getattr(self, "_current_agent_id_var", None)
+        if var is None:
+            var = contextvars.ContextVar("current_agent_id", default=None)
+            self._current_agent_id_var = var
+        var.set(agent_id)
+
+    def set_current_agent(
+        self,
+        agent_name: Optional[str],
+        agent_id: Optional[str] = None,
+    ) -> None:
+        """Set task-local agent attribution for token tracking."""
         self.current_agent_name = agent_name
+        self.current_agent_id = agent_id
+
+    def __deepcopy__(self, memo):
+        """Deep-copy the LLM with fresh attribution and outcome ContextVars.
+
+        ``contextvars.ContextVar`` has no ``__deepcopy__``/``__reduce__`` and is
+        not copyable/pickleable, so ``Agent.__deepcopy__`` (which recursively
+        copies ``_llm_instance`` per gateway channel, issue #5052) would raise
+        ``TypeError: cannot pickle ContextVar``. Every other attribute is copied
+        normally, brand-new ContextVars start the clone's attribution clean, and
+        thread locks on LLM subclasses (RateLimiter/FailoverManager) get fresh
+        locks so configured LLMs clone cleanly (issues #1746 / #5052 / #3933).
+        """
+        cls = self.__class__
+        clone = cls.__new__(cls)
+        memo[id(self)] = clone
+        for key, value in self.__dict__.items():
+            if key == "_current_agent_name_var":
+                clone.__dict__[key] = contextvars.ContextVar(
+                    "praison_llm_current_agent_name", default=None
+                )
+                continue
+            if key == "_last_stop_reason_var":
+                clone.__dict__[key] = contextvars.ContextVar(
+                    "last_stop_reason", default=None
+                )
+                continue
+            if key == "_stop_reason_active_var":
+                clone.__dict__[key] = contextvars.ContextVar(
+                    "stop_reason_active", default=None
+                )
+                continue
+            if key == "_last_stop_reason_fallback":
+                clone.__dict__[key] = (None, "completed")
+                continue
+            if key == "_current_agent_id_var":
+                clone.__dict__[key] = contextvars.ContextVar(
+                    "current_agent_id", default=None
+                )
+                continue
+            if type(value) is type(threading.RLock()):
+                clone.__dict__[key] = threading.RLock()
+                continue
+            if type(value) is type(threading.Lock()):
+                clone.__dict__[key] = threading.Lock()
+                continue
+            clone.__dict__[key] = copy.deepcopy(value, memo)
+        return clone
+
+    def _resolve_openai_compatible_model(self) -> str:
+        """Route a bare model name through the OpenAI-compatible client.
+
+        When a custom ``base_url`` is set but the model has no ``provider/``
+        prefix (e.g. ``deepseek-v4-flash`` against an OpenAI-compatible host),
+        LiteLLM cannot infer a provider and raises "LLM Provider NOT provided".
+        Prefixing ``openai/`` makes LiteLLM use its OpenAI Chat Completions
+        client against the supplied ``base_url``. Anthropic/Gemini/Ollama models
+        are left untouched so their native adapters still apply.
+
+        The effective base_url is either the instance ``base_url`` or one
+        injected by a subscription auth provider (e.g. qwen-cli/codex resolve a
+        Chat-Completions host at request time). Both paths need routing so a
+        bare model under subscription auth does not reach LiteLLM unprefixed.
+        """
+        model = self.model
+        if not isinstance(model, str):
+            return model
+        # llama.cpp's llama-server speaks OpenAI, but litellm knows no
+        # "llama_cpp/" provider -- it raised "LLM Provider NOT provided" and
+        # then retried four times before returning None. We accept the prefix
+        # because it names a real local engine, so we must also make it
+        # routable: strip it and let the OpenAI client handle the base_url.
+        for _local_prefix in ("llama_cpp/", "llamacpp/"):
+            if model.startswith(_local_prefix):
+                return f"openai/{model[len(_local_prefix):]}"
+        # NVIDIA NIM ids start with "nvidia/", which litellm does not know;
+        # its route is "nvidia_nim/".
+        from .model_providers import to_litellm_nvidia_nim
+        nim_model = to_litellm_nvidia_nim(model)
+        if nim_model:
+            return nim_model
+        if "/" in model:
+            return model
+        effective_base_url = self.base_url
+        if not effective_base_url:
+            creds = self._resolve_subscription_creds()
+            if creds and getattr(creds, "base_url", None):
+                effective_base_url = creds.base_url
+        if not effective_base_url:
+            return model
+        if self._detect_provider() != "openai":
+            return model
+        return f"openai/{model}"
+
+    @staticmethod
+    def _crosses_nim_boundary(old_model: Any, new_model: Any) -> bool:
+        """True when a model switch moves onto or off the NVIDIA NIM route."""
+        return str(old_model or "").startswith("nvidia_nim/") != str(new_model or "").startswith("nvidia_nim/")
+
+    @staticmethod
+    def _apply_nvidia_nim_credentials(params: Dict[str, Any]) -> None:
+        """Give an ``nvidia_nim/`` request an NVIDIA key, never the OpenAI one.
+
+        litellm reads only NVIDIA_NIM_API_KEY; when that is missing the OpenAI
+        SDK falls back to OPENAI_API_KEY and sends it to NVIDIA. Precedence:
+        explicit api_key, NVIDIA_NIM_API_KEY, NVIDIA_API_KEY, then a placeholder
+        for a local NIM (which accepts any non-empty key).
+        """
+        if params.get("api_key") or not str(params.get("model", "")).startswith("nvidia_nim/"):
+            return
+        key = os.environ.get("NVIDIA_NIM_API_KEY") or os.environ.get("NVIDIA_API_KEY")
+        if key:
+            params["api_key"] = key
+            return
+        base = params.get("base_url") or params.get("api_base") or os.environ.get("NVIDIA_NIM_API_BASE")
+        if base and "integrate.api.nvidia.com" not in base:
+            params["api_key"] = "not-used"
+            return
+        raise ValueError(
+            "NVIDIA_API_KEY is not set — get one at build.nvidia.com, "
+            "or pass base_url= for a local NIM"
+        )
+
+    def _guard_format_with_tools(self, params: Dict[str, Any]) -> None:
+        """Refuse a combination that makes the model fabricate.
+
+        On Ollama a JSON grammar makes the tool-call tag unemittable, so the
+        model cannot call the tool and instead invents a confident answer,
+        returned with HTTP 200 and no warning. Measured: the same request
+        without the grammar calls the tool correctly; with it the model
+        returned an invented temperature having never run the tool.
+
+        Raising is what this package's own quirk table prescribes -- a
+        fabricated answer that looks right is worse than an error.
+        """
+        adapter = getattr(self, '_provider_adapter', None)
+        if adapter is None or not getattr(adapter, 'format_and_tools_conflict', False):
+            return
+        if params.get("tools") and params.get("response_format"):
+            raise ValueError(
+                "This local provider cannot honour a structured-output schema and "
+                "tools in the same request: the JSON grammar makes the tool call "
+                "unemittable, so the model silently fabricates an answer instead "
+                "of calling your tool. Send tools without output_json/output_pydantic, "
+                "or drop the tools for this call."
+            )
 
     def _build_completion_params(self, **override_params) -> Dict[str, Any]:
         """Build parameters for litellm completion calls with all necessary config"""
         params = {
-            "model": self.model,
+            "model": self._resolve_openai_compatible_model(),
         }
         
         # Add optional parameters if they exist
@@ -5709,21 +7108,21 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
             # Set max_tokens here; for reasoning models this is normalized to
             # max_completion_tokens after per-call override_params are merged.
             params["max_tokens"] = self.max_tokens
-        if self.top_p:
+        if self.top_p is not None:
             params["top_p"] = self.top_p
-        if self.presence_penalty:
+        if self.presence_penalty is not None:
             params["presence_penalty"] = self.presence_penalty
-        if self.frequency_penalty:
+        if self.frequency_penalty is not None:
             params["frequency_penalty"] = self.frequency_penalty
         if self.logit_bias:
             params["logit_bias"] = self.logit_bias
         if self.response_format:
             params["response_format"] = self.response_format
-        if self.seed:
+        if self.seed is not None:
             params["seed"] = self.seed
-        if self.logprobs:
+        if self.logprobs is not None:
             params["logprobs"] = self.logprobs
-        if self.top_logprobs:
+        if self.top_logprobs is not None:
             params["top_logprobs"] = self.top_logprobs
         if self.stop_phrases:
             params["stop"] = self.stop_phrases
@@ -5747,7 +7146,22 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                 params["extra_headers"] = extra_headers
         
         # Override with any provided parameters
+        base_model = params.get("model")
         params.update(override_params)
+
+        # A per-call or failover-profile model override bypasses
+        # _resolve_openai_compatible_model, so route nvidia/ ids here too.
+        from .model_providers import to_litellm_nvidia_nim
+        nim_model = to_litellm_nvidia_nim(params.get("model"))
+        if nim_model:
+            params["model"] = nim_model
+        if self._crosses_nim_boundary(base_model, params.get("model")):
+            # The instance key and endpoint belong to the other vendor; let the
+            # target's own apply. Per-call values are still honoured.
+            for key in ("api_key", "base_url", "api_base"):
+                if key not in override_params:
+                    params.pop(key, None)
+        self._apply_nvidia_nim_credentials(params)
 
         # Resolve temperature from the instance when the caller did not specify
         # one. Public entry points now default temperature to None so a value
@@ -5776,16 +7190,33 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
             'max_tool_calls_per_turn', 'parallel_tool_calls',  # Tool execution settings
             'in_loop_compaction', 'clear_threshold_pct', 'compact_threshold_pct',  # In-loop context management
             'keep_recent_tool_results',  # In-loop context management
+            'reasoning_effort', 'thinking_budget',  # Reasoning-effort (translated below, Issue #4452)
         ]
         for param in internal_params:
             params.pop(param, None)
+
+        # Translate the unified reasoning-effort level to the target provider's
+        # native request parameter (Issue #4452): OpenAI/xAI reasoning models get
+        # ``reasoning_effort``, Anthropic/Gemini get an extended-thinking budget,
+        # and models with no reasoning control are left untouched. A per-call
+        # override wins over the instance-level setting; ``off``/unset is a no-op.
+        effort = override_params.get('reasoning_effort', self.reasoning_effort)
+        if effort is not None:
+            from ..thinking.effort import resolve_reasoning_params
+            reasoning_params = resolve_reasoning_params(effort, params['model'])
+            # Don't clobber an explicit native param the caller already set,
+            # whether top-level or nested in extra_body.
+            extra_body = params.get('extra_body') or {}
+            for key, value in reasoning_params.items():
+                if key not in extra_body:
+                    params.setdefault(key, value)
 
         # Reasoning models (o1/o3/gpt-5.x) require max_completion_tokens and
         # reject the legacy max_tokens parameter plus several sampling params.
         # Normalize here (after override_params merge) so per-call overrides
         # like max_tokens/temperature cannot reintroduce rejected params.
         from .model_capabilities import is_reasoning_model
-        if is_reasoning_model(self.model):
+        if is_reasoning_model(params['model']):
             # Map max_tokens -> max_completion_tokens unless the caller already
             # provided max_completion_tokens explicitly (which takes precedence).
             if 'max_tokens' in params:
@@ -5800,11 +7231,11 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
             schema_model = output_json or output_pydantic
             
             # Check if model supports structured outputs
-            if supports_structured_outputs(self.model):
+            if supports_structured_outputs(params['model']):
                 # Check if this is a Gemini model (uses different params)
-                if self._is_gemini_model():
-                    if schema_model and hasattr(schema_model, 'model_json_schema'):
-                        schema = schema_model.model_json_schema()
+                if self._is_gemini_model(params['model']):
+                    schema = schema_model.model_json_schema() if hasattr(schema_model, 'model_json_schema') else schema_model
+                    if isinstance(schema, dict):
                         # Gemini uses response_mime_type and response_schema
                         params['response_mime_type'] = 'application/json'
                         params['response_schema'] = schema
@@ -5842,8 +7273,10 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
         if 'tools' in params and params['tools'] and 'tool_choice' not in params:
             try:
                 import litellm
-                # Check if model supports function calling before setting tool_choice
-                if litellm.supports_function_calling(model=self.model):
+                # Check if model supports function calling before setting tool_choice.
+                # litellm's map has no NIM chat entries, so NIM is opted in explicitly.
+                if (str(params['model']).startswith('nvidia_nim/')
+                        or litellm.supports_function_calling(model=self.model)):
                     params['tool_choice'] = 'auto'
                     logging.debug(f"Set tool_choice='auto' for model {self.model}")
             except Exception as e:
@@ -5895,10 +7328,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                 web_fetch_tool['max_uses'] = 5
             
             # Add web_fetch tool to existing tools or create tools list
-            if 'tools' in params and params['tools']:
-                params['tools'].append(web_fetch_tool)
-            else:
-                params['tools'] = [web_fetch_tool]
+            params['tools'] = list(params.get('tools') or []) + [web_fetch_tool]
             
             logging.debug(f"Web fetch enabled with tool: {web_fetch_tool}")
         
@@ -5910,20 +7340,17 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                 memory_tool_def = memory_tool.get_tool_definition()
                 
                 # Add memory tool to existing tools or create tools list
-                if 'tools' in params and params['tools']:
-                    params['tools'].append(memory_tool_def)
-                else:
-                    params['tools'] = [memory_tool_def]
+                params['tools'] = list(params.get('tools') or []) + [memory_tool_def]
                 
                 # Add the beta header for Anthropic
                 beta_header = memory_tool.get_beta_header()
-                if 'extra_headers' in params:
-                    params['extra_headers']['anthropic-beta'] = beta_header
-                else:
-                    params['extra_headers'] = {'anthropic-beta': beta_header}
+                extra_headers = dict(params.get('extra_headers') or {})
+                extra_headers['anthropic-beta'] = beta_header
+                params['extra_headers'] = extra_headers
                 
                 logging.debug(f"Claude memory tool enabled with beta header: {beta_header}")
         
+        self._guard_format_with_tools(params)
         return params
 
     # ── Responses API support ───────────────────────────────────────────
@@ -5991,7 +7418,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
           - tools → ``tools`` (Responses API uses same function schema)
           - temperature, max_tokens, etc. → direct pass-through
         """
-        params: Dict[str, Any] = {"model": self.model}
+        params: Dict[str, Any] = {"model": self._resolve_openai_compatible_model()}
 
         # ── Extract system instructions ─────────────────────────────────
         instructions = None
@@ -5999,12 +7426,18 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
         for msg in messages:
             role = msg.get("role", "")
             if role in ("system", "developer"):
-                # Accumulate system / developer messages as instructions
-                content = msg.get("content", "")
+                # Accumulate system / developer messages as instructions.
+                # Normalise Chat Completions-style text-part content into a
+                # plain string before combining so we never mutate the
+                # caller-owned list nor send raw parts as instructions.
+                from .openai_client import OpenAIClient
+                content = OpenAIClient._normalise_instruction_content(
+                    msg.get("content", "")
+                )
                 if instructions is None:
                     instructions = content
                 else:
-                    instructions += "\n" + content
+                    instructions = instructions + "\n" + content
             else:
                 # user / assistant / tool messages become input items
                 # Special handling for Chat Completions→Responses API format:
@@ -6012,13 +7445,21 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                     # Assistant message with tool_calls → emit text (if any)
                     # then emit function_call items for each tool call
                     content = msg.get("content")
-                    if content and content.strip():
+                    if isinstance(content, list):
+                        from .openai_client import OpenAIClient
+                        converted = OpenAIClient._build_responses_content(content)
+                        if converted:
+                            input_items.append({"role": "assistant", "content": converted})
+                    elif content and content.strip():
                         input_items.append({"role": "assistant", "content": content})
                     for tc in msg["tool_calls"]:
-                        fn = tc.get("function", tc) if isinstance(tc, dict) else tc
+                        fn = tc.get("function", tc) if isinstance(tc, dict) else getattr(tc, "function", tc)
                         fn_name = fn.get("name", "") if isinstance(fn, dict) else getattr(fn, "name", "")
                         fn_args = fn.get("arguments", "{}") if isinstance(fn, dict) else getattr(fn, "arguments", "{}")
                         tc_id = tc.get("id", "") if isinstance(tc, dict) else getattr(tc, "id", "")
+                        # Skip items with empty name — API rejects them
+                        if not fn_name:
+                            continue
                         input_items.append({
                             "type": "function_call",
                             "call_id": tc_id,
@@ -6038,7 +7479,9 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                     # (input_text / input_image); local image paths become
                     # data URLs. Plain-string content is passed through.
                     from .openai_client import OpenAIClient
-                    item = dict(msg)
+                    # Do not forward persisted metadata/provider extensions as
+                    # Responses message properties.
+                    item = {"role": role}
                     item["content"] = OpenAIClient._build_responses_content(
                         msg.get("content", "")
                     )
@@ -6077,11 +7520,13 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                 params["tool_choice"] = "auto"
 
         # ── Scalar params ───────────────────────────────────────────────
+        if temperature is None:
+            temperature = self.temperature
         if temperature is not None:
             params["temperature"] = temperature
         if self.max_tokens:
             params["max_output_tokens"] = self.max_tokens
-        if self.top_p:
+        if self.top_p is not None:
             params["top_p"] = self.top_p
         if self.base_url:
             params["base_url"] = self.base_url
@@ -6109,13 +7554,14 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
         schema_model = output_json or output_pydantic
         if schema_model:
             from .model_capabilities import supports_structured_outputs
-            if supports_structured_outputs(self.model):
-                if hasattr(schema_model, 'model_json_schema'):
-                    schema = schema_model.model_json_schema()
+            request_model = kwargs.get('model') if kwargs.get('model') is not None else params['model']
+            if supports_structured_outputs(request_model):
+                schema = schema_model.model_json_schema() if hasattr(schema_model, 'model_json_schema') else schema_model
+                if isinstance(schema, dict):
                     params['text'] = {
                         "format": {
                             "type": "json_schema",
-                            "name": getattr(schema_model, '__name__', 'response'),
+                            "name": getattr(schema_model, '__name__', 'structured_output' if isinstance(schema_model, dict) else 'response'),
                             "schema": schema,
                             "strict": True,
                         }
@@ -6136,13 +7582,26 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
             if k not in _internal and v is not None:
                 params[k] = v
 
+        # Match Chat Completions after merging overrides: reasoning models
+        # must not regain unsupported sampling parameters through either path.
+        from .model_capabilities import is_reasoning_model
+        if is_reasoning_model(params["model"]):
+            for param in ('temperature', 'top_p', 'presence_penalty',
+                          'frequency_penalty', 'logit_bias'):
+                params.pop(param, None)
+
         return params
 
     def _call_responses_api(self, **params) -> Any:
         """
         Call ``litellm.responses()`` synchronously with retry support.
         Returns a ``ResponsesAPIResponse`` object.
+
+        Raises:
+            ModelRequestBlocked: If a test suite turned real model requests off
+                via ``praisonaiagents.model_harness.allow_model_requests(False)``.
         """
+        check_model_request(self.model, "litellm.responses")
         import litellm
         return self._call_with_retry(litellm.responses, **params)
 
@@ -6150,11 +7609,25 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
         """
         Call ``litellm.aresponses()`` asynchronously with retry support.
         Returns a ``ResponsesAPIResponse`` object.
+
+        Raises:
+            ModelRequestBlocked: If a test suite turned real model requests off
+                via ``praisonaiagents.model_harness.allow_model_requests(False)``.
         """
+        check_model_request(self.model, "litellm.aresponses")
         import litellm
         response = await self._call_with_retry_async(litellm.aresponses, **params)
         self._track_token_usage(response, self._response_model_for_tracking(response))
         return response
+
+    def _raise_responses_failure(self, error) -> None:
+        """Surface a failed Responses request without accepting partial output."""
+        code = error.get("code") if isinstance(error, dict) else getattr(error, "code", None)
+        message = error.get("message") if isinstance(error, dict) else getattr(error, "message", None)
+        if self._last_stop_reason == "completed":
+            self._last_stop_reason = "error"
+        label = f"Responses API failed ({code})" if code else "Responses API failed"
+        raise LLMResponseError(f"{label}: {message or 'Provider returned a failed response.'}")
 
     def _extract_from_responses_output(self, response) -> tuple:
         """
@@ -6167,11 +7640,16 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
         Unlike Chat Completions, text and tool calls are *always* separate
         items, so ``content`` is never null when text is present.
         """
+        status = response.get("status") if isinstance(response, dict) else getattr(response, "status", None)
+        if status == "failed":
+            error = response.get("error") if isinstance(response, dict) else getattr(response, "error", None)
+            self._raise_responses_failure(error)
+        self._record_finish_reason(response)
         response_text = ""
         tool_calls: List[Dict[str, Any]] = []
         reasoning_content = None
 
-        output_items = getattr(response, 'output', None) or []
+        output_items = (response.get('output') if isinstance(response, dict) else getattr(response, 'output', None)) or []
         for item in output_items:
             # Handle both dict and object access
             if isinstance(item, dict):
@@ -6229,6 +7707,34 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
 
         return response_text, tool_calls if tool_calls else None, reasoning_content
 
+    @staticmethod
+    def _close_responses_stream(stream) -> None:
+        """Close a stream or its LiteLLM transport without masking its error."""
+        try:
+            close = getattr(stream, "close", None)
+            if not callable(close):
+                close = getattr(getattr(stream, "response", None), "close", None)
+            if callable(close):
+                close()
+        except Exception:
+            logging.debug("Responses stream cleanup failed", exc_info=True)
+
+    @staticmethod
+    async def _aclose_responses_stream(stream) -> None:
+        """Await transport cleanup on completion, failure or cancellation."""
+        try:
+            target = stream
+            close = getattr(target, "aclose", None) or getattr(target, "close", None)
+            if not callable(close):
+                target = getattr(stream, "response", None)
+                close = getattr(target, "aclose", None) or getattr(target, "close", None)
+            if callable(close):
+                result = close()
+                if inspect.isawaitable(result):
+                    await result
+        except Exception:
+            logging.debug("Responses stream cleanup failed", exc_info=True)
+
     def _stream_responses_api(
         self,
         params: Dict[str, Any],
@@ -6242,7 +7748,12 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
 
         Returns the same (response_text, tool_calls) tuple as the Chat
         Completions streaming path.  Emits StreamEvents when configured.
+
+        Raises:
+            ModelRequestBlocked: If a test suite turned real model requests off
+                via ``praisonaiagents.model_harness.allow_model_requests(False)``.
         """
+        check_model_request(self.model, "litellm.responses")
         import litellm
 
         params["stream"] = True
@@ -6250,94 +7761,117 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
         # tool_calls accumulator: {output_index: {"id":..., "name":..., "arguments":...}}
         _pending_tools: Dict[int, Dict[str, Any]] = {}
         _emit = emit_events and stream_callback is not None
+        _final_response = None
 
         if _emit:
             from ..streaming.events import StreamEvent, StreamEventType
 
-        for event in litellm.responses(**params):
-            # Access event type — handle both object and dict
-            if isinstance(event, dict):
-                evt_type = event.get("type", "")
-            else:
-                evt_type = getattr(event, "type", "")
-
-            # ── Text delta ──────────────────────────────────────────
-            if evt_type == "response.output_text.delta":
-                delta_text = (event.get("delta", "") if isinstance(event, dict)
-                              else getattr(event, "delta", ""))
-                response_text += delta_text
-                if _emit and delta_text:
-                    stream_callback(StreamEvent(
-                        type=StreamEventType.DELTA_TEXT,
-                        timestamp=time.perf_counter(),
-                        content=delta_text,
-                        is_reasoning=False,
-                    ))
-
-            # ── Reasoning delta ─────────────────────────────────────
-            elif evt_type == "response.reasoning_summary_text.delta":
-                delta_text = (event.get("delta", "") if isinstance(event, dict)
-                              else getattr(event, "delta", ""))
-                if _emit and delta_text:
-                    stream_callback(StreamEvent(
-                        type=StreamEventType.DELTA_TEXT,
-                        timestamp=time.perf_counter(),
-                        content=delta_text,
-                        is_reasoning=True,
-                    ))
-
-            # ── Function call arguments delta ───────────────────────
-            elif evt_type == "response.function_call_arguments.delta":
-                idx = (event.get("output_index", 0) if isinstance(event, dict)
-                       else getattr(event, "output_index", 0))
-                delta_args = (event.get("delta", "") if isinstance(event, dict)
-                              else getattr(event, "delta", ""))
-                if idx not in _pending_tools:
-                    item_id = (event.get("item_id", f"tool_{idx}") if isinstance(event, dict)
-                               else getattr(event, "item_id", f"tool_{idx}"))
-                    _pending_tools[idx] = {
-                        "id": item_id,
-                        "name": "",
-                        "arguments": "",
-                    }
-                _pending_tools[idx]["arguments"] += delta_args
-
-            # ── Output item done — finalise tool call metadata ──────
-            elif evt_type == "response.output_item.done":
+        response_stream = litellm.responses(**params)
+        try:
+            for event in response_stream:
+                # Access event type — handle both object and dict
                 if isinstance(event, dict):
-                    item = event.get("item", {})
-                    idx = event.get("output_index", 0)
+                    evt_type = event.get("type", "")
                 else:
-                    item = getattr(event, "item", None) or {}
-                    idx = getattr(event, "output_index", 0)
+                    evt_type = getattr(event, "type", "")
 
-                if isinstance(item, dict):
-                    i_type = item.get("type", "")
-                else:
-                    i_type = getattr(item, "type", "")
+                if evt_type == "response.failed":
+                    failed_response = event.get("response") if isinstance(event, dict) else getattr(event, "response", None)
+                    error = failed_response.get("error") if isinstance(failed_response, dict) else getattr(failed_response, "error", None)
+                    self._raise_responses_failure(error)
+                if evt_type == "error":
+                    self._raise_responses_failure(event)
 
-                if i_type == "function_call":
-                    if isinstance(item, dict):
-                        call_id = item.get("call_id", item.get("id", f"tool_{idx}"))
-                        fn_name = item.get("name", "")
-                        fn_args = item.get("arguments", "")
-                    else:
-                        call_id = getattr(item, "call_id", None) or getattr(item, "id", f"tool_{idx}")
-                        fn_name = getattr(item, "name", "")
-                        fn_args = getattr(item, "arguments", "")
+                # ── Completed — capture the final response for usage accounting ──
+                if evt_type in ("response.completed", "response.incomplete"):
+                    _final_response = (event.get("response") if isinstance(event, dict)
+                                       else getattr(event, "response", None))
+                    self._record_finish_reason(_final_response)
 
-                    if idx in _pending_tools:
-                        _pending_tools[idx]["id"] = call_id
-                        _pending_tools[idx]["name"] = fn_name
-                        # Prefer the accumulated delta args if available, else use final
-                        if not _pending_tools[idx]["arguments"]:
-                            _pending_tools[idx]["arguments"] = fn_args
-                    else:
+                if evt_type == "response.refusal.delta":
+                    refusal = event.get("delta", "") if isinstance(event, dict) else getattr(event, "delta", "")
+                    self._record_finish_reason({"choices": [{"message": {"refusal": refusal}}]})
+
+                # ── Text delta ──────────────────────────────────────────
+                if evt_type == "response.output_text.delta":
+                    delta_text = (event.get("delta", "") if isinstance(event, dict)
+                                  else getattr(event, "delta", ""))
+                    response_text += delta_text
+                    if _emit and delta_text:
+                        stream_callback(StreamEvent(
+                            type=StreamEventType.DELTA_TEXT,
+                            timestamp=time.perf_counter(),
+                            content=delta_text,
+                            is_reasoning=False,
+                        ))
+
+                # ── Reasoning delta ─────────────────────────────────────
+                elif evt_type == "response.reasoning_summary_text.delta":
+                    delta_text = (event.get("delta", "") if isinstance(event, dict)
+                                  else getattr(event, "delta", ""))
+                    if _emit and delta_text:
+                        stream_callback(StreamEvent(
+                            type=StreamEventType.DELTA_TEXT,
+                            timestamp=time.perf_counter(),
+                            content=delta_text,
+                            is_reasoning=True,
+                        ))
+
+                # ── Function call arguments delta ───────────────────────
+                elif evt_type == "response.function_call_arguments.delta":
+                    idx = (event.get("output_index", 0) if isinstance(event, dict)
+                           else getattr(event, "output_index", 0))
+                    delta_args = (event.get("delta", "") if isinstance(event, dict)
+                                  else getattr(event, "delta", ""))
+                    if idx not in _pending_tools:
+                        item_id = (event.get("item_id", f"tool_{idx}") if isinstance(event, dict)
+                                   else getattr(event, "item_id", f"tool_{idx}"))
                         _pending_tools[idx] = {
-                            "id": call_id,
-                            "name": fn_name,
-                            "arguments": fn_args,
+                            "id": item_id,
+                            "name": "",
+                            "arguments": "",
                         }
+                    _pending_tools[idx]["arguments"] += delta_args
+
+                # ── Output item done — finalise tool call metadata ──────
+                elif evt_type == "response.output_item.done":
+                    if isinstance(event, dict):
+                        item = event.get("item", {})
+                        idx = event.get("output_index", 0)
+                    else:
+                        item = getattr(event, "item", None) or {}
+                        idx = getattr(event, "output_index", 0)
+
+                    if isinstance(item, dict):
+                        i_type = item.get("type", "")
+                    else:
+                        i_type = getattr(item, "type", "")
+
+                    if i_type == "function_call":
+                        if isinstance(item, dict):
+                            call_id = item.get("call_id", item.get("id", f"tool_{idx}"))
+                            fn_name = item.get("name", "")
+                            fn_args = item.get("arguments", "")
+                        else:
+                            call_id = getattr(item, "call_id", None) or getattr(item, "id", f"tool_{idx}")
+                            fn_name = getattr(item, "name", "")
+                            fn_args = getattr(item, "arguments", "")
+
+                        if idx in _pending_tools:
+                            _pending_tools[idx]["id"] = call_id
+                            _pending_tools[idx]["name"] = fn_name
+                            # Prefer the accumulated delta args if available, else use final
+                            if not _pending_tools[idx]["arguments"]:
+                                _pending_tools[idx]["arguments"] = fn_args
+                        else:
+                            _pending_tools[idx] = {
+                                "id": call_id,
+                                "name": fn_name,
+                                "arguments": fn_args,
+                            }
+
+        finally:
+            self._close_responses_stream(response_stream)
 
         # ── Build tool_calls list in output_index order ─────────────
         tool_calls: List[Dict[str, Any]] = []
@@ -6352,7 +7886,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                 },
             })
 
-        return response_text, tool_calls if tool_calls else None
+        return response_text, tool_calls if tool_calls else None, _final_response
 
     async def _stream_responses_api_async(
         self,
@@ -6363,87 +7897,114 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
         """
         Async streaming for Responses API.
         Returns (response_text, tool_calls).
+
+        Raises:
+            ModelRequestBlocked: If a test suite turned real model requests off
+                via ``praisonaiagents.model_harness.allow_model_requests(False)``.
         """
+        check_model_request(self.model, "litellm.aresponses")
         import litellm
 
         params["stream"] = True
         response_text = ""
         _pending_tools: Dict[int, Dict[str, Any]] = {}
         _emit = emit_events and stream_callback is not None
+        _final_response = None
 
         if _emit:
             from ..streaming.events import StreamEvent, StreamEventType
 
-        async for event in await litellm.aresponses(**params):
-            if isinstance(event, dict):
-                evt_type = event.get("type", "")
-            else:
-                evt_type = getattr(event, "type", "")
-
-            if evt_type == "response.output_text.delta":
-                delta_text = (event.get("delta", "") if isinstance(event, dict)
-                              else getattr(event, "delta", ""))
-                response_text += delta_text
-                if _emit and delta_text:
-                    stream_callback(StreamEvent(
-                        type=StreamEventType.DELTA_TEXT,
-                        timestamp=time.perf_counter(),
-                        content=delta_text,
-                        is_reasoning=False,
-                    ))
-
-            elif evt_type == "response.reasoning_summary_text.delta":
-                delta_text = (event.get("delta", "") if isinstance(event, dict)
-                              else getattr(event, "delta", ""))
-                if _emit and delta_text:
-                    stream_callback(StreamEvent(
-                        type=StreamEventType.DELTA_TEXT,
-                        timestamp=time.perf_counter(),
-                        content=delta_text,
-                        is_reasoning=True,
-                    ))
-
-            elif evt_type == "response.function_call_arguments.delta":
-                idx = (event.get("output_index", 0) if isinstance(event, dict)
-                       else getattr(event, "output_index", 0))
-                delta_args = (event.get("delta", "") if isinstance(event, dict)
-                              else getattr(event, "delta", ""))
-                if idx not in _pending_tools:
-                    item_id = (event.get("item_id", f"tool_{idx}") if isinstance(event, dict)
-                               else getattr(event, "item_id", f"tool_{idx}"))
-                    _pending_tools[idx] = {"id": item_id, "name": "", "arguments": ""}
-                _pending_tools[idx]["arguments"] += delta_args
-
-            elif evt_type == "response.output_item.done":
+        response_stream = await litellm.aresponses(**params)
+        try:
+            async for event in response_stream:
                 if isinstance(event, dict):
-                    item = event.get("item", {})
-                    idx = event.get("output_index", 0)
+                    evt_type = event.get("type", "")
                 else:
-                    item = getattr(event, "item", None) or {}
-                    idx = getattr(event, "output_index", 0)
+                    evt_type = getattr(event, "type", "")
 
-                if isinstance(item, dict):
-                    i_type = item.get("type", "")
-                else:
-                    i_type = getattr(item, "type", "")
+                if evt_type == "response.failed":
+                    failed_response = event.get("response") if isinstance(event, dict) else getattr(event, "response", None)
+                    error = failed_response.get("error") if isinstance(failed_response, dict) else getattr(failed_response, "error", None)
+                    self._raise_responses_failure(error)
+                if evt_type == "error":
+                    self._raise_responses_failure(event)
 
-                if i_type == "function_call":
+                if evt_type in ("response.completed", "response.incomplete"):
+                    _final_response = (event.get("response") if isinstance(event, dict)
+                                       else getattr(event, "response", None))
+                    self._record_finish_reason(_final_response)
+
+                if evt_type == "response.refusal.delta":
+                    refusal = event.get("delta", "") if isinstance(event, dict) else getattr(event, "delta", "")
+                    self._record_finish_reason({"choices": [{"message": {"refusal": refusal}}]})
+
+                if evt_type == "response.output_text.delta":
+                    delta_text = (event.get("delta", "") if isinstance(event, dict)
+                                  else getattr(event, "delta", ""))
+                    response_text += delta_text
+                    if _emit and delta_text:
+                        stream_callback(StreamEvent(
+                            type=StreamEventType.DELTA_TEXT,
+                            timestamp=time.perf_counter(),
+                            content=delta_text,
+                            is_reasoning=False,
+                        ))
+
+                elif evt_type == "response.reasoning_summary_text.delta":
+                    delta_text = (event.get("delta", "") if isinstance(event, dict)
+                                  else getattr(event, "delta", ""))
+                    if _emit and delta_text:
+                        stream_callback(StreamEvent(
+                            type=StreamEventType.DELTA_TEXT,
+                            timestamp=time.perf_counter(),
+                            content=delta_text,
+                            is_reasoning=True,
+                        ))
+
+                elif evt_type == "response.function_call_arguments.delta":
+                    idx = (event.get("output_index", 0) if isinstance(event, dict)
+                           else getattr(event, "output_index", 0))
+                    delta_args = (event.get("delta", "") if isinstance(event, dict)
+                                  else getattr(event, "delta", ""))
+                    if idx not in _pending_tools:
+                        item_id = (event.get("item_id", f"tool_{idx}") if isinstance(event, dict)
+                                   else getattr(event, "item_id", f"tool_{idx}"))
+                        _pending_tools[idx] = {"id": item_id, "name": "", "arguments": ""}
+                    _pending_tools[idx]["arguments"] += delta_args
+
+                elif evt_type == "response.output_item.done":
+                    if isinstance(event, dict):
+                        item = event.get("item", {})
+                        idx = event.get("output_index", 0)
+                    else:
+                        item = getattr(event, "item", None) or {}
+                        idx = getattr(event, "output_index", 0)
+
                     if isinstance(item, dict):
-                        call_id = item.get("call_id", item.get("id", f"tool_{idx}"))
-                        fn_name = item.get("name", "")
-                        fn_args = item.get("arguments", "")
+                        i_type = item.get("type", "")
                     else:
-                        call_id = getattr(item, "call_id", None) or getattr(item, "id", f"tool_{idx}")
-                        fn_name = getattr(item, "name", "")
-                        fn_args = getattr(item, "arguments", "")
+                        i_type = getattr(item, "type", "")
 
-                    if idx in _pending_tools:
-                        _pending_tools[idx]["id"] = call_id
-                        _pending_tools[idx]["name"] = fn_name
-                        if not _pending_tools[idx]["arguments"]:
-                            _pending_tools[idx]["arguments"] = fn_args
-                    else:
-                        _pending_tools[idx] = {"id": call_id, "name": fn_name, "arguments": fn_args}
+                    if i_type == "function_call":
+                        if isinstance(item, dict):
+                            call_id = item.get("call_id", item.get("id", f"tool_{idx}"))
+                            fn_name = item.get("name", "")
+                            fn_args = item.get("arguments", "")
+                        else:
+                            call_id = getattr(item, "call_id", None) or getattr(item, "id", f"tool_{idx}")
+                            fn_name = getattr(item, "name", "")
+                            fn_args = getattr(item, "arguments", "")
+
+                        if idx in _pending_tools:
+                            _pending_tools[idx]["id"] = call_id
+                            _pending_tools[idx]["name"] = fn_name
+                            if not _pending_tools[idx]["arguments"]:
+                                _pending_tools[idx]["arguments"] = fn_args
+                        else:
+                            _pending_tools[idx] = {"id": call_id, "name": fn_name, "arguments": fn_args}
+
+        finally:
+            await self._aclose_responses_stream(response_stream)
 
         tool_calls: List[Dict[str, Any]] = []
         for idx in sorted(_pending_tools.keys()):
@@ -6454,7 +8015,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                 "function": {"name": tc["name"], "arguments": tc["arguments"]},
             })
 
-        return response_text, tool_calls if tool_calls else None
+        return response_text, tool_calls if tool_calls else None, _final_response
 
     def _process_streaming_chunk(self, chunk) -> Optional[str]:
         """Extract content from a streaming chunk"""
@@ -6464,23 +8025,102 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
 
     def _process_tool_calls_from_stream(self, delta, tool_calls: List[Dict]) -> List[Dict]:
         """Process tool calls from streaming delta chunks.
-        
-        This handles the accumulation of tool call data from streaming chunks,
-        building up the complete tool call information incrementally.
+
+        Accumulates tool-call fragments across chunks, keyed by the provider's
+        ``index``. Three hardening points over the naive version:
+
+        - A first-seen ``index`` larger than the current list is grown with
+          placeholder slots instead of indexing past the end (previously an
+          ``IndexError``).
+        - A ``name``/``id`` that only arrives in a later chunk is filled in
+          rather than ignored (the ``id`` is otherwise never updated).
+        - When a *different* non-empty ``id`` reuses an already-populated index
+          (some providers reuse ``index=0`` for distinct parallel calls), a new
+          slot is started instead of concatenating two calls' arguments into one
+          invalid-JSON blob. Once an index has been re-pointed to that new slot,
+          later *id-less* argument chunks carrying the same index are routed to
+          the new slot too (via ``_stream_index_route``) rather than reopening
+          the first call and corrupting its JSON.
         """
-        if hasattr(delta, 'tool_calls') and delta.tool_calls:
-            for tc in delta.tool_calls:
-                if tc.index >= len(tool_calls):
-                    tool_calls.append({
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {"name": "", "arguments": ""}
-                    })
-                if tc.function.name:
-                    tool_calls[tc.index]["function"]["name"] = tc.function.name
-                if tc.function.arguments:
-                    tool_calls[tc.index]["function"]["arguments"] += tc.function.arguments
+        # Per-accumulation routing: maps a provider ``index`` to the latest
+        # appended slot when that index has been reused for a new call. Reset
+        # whenever a fresh (empty) ``tool_calls`` list begins a new stream so the
+        # map never leaks across turns.
+        route_key = id(tool_calls)
+        index_route = getattr(self, "_stream_index_route", None)
+        if index_route is None or not isinstance(index_route, dict):
+            index_route = {}
+            self._stream_index_route = index_route
+        if not tool_calls:
+            index_route.pop(route_key, None)
+        routes: Dict[int, int] = index_route.setdefault(route_key, {})
+
+        for tc in getattr(delta, "tool_calls", None) or []:
+            idx = getattr(tc, "index", None)
+            if idx is None:
+                idx = len(tool_calls)
+            while len(tool_calls) <= idx:
+                tool_calls.append({
+                    "id": None,
+                    "type": "function",
+                    "function": {"name": "", "arguments": ""},
+                })
+            # Honour an earlier re-point for this index so continuation chunks
+            # land on the new call rather than the original slot.
+            slot_idx = routes.get(idx, idx)
+            if slot_idx >= len(tool_calls):
+                slot_idx = idx
+            slot = tool_calls[slot_idx]
+
+            tc_id = getattr(tc, "id", None)
+            # A different, non-empty id at an already-identified slot means the
+            # provider is reusing the index for a new parallel call: start a new
+            # slot so arguments are not merged across calls.
+            if tc_id and slot["id"] and tc_id != slot["id"]:
+                slot = {
+                    "id": None,
+                    "type": "function",
+                    "function": {"name": "", "arguments": ""},
+                }
+                tool_calls.append(slot)
+                routes[idx] = len(tool_calls) - 1
+            if tc_id and not slot["id"]:
+                slot["id"] = tc_id
+
+            fn = getattr(tc, "function", None)
+            if fn is not None:
+                if getattr(fn, "name", None):
+                    slot["function"]["name"] = fn.name
+                if getattr(fn, "arguments", None):
+                    slot["function"]["arguments"] += fn.arguments
         return tool_calls
+
+    def _create_tool_message(self, function_name: str, result: Any,
+                             tool_call_id: Optional[str], is_ollama: bool = False) -> Dict[str, Any]:
+        """Build the message that carries a tool's result back to the model.
+
+        get_response_stream called this from its streaming tool loop and it was
+        never defined, so the first tool result raised AttributeError. The
+        broad `except Exception` around that loop swallowed it, set
+        use_streaming = False, and dropped through to the non-streaming branch
+        -- which discarded the tool calls too. The net effect was that tool
+        calling appeared to do nothing on every streaming turn, with the real
+        cause visible only as a logged warning.
+
+        Two unit tests exercised this loop by assigning `_create_tool_message`
+        onto the instance themselves, so they passed against a method
+        production never had.
+
+        Mirrors the formatting the non-streaming loop uses, including Ollama's
+        natural-language variant.
+        """
+        if is_ollama:
+            return self._format_ollama_tool_result_message(function_name, result)
+        adapter = getattr(self, '_provider_adapter', None)
+        if adapter is None:
+            from .adapters import DefaultAdapter
+            adapter = DefaultAdapter()
+        return adapter.format_tool_result_message(function_name, result, tool_call_id)
 
     def _serialize_tool_calls(self, tool_calls) -> List[Dict]:
         """Convert tool calls to a serializable format for all providers."""
@@ -6499,6 +8139,25 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                     }
                 })
         return serializable_tool_calls
+
+    def _tool_call_fingerprint(self, tool_calls, is_ollama: bool = False) -> tuple:
+        """Stable identity for a batch of tool calls, ignoring provider call ids.
+
+        Two consecutive batches with the same fingerprint and no prose between
+        them mean the provider is repeating itself, not making progress. Call
+        ids are excluded deliberately: Ollama mints a fresh one every turn, so
+        an id-sensitive comparison would never match.
+        """
+        fingerprint = []
+        for tool_call in tool_calls:
+            function_name, arguments, _ = self._extract_tool_call_info(
+                tool_call, is_ollama)
+            try:
+                rendered = json.dumps(arguments, sort_keys=True, default=str)
+            except (TypeError, ValueError):
+                rendered = str(arguments)
+            fingerprint.append((function_name, rendered))
+        return tuple(fingerprint)
 
     def _extract_tool_call_info(self, tool_call, is_ollama: bool = False) -> tuple:
         """Extract function name, arguments, and tool_call_id from a tool call.

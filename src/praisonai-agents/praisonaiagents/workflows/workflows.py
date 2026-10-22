@@ -25,7 +25,7 @@ import json
 import copy
 import time
 import logging
-import threading
+import collections
 from praisonaiagents._logging import get_logger
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Callable, Tuple, Union
@@ -36,6 +36,7 @@ from .workflow_configs import (
     TaskContextConfig, TaskOutputConfig, TaskExecutionConfig, TaskRoutingConfig,
 )
 from ..task.task import Task
+from ..llm.model_providers import default_auxiliary_model
 
 logger = get_logger(__name__)
 
@@ -47,10 +48,166 @@ DEFAULT_MAX_PARALLEL_WORKERS = 3
 # summarisation request consumes roughly as many tokens as it saves.
 MIN_BRANCHES_FOR_LLM_SUMMARY = 3
 
-# Guards lazy creation of each Workflow's per-instance _run_lock so two threads
-# entering run()/astart() concurrently on a fresh instance cannot each create
-# and acquire a *different* lock object (which would defeat the run guard).
-_RUN_LOCK_INIT_GUARD = threading.Lock()
+import contextvars
+
+# Generation of the run a branch belongs to. A fail_fast/timeout Parallel block
+# abandons still-running branches (threads cannot be force-killed in Python); if
+# that branch later fails it must NOT scribble "failed" onto a *subsequent* run's
+# shared status. Each run() stamps its generation here; branches capture it via
+# contextvars (propagated into the ThreadPoolExecutor by copy_context_to_callable)
+# and status writes are suppressed once the owning run has moved on. None means
+# "no active run" (e.g. a bare _execute_single_step_internal call in tests).
+_run_generation: "contextvars.ContextVar[Optional[int]]" = contextvars.ContextVar(
+    "praisonai_workflow_run_generation", default=None
+)
+
+from .._run_lock import ensure_run_lock
+
+
+class _WriteTrackingDict(dict):
+    """A ``dict`` that records which keys were assigned after construction.
+
+    A parallel branch runs against its own deep copy of the shared variables and
+    the branch's writes must be merged back (see ``_merge_branch_variables``). The
+    only reliable way to know *which* keys a branch wrote - not equality (drops an
+    equal-valued write, mis-flags a value whose ``!=`` is not a bool) nor identity
+    (blind to a rebind to an interned immutable like ``x = "SAME"``) - is to record
+    the assignment as it happens. Keys set at construction time seed the branch's
+    starting scope and are deliberately *not* counted as writes.
+    """
+
+    __slots__ = ("written_keys",)
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # A set, not a copy of the values: only the identity of *which* keys were
+        # written matters, and the current value is read from the dict at merge.
+        self.written_keys = set()
+
+    def __setitem__(self, key, value):
+        self.written_keys.add(key)
+        super().__setitem__(key, value)
+
+    def update(self, *args, **kwargs):
+        # dict.update does NOT route through __setitem__, so a StepResult.variables
+        # merge (``all_variables.update(result.variables)``) would otherwise be an
+        # invisible write. Record its keys explicitly.
+        merged = dict(*args, **kwargs)
+        self.written_keys.update(merged)
+        super().update(merged)
+
+    def setdefault(self, key, default=None):
+        # setdefault also bypasses __setitem__ and creates the key when absent.
+        if key not in self:
+            self.written_keys.add(key)
+        return super().setdefault(key, default)
+
+def _isolate_value(value: Any, memo: dict) -> Any:
+    """Deep-copy ``value`` but degrade to sharing by reference where it can't.
+
+    This is ``copy.deepcopy`` with two differences that matter for a parallel
+    scope:
+
+    * **Shared memo.** All values in one scope are copied with the *same* ``memo``
+      so cross-variable aliasing survives: if ``variables['records']`` and
+      ``variables['state']['records']`` are the same list, the branch still sees
+      one shared list, exactly as the old whole-scope ``copy.deepcopy`` did. A
+      write through one name is visible through the other within the branch.
+    * **Granular fallback.** A value that cannot be deep-copied (thread lock,
+      DB/HTTP/LLM client, open file, a live Agent, generator, ...) would abort the
+      whole run with a pickling ``TypeError`` even when no branch touches it. Only
+      the *exact* un-copyable node is shared by reference; the containers around it
+      are still copied, so an ordinary mutable sibling (``{'client': c, 'rows': []}``
+      -> ``rows``) stays isolated and an in-place mutation cannot leak to a sibling
+      branch or loop iteration.
+    """
+    # Already isolated under this scope (cross-variable alias): reuse the copy.
+    if id(value) in memo:
+        return memo[id(value)]
+
+    pre_existing = set(memo)
+    try:
+        return copy.deepcopy(value, memo)
+    except Exception:
+        pass
+    # ``copy.deepcopy`` failed somewhere inside ``value``. A failed deepcopy can
+    # leave *unfinished* copies in ``memo`` (e.g. an empty dict for a container it
+    # had started but not populated before the un-copyable leaf raised). Reusing
+    # those would silently drop nested seed data, so discard everything this
+    # attempt added and rebuild the known container types node-by-node. The
+    # un-copyable leaves are shared by reference; everything around them is still
+    # isolated, and container subclasses (namedtuple, defaultdict, OrderedDict,
+    # subclassed list/set/tuple) keep their type and behaviour.
+    for key in set(memo) - pre_existing:
+        del memo[key]
+    return _rebuild_isolated(value, memo)
+
+
+def _rebuild_isolated(value: Any, memo: dict) -> Any:
+    """Node-by-node fallback copy that shares only the un-copyable leaves.
+
+    Used by :func:`_isolate_value` after a whole-value ``copy.deepcopy`` fails.
+    Rebuilds ``dict``/``list``/``set``/``tuple`` (and their subclasses, so a
+    ``defaultdict`` keeps its factory and a ``namedtuple`` keeps its fields),
+    recursing through :func:`_isolate_value` so each nested child first gets a
+    clean ``deepcopy`` attempt and only genuinely un-copyable nodes are shared.
+    """
+    if id(value) in memo:
+        return memo[id(value)]
+
+    if isinstance(value, dict):
+        try:
+            copied = value.__class__()  # preserves defaultdict/OrderedDict/...
+        except Exception:
+            copied = {}
+        if isinstance(value, collections.defaultdict):
+            copied.default_factory = value.default_factory
+        memo[id(value)] = copied
+        for k, v in value.items():
+            copied[_isolate_value(k, memo)] = _isolate_value(v, memo)
+        return copied
+    if isinstance(value, list):
+        try:
+            copied = value.__class__()  # preserves a list subclass where possible
+        except Exception:
+            copied = []  # subclass constructor requires args: fall back to list
+        memo[id(value)] = copied
+        copied.extend(_isolate_value(v, memo) for v in value)
+        return copied
+    if isinstance(value, set):
+        try:
+            copied = value.__class__()  # preserves a set subclass where possible
+        except Exception:
+            copied = set()  # subclass constructor requires args: fall back to set
+        memo[id(value)] = copied
+        for v in value:
+            copied.add(_isolate_value(v, memo))
+        return copied
+    if isinstance(value, tuple):
+        items = [_isolate_value(v, memo) for v in value]
+        if hasattr(value, "_fields"):  # namedtuple keeps its type and fields
+            try:
+                return value.__class__(*items)
+            except Exception:
+                return tuple(items)
+        return tuple(items)
+    # Unknown/atomic object that could not be deep-copied: share by reference as
+    # a last resort (read-only intent).
+    return value
+
+
+def _isolate_scope(variables: dict) -> dict:
+    """Give a parallel branch/iteration its own copy of the variable scope.
+
+    A branch needs its own container so concurrent writes are not a data race,
+    and mutable data (lists/dicts) is deep-copied so a sibling cannot observe
+    another branch's in-place mutation. Values are copied with one shared
+    ``memo`` so cross-variable aliasing is preserved, and any value that cannot
+    be deep-copied degrades to a by-reference share of only the un-copyable node
+    rather than crashing the run. See ``_isolate_value``.
+    """
+    memo: dict = {}
+    return {k: _isolate_value(v, memo) for k, v in variables.items()}
 
 class WorkflowStepError(Exception):
     """Exception raised when workflow step execution fails."""
@@ -196,6 +353,7 @@ class StepResult:
     output: str = ""  # Step output content
     stop_workflow: bool = False  # If True, stop the entire workflow early
     variables: Dict[str, Any] = field(default_factory=dict)  # Variables to add/update
+    skipped: bool = False  # Completion observer outcome when no handler ran
 
 # Aliases for backward compatibility
 StepInput = WorkflowContext
@@ -242,21 +400,54 @@ class Parallel:
     - "partial_ok": Continue with partial results if some branches fail (default)
     - "fail_fast": Cancel remaining branches and fail immediately on first error
     - "fail_all": Wait for all branches to complete, then fail if any failed
+
+    timeout: optional per-Parallel wall-clock bound (seconds). Must be a positive
+    number, or None for no bound (a non-positive value raises ValueError rather
+    than silently disabling the limit). The clock starts when the block begins,
+    including any context-preparation work. If branches are still running after it
+    elapses the block raises WorkflowStepError instead of hanging forever. Threads
+    running user code cannot be force-killed in Python, so a timed-out/cancelled
+    branch may keep running in the background, but the caller is no longer blocked
+    on it and its late failure cannot corrupt a later run's status.
+
+    Context strategies (how the upstream step's output reaches each branch):
+    - "full": Pass the exact upstream output to every branch (default, no data loss)
+    - "truncate": Excerpt head+tail to save tokens (lossy; opt-in)
+    - "summarize": LLM-summarise for large fan-outs, else truncate (lossy; opt-in)
     """
     steps: List = field(default_factory=list)
     max_workers: Optional[int] = None  # None = use system default
     on_failure: str = "partial_ok"  # "partial_ok" | "fail_fast" | "fail_all"
-    
-    def __init__(self, steps: List, max_workers: Optional[int] = None, on_failure: str = "partial_ok"):
+    timeout: Optional[float] = None  # None = no wall-clock bound
+    context: str = "full"  # "full" | "truncate" | "summarize"
+
+    def __init__(self, steps: List, max_workers: Optional[int] = None, on_failure: str = "partial_ok", timeout: Optional[float] = None, context: str = "full"):
         valid_on_failure = {"partial_ok", "fail_fast", "fail_all"}
         if on_failure not in valid_on_failure:
             raise ValueError(
                 f"Invalid on_failure='{on_failure}'. Must be one of {valid_on_failure}. "
                 "See Parallel docstring for semantics."
             )
+        # Reject a non-positive timeout: `timeout=0`/negatives are truthiness-false
+        # and would silently disable the bound, letting a hung branch wait forever
+        # even though the caller explicitly asked for a limit. `None` is the only
+        # way to mean "no bound".
+        if timeout is not None and timeout <= 0:
+            raise ValueError(
+                f"Invalid timeout={timeout!r}. Must be a positive number of seconds, "
+                "or None for no wall-clock bound."
+            )
+        valid_context = {"full", "truncate", "summarize"}
+        if context not in valid_context:
+            raise ValueError(
+                f"Invalid context='{context}'. Must be one of {valid_context}. "
+                "See Parallel docstring for semantics."
+            )
         self.steps = steps
         self.max_workers = max_workers
         self.on_failure = on_failure
+        self.timeout = timeout
+        self.context = context
 
 @dataclass
 class Loop:
@@ -307,7 +498,8 @@ class Loop:
     parallel: bool = False  # Execute iterations in parallel
     max_workers: Optional[int] = None  # Max parallel workers (None = unlimited)
     output_variable: Optional[str] = None  # Store loop results in this variable name
-    
+    context: str = "full"  # "full" | "truncate" — how previous_output reaches parallel iterations
+
     def __init__(
         self, 
         step: Any = None,
@@ -318,7 +510,8 @@ class Loop:
         var_name: str = "item",
         parallel: bool = False,
         max_workers: Optional[int] = None,
-        output_variable: Optional[str] = None
+        output_variable: Optional[str] = None,
+        context: str = "full"
     ):
         # Validation: cannot have both step and steps
         if step is not None and steps is not None:
@@ -329,6 +522,11 @@ class Loop:
         # Validation: steps cannot be empty
         if steps is not None and len(steps) == 0:
             raise ValueError("Loop 'steps' cannot be empty")
+        valid_context = {"full", "truncate"}
+        if context not in valid_context:
+            raise ValueError(
+                f"Invalid context='{context}'. Must be one of {valid_context}."
+            )
         
         self.step = step
         self.steps = steps
@@ -339,6 +537,54 @@ class Loop:
         self.parallel = parallel
         self.max_workers = max_workers
         self.output_variable = output_variable
+        self.context = context
+
+class Discussion:
+    """N agents take turns on the same thread until a criterion is met.
+
+    PraisonAI had no N-agent conversation loop at all -- no round-robin, no
+    speaker selection -- so having three agents debate for a few turns meant
+    writing the loop by hand. ``repeat([a, b])`` was the obvious workaround and
+    silently misbehaved until it was fixed, which is what made this worth
+    building rather than documenting around.
+
+        Discussion([critic, author], rounds=3,
+                   until=lambda ctx: "AGREED" in (ctx.previous_result or ""))
+
+    Each turn receives the previous turn's output via ``ctx.previous_result``,
+    so this is a conversation rather than N independent answers. The full
+    running transcript is exposed as the ``discussion_transcript`` variable --
+    a speaker action sees the whole thread only when it references
+    ``{{discussion_transcript}}``. ``rounds`` counts full passes over the
+    speakers; it defaults to a bounded 3 and must be >= 1 -- an unbounded
+    debate is a bill, not a feature.
+    """
+
+    def __init__(
+        self,
+        agents=None,
+        rounds: int = 3,
+        until=None,
+        select=None,
+        name: str = "discussion",
+    ):
+        speakers = list(agents or [])
+        if not speakers:
+            raise ValueError(
+                "Discussion needs at least one speaker; an empty discussion would "
+                "run zero turns and report success."
+            )
+        if rounds < 1:
+            raise ValueError("Discussion rounds must be >= 1.")
+        self.agents = speakers
+        self.rounds = rounds
+        #: Stop early when this returns True, checked after every turn.
+        self.until = until
+        #: Choose the next speaker: (turn_index, context) -> agent. Defaults to
+        #: round-robin, which is the behaviour people expect from "discussion".
+        self.select = select
+        self.name = name
+
 
 @dataclass
 class Repeat:
@@ -377,6 +623,8 @@ def parallel(
     steps: List,
     max_workers: Optional[int] = None,
     on_failure: str = "partial_ok",
+    timeout: Optional[float] = None,
+    context: str = "full",
 ) -> Parallel:
     """Execute steps in parallel.
 
@@ -385,14 +633,19 @@ def parallel(
         max_workers: Optional cap on ThreadPoolExecutor workers. When unset,
             defaults to min(DEFAULT_MAX_PARALLEL_WORKERS, len(steps)).
         on_failure: Failure strategy — "partial_ok" (default), "fail_fast", or "fail_all".
+        timeout: Optional per-Parallel wall-clock bound (seconds); must be positive
+            (or None for no bound). Raises instead of hanging if branches are still
+            running when it elapses.
+        context: How the upstream output reaches each branch — "full" (default,
+            exact pass-through, no data loss), "truncate", or "summarize".
     """
-    return Parallel(steps=steps, max_workers=max_workers, on_failure=on_failure)
+    return Parallel(steps=steps, max_workers=max_workers, on_failure=on_failure, timeout=timeout, context=context)
 
 def loop(step: Any = None, steps: Optional[List[Any]] = None,
          over: Optional[str] = None, from_csv: Optional[str] = None, 
          from_file: Optional[str] = None, var_name: str = "item",
          parallel: bool = False, max_workers: Optional[int] = None,
-         output_variable: Optional[str] = None) -> Loop:
+         output_variable: Optional[str] = None, context: str = "full") -> Loop:
     """Loop over items executing step(s) for each.
     
     Args:
@@ -405,13 +658,15 @@ def loop(step: Any = None, steps: Optional[List[Any]] = None,
         parallel: If True, execute iterations in parallel (default: False)
         max_workers: Max parallel workers when parallel=True (default: None = unlimited)
         output_variable: Variable name to store all loop outputs (default: None = "loop_outputs")
+        context: How previous_output reaches parallel iterations — "full" (default,
+            exact pass-through, no data loss) or "truncate" (lossy; opt-in)
     
     Returns:
         Loop object configured for iteration
     """
     return Loop(step=step, steps=steps, over=over, from_csv=from_csv, from_file=from_file, 
                 var_name=var_name, parallel=parallel, max_workers=max_workers,
-                output_variable=output_variable)
+                output_variable=output_variable, context=context)
 
 def repeat(step: Any, until: Optional[Callable[[WorkflowContext], bool]] = None,
            max_iterations: int = 10) -> Repeat:
@@ -598,6 +853,11 @@ class AgentFlow:
     description: str = ""
     steps: List = field(default_factory=list)  # Can be Task, Agent, or function
     variables: Dict[str, Any] = field(default_factory=dict)
+    #: Cache step results by their inputs. True for a process-scoped LRU, or
+    #: any object with get()/set(). OPT-IN: an agent step is not always
+    #: deterministic, and silently serving a cached answer for a call the user
+    #: expected to happen again is worse than paying for it.
+    cache: Any = None
     file_path: Optional[str] = None
     
     # Default configuration for all steps
@@ -661,7 +921,15 @@ class AgentFlow:
     # Status tracking
     status: str = "not_started"  # not_started, running, completed, failed
     step_statuses: Dict[str, str] = field(default_factory=dict)  # {step_name: status}
-    
+
+    #: Optional type for ``variables``: a Pydantic model or a dataclass. When
+    #: set, the initial variables are validated and ``flow.state`` gives typed
+    #: access, so a misspelled variable is an error instead of a value written
+    #: once and never read. Without it nothing changes -- ``variables`` stays
+    #: the untyped dict it has always been. Declared last so it never shifts
+    #: the positional binding of existing fields like ``file_path``.
+    state_model: Optional[type] = None
+
     # Private resolved fields (set in __post_init__)
     _verbose: bool = field(default=False, repr=False)
     _stream: bool = field(default=True, repr=False)
@@ -687,6 +955,49 @@ class AgentFlow:
     # Guards per-run mutable state (status/step_statuses/_handoff_chain) so a
     # shared Workflow instance cannot be corrupted by concurrent run() calls.
     _run_lock: Optional[Any] = field(default=None, repr=False, compare=False)
+    # Monotonic id of the currently-executing run. Bumped at each run() so an
+    # abandoned fail_fast/timeout Parallel branch can tell it outlived its run
+    # and must not mutate a later run's shared status (see _begin_run_generation
+    # and _is_current_run_generation).
+    _current_run_generation: int = field(default=0, repr=False, compare=False)
+    # Reset token for the _run_generation contextvar captured at run() start and
+    # consumed in run()'s finally to restore the caller's generation (nested runs).
+    _run_generation_token: Any = field(default=None, repr=False, compare=False)
+
+    def _begin_run_generation(self) -> Any:
+        """Stamp a fresh generation for the run starting now and publish it to the
+        current context so branches submitted by this run capture it.
+
+        Returns the contextvar reset token for the *previous* generation. The
+        caller MUST pass it to :meth:`_end_run_generation` in a ``finally`` so a
+        nested ``Workflow.run()`` (e.g. an ``Include`` step launching another
+        flow) restores the outer run's generation on the way out instead of
+        leaving its own value stamped on the outer thread's context -- otherwise
+        a later task in the outer flow would be judged against the wrong
+        generation and have its failure silently suppressed.
+        """
+        self._current_run_generation += 1
+        return _run_generation.set(self._current_run_generation)
+
+    def _end_run_generation(self, token: Any) -> None:
+        """Restore the generation the context carried before :meth:`_begin_run_generation`.
+
+        A no-op when ``token`` is None so callers can guard unconditionally.
+        """
+        if token is not None:
+            _run_generation.reset(token)
+
+    def _is_current_run_generation(self) -> bool:
+        """True if the caller still belongs to the instance's live run.
+
+        A branch abandoned by a previous fail_fast/timeout Parallel block carries
+        an older generation (captured via the _run_generation contextvar), so this
+        returns False for it and its late status writes are suppressed. A bare
+        internal call outside any run (generation None) is treated as current to
+        preserve existing single-step behaviour.
+        """
+        gen = _run_generation.get()
+        return gen is None or gen == self._current_run_generation
 
     @property
     def _execution_lock(self):
@@ -696,18 +1007,24 @@ class AgentFlow:
         first reach run()/astart() concurrently observe the *same* lock object
         (double-checked locking) rather than each minting and acquiring its own.
         """
-        lock = self._run_lock
-        if lock is None:
-            with _RUN_LOCK_INIT_GUARD:
-                lock = self._run_lock
-                if lock is None:
-                    lock = threading.Lock()
-                    self._run_lock = lock
-        return lock
+        return ensure_run_lock(self)
 
     def __post_init__(self):
         """Resolve consolidated params to internal values."""
         from ..utils.model_alias import resolve_model_name
+        from .step_cache import resolve_step_cache
+
+        # Resolved once, not per step: `cache=True` must mean ONE cache shared
+        # across the run, not a fresh empty one for every step (which would
+        # never hit and would look like the feature simply not working).
+        self._step_cache = resolve_step_cache(self.cache)
+
+        # Validate the declared state up front. A misspelled variable found when
+        # the flow is BUILT costs nothing; found mid-run it has already burned
+        # the steps before it, and may never be found at all.
+        if self.state_model is not None:
+            from .state import validate_variables as _validate_state
+            _validate_state(self.state_model, self.variables)
 
         # One rule for the alias pair, shared with Agent and AgentTeam. Must
         # UNWRAP an LLMConfig to its model string: this value seeds the agents
@@ -1160,7 +1477,46 @@ class AgentFlow:
                 finally:
                     self._active_shared_compute = None
         finally:
+            # Restore the generation the caller's context carried before this
+            # run stamped its own, so a nested Workflow.run() (Include) does not
+            # leave a stale generation on the outer run's thread.
+            token, self._run_generation_token = self._run_generation_token, None
+            self._end_run_generation(token)
             self._execution_lock.release()
+
+    def to_mermaid(self) -> str:
+        """Render this flow's DEFINITION as a mermaid diagram.
+
+        Unlike the telemetry diagrams, which need a captured execution trace,
+        this reads the step list -- so a flow can be checked before it is run
+        and before it costs anything. Mermaid needs no extra dependency and
+        renders inline on GitHub and in the docs.
+
+            print(flow.to_mermaid())
+        """
+        from .diagram import flow_to_mermaid
+        return flow_to_mermaid(self)
+
+    @property
+    def state(self):
+        """The flow's variables as the declared ``state_model``.
+
+        Returns None when no model was declared, so callers can tell "untyped"
+        from "typed and empty" rather than being handed a misleading blank.
+        """
+        from .state import build_state
+        if self.state_model is None:
+            return None
+        return build_state(self.state_model, self.variables)
+
+    def validate_variables(self) -> None:
+        """Raise unless the current variables fit ``state_model``.
+
+        Called for you at construction; exposed so a step that writes variables
+        can re-check before the next step reads them.
+        """
+        from .state import validate_variables
+        validate_variables(self.state_model, self.variables)
 
     def __repr__(self):
         """Show where this workflow's steps run.
@@ -1218,6 +1574,9 @@ class AgentFlow:
                 visit(step.step)
                 visit(step.steps)
                 return
+            if isinstance(step, Discussion):
+                visit(step.agents)
+                return
             if isinstance(step, Repeat):
                 visit(step.step)
                 return
@@ -1267,7 +1626,7 @@ class AgentFlow:
         self._validate_framework()
         
         # Use default LLM if not specified
-        model = llm or self.llm or "gpt-4o-mini"
+        model = default_auxiliary_model(llm or self.llm)
         logger.debug(f"Workflow using model: {model} (llm={llm}, default_llm={self.llm})")
 
         # Agents the flow builds itself already receive the default via
@@ -1298,6 +1657,14 @@ class AgentFlow:
         
         # Update workflow status
         self.status = "running"
+        # Stamp a fresh generation for this run so a still-running branch from a
+        # previous fail_fast/timeout Parallel block (which cannot be force-killed)
+        # cannot write "failed" onto this run's status. Branches capture this via
+        # the _run_generation contextvar at submit time. The reset token is kept
+        # on the instance so run()'s finally can restore the context the caller
+        # had -- critical for nested Workflow.run() (Include), which must not
+        # leave its own generation stamped on the outer run's thread.
+        self._run_generation_token = self._begin_run_generation()
         
         # Set YAML-approved tools only when caller allows dangerous tools
         _approval_token = None
@@ -1392,6 +1759,23 @@ class AgentFlow:
                 i += 1
                 continue
                 
+            elif isinstance(step, Discussion):
+                discussion_result = self._execute_discussion(
+                    step, previous_output, input, all_variables, model, verbose, stream
+                )
+                results.extend(discussion_result["steps"])
+                previous_output = discussion_result["output"]
+                all_variables.update(discussion_result.get("variables", {}))
+                # A speaker with on_error="stop" halts the whole workflow, not
+                # just the discussion: honor the propagated stop signal here.
+                if discussion_result.get("stop"):
+                    self.status = "failed"
+                    if verbose:
+                        print("🛑 Workflow stopped by nested discussion step")
+                    break
+                i += 1
+                continue
+
             elif isinstance(step, Repeat):
                 # Repeat until condition
                 repeat_result = self._execute_repeat(
@@ -1445,19 +1829,21 @@ class AgentFlow:
                 current_step=step.name,
                 variables=all_variables.copy()
             )
-            
-            # Update step status
+
+            # Start a step attempt before notifying lifecycle observers. The
+            # attempt may finish as skipped or from cache without a handler call.
             if hasattr(step, 'status'):
                 step.status = "running"
             self.step_statuses[step.name] = "running"
-            
-            # Call on_step_start callback
+
+            # Preserve the preparation hook before the gate: it may populate
+            # context variables used by should_run, including on cached runs.
             if self.on_step_start:
                 try:
                     self.on_step_start(step.name, context)
                 except Exception as e:
                     logger.error(f"on_step_start callback failed: {e}")
-            
+
             # Check should_run condition
             if step.should_run:
                 try:
@@ -1467,10 +1853,72 @@ class AgentFlow:
                         if hasattr(step, 'status'):
                             step.status = "skipped"
                         self.step_statuses[step.name] = "skipped"
+                        if self.on_step_complete:
+                            try:
+                                self.on_step_complete(step.name, StepResult(output="", skipped=True))
+                            except Exception as e:
+                                logger.error(f"on_step_complete callback failed: {e}")
                         i += 1
                         continue
                 except Exception as e:
                     logger.error(f"should_run failed for {step.name}: {e}")
+
+            # Cache only the result, never the decision to run. A condition can
+            # observe external state that is absent from the cache key, so it
+            # must be evaluated even when identical inputs have a cached result.
+            _step_cache = getattr(self, "_step_cache", None)
+            _cache_key = None
+            if _step_cache is not None:
+                from .step_cache import make_step_key
+                if step.handler:
+                    _cache_key = make_step_key(step, context.previous_result, context.input, context.variables)
+                else:
+                    # Agent prompts and attachments consume workflow inputs,
+                    # not the handler context prepared by lifecycle hooks.
+                    _cache_key = make_step_key(step, previous_output, input, all_variables)
+                try:
+                    _cached = copy.deepcopy(_step_cache.get(_cache_key))
+                except Exception:
+                    _cached = None
+                    logger.warning("Could not restore cached workflow step '%s'", step.name)
+                if _cached is not None:
+                    if verbose:
+                        print(f"↩︎  cache hit: {step.name}")
+                    previous_output = _cached.get("output")
+                    # Replay the full step delta recorded on the cold run so a
+                    # hit is indistinguishable from re-executing: the step's
+                    # status/retries, any handler-supplied variables (and the
+                    # generated output variable, present only when the cold run
+                    # did not stop first), and -- crucially -- the stop signal.
+                    # A hit that only appended {step, output} and continued lost
+                    # the stop flag and the handler's variables, so a workflow
+                    # that stopped on the cold run ran on through the cached one.
+                    cached_record = _cached.get("step_record") or {
+                        "step": step.name, "output": previous_output,
+                        "status": "completed", "retries": 0,
+                    }
+                    results.append(dict(cached_record))
+                    self.step_statuses[step.name] = cached_record["status"]
+                    if hasattr(step, "status"):
+                        step.status = cached_record["status"]
+                    if _cached.get("variables"):
+                        all_variables.update(_cached["variables"])
+                    if self.on_step_complete:
+                        try:
+                            self.on_step_complete(
+                                step.name, StepResult(
+                                    output=previous_output or "",
+                                    stop_workflow=bool(_cached.get("stop")),
+                                ),
+                            )
+                        except Exception as e:
+                            logger.error(f"on_step_complete callback failed: {e}")
+                    if _cached.get("stop"):
+                        if verbose:
+                            print(f"🛑 Workflow stopped at: {step.name}")
+                        break
+                    i += 1
+                    continue
             
             # Gap 3c: Check for cross-step handoff cycles
             self._check_handoff_cycle(step)
@@ -1483,6 +1931,7 @@ class AgentFlow:
             retry_count = 0
             validation_feedback = None
             guardrail_failed = False
+            cached_variable_updates = {} if _cache_key is not None else None
             
             while retry_count <= max_retries:
                 step_error = None
@@ -1499,7 +1948,14 @@ class AgentFlow:
                             output = result.output
                             stop = result.stop_workflow
                             if result.variables:
+                                # Accumulate across retries so the cached
+                                # snapshot matches the cold run: a rejected
+                                # attempt that wrote {a, b} followed by an
+                                # accepted attempt that wrote {a} leaves both
+                                # keys in the live run, so both must be cached.
                                 all_variables.update(result.variables)
+                                if cached_variable_updates is not None:
+                                    cached_variable_updates.update(result.variables)
                         else:
                             output = str(result)
                             
@@ -1688,11 +2144,29 @@ class AgentFlow:
             # a failure too, even though no exception was raised. Treat it like
             # step_error so on_error flow control and the final status are honored
             # instead of silently reporting the step "completed".
-            step_failed = bool(step_error) or guardrail_failed
+            #
+            # So is an LLM-backed step that produced no output at all. `chat()`
+            # returns None when the underlying call failed and the agent
+            # swallowed the error (an auth 401 is the common case): the engine
+            # already logs "Output is None" a few lines below, so it knows the
+            # step produced nothing — it just used to report the run
+            # "completed" anyway, and every consumer (CLI, API server, Python
+            # callers) was told the run succeeded. Only agent/action steps are
+            # judged this way: a custom `handler` may legitimately return None,
+            # and a skipped step never reaches here.
+            produced_nothing = (
+                output is None
+                and not step_error
+                and not step.handler
+                and (step.agent is not None or bool(step.action))
+            )
+            step_failed = bool(step_error) or guardrail_failed or produced_nothing
             failure_reason = (
                 str(step_error) if step_error
                 else (f"guardrail validation failed: {validation_feedback}"
-                      if guardrail_failed else None)
+                      if guardrail_failed
+                      else ("agent produced no output (None) — the model call "
+                            "most likely failed" if produced_nothing else None))
             )
 
             # Update step status
@@ -1760,14 +2234,44 @@ class AgentFlow:
                 except Exception as e:
                     logger.error(f"Failed to save output to file: {e}")
             
-            # Store result
-            results.append({
+            # Store result. A step that failed under on_error="continue" reaches
+            # here (the on_error="stop" branch above already returned); carry its
+            # failure_reason through so the final result surfaces *why* it failed
+            # rather than the generic "step(s) failed: <name>" fallback.
+            step_record = {
                 "step": step.name,
                 "output": output,
                 "status": self.step_statuses.get(step.name, "completed"),
                 "retries": retry_count
-            })
+            }
+            if step_failed and failure_reason:
+                step_record["error"] = failure_reason
+            results.append(step_record)
             previous_output = output
+
+            # Only a SUCCESSFUL step is cached. Caching a failure would serve
+            # the failure again on every re-run, turning a transient error into
+            # a permanent one that no retry could clear. The step's output
+            # variables and stop signal must be stored too: a cache hit must
+            # preserve handler state and control flow, not just output text.
+            # Store only this step's variable updates, including its output
+            # variable unless it stopped before that variable was written.
+            if _cache_key is not None and not step_failed:
+                if not stop:
+                    _cached_var_name = step.output_variable or f"{step.name}_output"
+                    cached_variable_updates[_cached_var_name] = output
+                try:
+                    _step_cache.set(
+                        _cache_key,
+                        copy.deepcopy({
+                            "output": output, "variables": cached_variable_updates,
+                            "stop": stop, "step_record": step_record,
+                        }),
+                    )
+                except Exception:
+                    # Custom caches may only accept serializable state. Keep
+                    # the successful workflow result when storage rejects it.
+                    logger.warning("Could not cache workflow step '%s'", step.name)
             
             if verbose:
                 print(f"✅ {step.name}: {str(output)}")
@@ -1826,6 +2330,26 @@ class AgentFlow:
             "variables": all_variables,
             "status": self.status
         }
+        # Surface *why* a failed run failed. Callers (the CLI included) read
+        # result["error"]; without it a genuine failure printed
+        # "Workflow failed: Unknown error".
+        if self.status == "failed":
+            reasons = [
+                f"{r.get('step')}: {r.get('error')}"
+                for r in results
+                if r.get("status") == "failed" and r.get("error")
+            ]
+            if reasons:
+                final_result["error"] = "; ".join(reasons)
+            else:
+                failed_names = [
+                    str(r.get("step")) for r in results
+                    if r.get("status") == "failed"
+                ]
+                final_result["error"] = (
+                    "step(s) failed: " + ", ".join(failed_names)
+                    if failed_names else "workflow failed"
+                )
         
         # Call on_workflow_complete callback
         if self.on_workflow_complete:
@@ -1929,18 +2453,51 @@ class AgentFlow:
                 step_result_internal = self._execute_single_step_internal(
                     step, previous_output, input, all_variables, model, verbose, i, stream
                 )
+                if step_result_internal.get("skipped"):
+                    results.append({"step": step_name, "output": None, "status": "skipped"})
+                    continue
                 output = step_result_internal.get("output", "")
                 stop = step_result_internal.get("stop", False)
                 step_vars = step_result_internal.get("variables", {})
                 all_variables.update(step_vars)
                 
+                # An LLM-backed step that produced nothing is a failure here
+                # too, exactly as in the sequential path: `chat()` returns None
+                # when the model call failed and the agent swallowed the error.
+                # This loop used to mark every non-raising step "completed"
+                # before the manager ever saw it.
+                produced_nothing = (
+                    output is None
+                    and not getattr(step, 'handler', None)
+                    and (getattr(step, 'agent', None) is not None
+                         or bool(getattr(step, 'action', None)))
+                )
+
                 step_result = {
                     "step": step_name,
                     "output": output,
-                    "status": "completed"
+                    "status": "failed" if produced_nothing else "completed"
                 }
                 results.append(step_result)
-                
+
+                if produced_nothing:
+                    failure_reason = (
+                        f"Step '{step_name}' produced no output (None) -- the "
+                        f"model call most likely failed"
+                    )
+                    logger.error(failure_reason)
+                    self.status = "failed"
+                    if hasattr(step, 'status'):
+                        step.status = "failed"
+                    self.step_statuses[step_name] = "failed"
+                    step_result["failure_reason"] = failure_reason
+                    if self.on_step_error:
+                        try:
+                            self.on_step_error(self, step, Exception(failure_reason))
+                        except Exception as callback_e:
+                            logger.error(f"on_step_error callback failed: {callback_e}")
+                    break
+
                 if hasattr(step, 'status'):
                     step.status = "completed"
                 self.step_statuses[step_name] = "completed"
@@ -1999,16 +2556,26 @@ Respond with JSON: {{"approved": true/false, "reason": "Brief explanation"}}
                         output_json=True
                     )
                     
-                    if isinstance(validation_response, str):
-                        import json
-                        try:
-                            decision_data = json.loads(validation_response)
-                        except json.JSONDecodeError:
-                            decision_data = {"approved": True, "reason": "Could not parse response, assuming success"}
-                    elif isinstance(validation_response, dict):
-                        decision_data = validation_response
-                    else:
-                        decision_data = {"approved": True, "reason": "Unknown response format, assuming success"}
+                    # Parse the manager's verdict with the module's own JSON
+                    # helper, which already strips the ```json fences models
+                    # routinely emit. A bare json.loads() raised JSONDecodeError
+                    # on every fenced reply, and the handler then FAILED OPEN --
+                    # turning "approved": false into "assuming success". A
+                    # manager rejection was therefore silently discarded and the
+                    # run reported completed, which is the same class of defect
+                    # as an all-None run reporting success.
+                    decision_data = _parse_json_output(
+                        validation_response, step_name
+                    )
+                    if not isinstance(decision_data, dict):
+                        # Fail CLOSED: an unreadable verdict is not approval.
+                        decision_data = {
+                            "approved": False,
+                            "reason": (
+                                "Manager validation response could not be "
+                                f"parsed: {str(validation_response)[:200]!r}"
+                            ),
+                        }
                     
                     approved = decision_data.get("approved", True)
                     reason = decision_data.get("reason", "No reason provided")
@@ -2034,8 +2601,31 @@ Respond with JSON: {{"approved": true/false, "reason": "Brief explanation"}}
                         break
                         
                 except Exception as e:
-                    logger.warning(f"Manager validation failed for step '{step_name}': {e}. Continuing workflow.")
-                
+                    # The manager is a GATE. If it could not run, it has not
+                    # passed -- reporting "completed successfully" because the
+                    # quality check itself failed is the same lie as approving a
+                    # rejection. This block already fails closed on an
+                    # unparseable verdict two lines up, so failing open here
+                    # would be incoherent. Hierarchical mode is opt-in: a caller
+                    # who asked for manager validation wants it enforced.
+                    failure_reason = (
+                        f"Manager validation could not run for step "
+                        f"'{step_name}': {e}"
+                    )
+                    logger.error(failure_reason)
+                    self.status = "failed"
+                    if hasattr(step, 'status'):
+                        step.status = "failed"
+                    self.step_statuses[step_name] = "failed"
+                    step_result["status"] = "failed"
+                    step_result["failure_reason"] = failure_reason
+                    if self.on_step_error:
+                        try:
+                            self.on_step_error(self, step, e)
+                        except Exception as callback_e:
+                            logger.error(f"on_step_error callback failed: {callback_e}")
+                    break
+
                 previous_output = output
                 
                 # Store output in variables for next step's variable substitution
@@ -2082,6 +2672,10 @@ Respond with JSON: {{"approved": true/false, "reason": "Brief explanation"}}
         
         if failure_reason:
             final_result["failure_reason"] = failure_reason
+            # Also expose it as `error`, the key every caller (the CLI
+            # included) reads. Without it a genuine hierarchical failure
+            # printed "Workflow failed: Unknown error".
+            final_result.setdefault("error", failure_reason)
         
         if self.on_workflow_complete:
             try:
@@ -2384,6 +2978,93 @@ Create a brief execution plan (2-3 sentences) describing how to best accomplish 
         stream: bool = True,
         depth: int = 0
     ) -> Dict[str, Any]:
+        """Cache wrapper. The uncached body is _execute_single_step_uncached."""
+        # Patterns are control flow, not deterministic leaf results. Re-enter
+        # them on every run so their conditions and nested Task gates execute;
+        # their individual leaves can still reuse cached results.
+        if isinstance(step, (Loop, Parallel, Route, Repeat, Discussion, If, Include)):
+            return self._execute_single_step_uncached(
+                step, previous_output, input, all_variables, model, verbose, index,
+                stream=stream, depth=depth,
+            )
+        if depth > MAX_NESTING_DEPTH:
+            raise ValueError(
+                f"Maximum nesting depth ({MAX_NESTING_DEPTH}) exceeded. "
+                "Simplify your workflow or reduce pattern nesting."
+            )
+        step = self._normalize_single_step(step, index)
+        if step.should_run:
+            context = WorkflowContext(
+                input=input,
+                previous_result=str(previous_output) if previous_output else None,
+                current_step=step.name, variables=all_variables.copy(),
+            )
+            try:
+                should_run = step.should_run(context)
+            except Exception as e:
+                logger.error(f"should_run failed for {step.name}: {e}")
+                should_run = True  # Preserve the linear executor's error policy.
+            if not should_run:
+                step.status = "skipped"
+                self.step_statuses[step.name] = "skipped"
+                return {
+                    "step": step.name, "output": previous_output,
+                    "stop": False, "skipped": True, "variables": {},
+                }
+        cache = getattr(self, "_step_cache", None)
+        if cache is None:
+            return self._execute_single_step_uncached(
+                step, previous_output, input, all_variables, model, verbose, index,
+                stream=stream, depth=depth,
+            )
+        from .step_cache import make_step_key
+        key = make_step_key(step, previous_output, input, all_variables)
+        try:
+            hit = copy.deepcopy(cache.get(key))
+        except Exception:
+            hit = None
+            logger.warning("Could not restore cached workflow step")
+        if hit is not None:
+            if verbose:
+                print(f"↩︎  cache hit: {getattr(step, 'name', getattr(step, '__name__', step))}")
+            # A cache hit means the gated-in step is being served a prior result,
+            # so its status is "completed" -- not whatever a previous run left in
+            # step_statuses. Without this reset, a step that was gated OUT on an
+            # earlier run ("skipped") and is now gated IN would still report
+            # "skipped" to callers even though its cached output is returned.
+            if hasattr(step, "status"):
+                step.status = "completed"
+            self.step_statuses[step.name] = "completed"
+            # Copy: a caller mutating a returned result must not edit the cache.
+            return dict(hit)
+        result = self._execute_single_step_uncached(
+            step, previous_output, input, all_variables, model, verbose, index,
+            stream=stream, depth=depth,
+        )
+        # Only cache a SUCCESSFUL result. A nested step that exhausts its
+        # retries or fails a guardrail returns a dict carrying an "error" key
+        # (see the failure branches of _execute_single_step_uncached); caching
+        # that would replay the failure on every identical re-run and never let
+        # the step retry -- turning a transient error into a permanent one.
+        if isinstance(result, dict) and not result.get("error"):
+            try:
+                cache.set(key, copy.deepcopy(result))
+            except Exception:
+                logger.warning("Could not cache workflow step")
+        return result
+
+    def _execute_single_step_uncached(
+        self, 
+        step: Any, 
+        previous_output: Optional[str],
+        input: str,
+        all_variables: Dict[str, Any],
+        model: str,
+        verbose: bool,
+        index: int = 0,
+        stream: bool = True,
+        depth: int = 0
+    ) -> Dict[str, Any]:
         """Execute a single step and return result.
         
         Args:
@@ -2454,6 +3135,21 @@ Create a brief execution plan (2-3 sentences) describing how to best accomplish 
                 "output": repeat_result.get("output", ""),
                 "stop": repeat_result.get("stop", False),
                 "variables": repeat_result.get("variables", all_variables)
+            }
+        
+        if isinstance(step, Discussion):
+            discussion_result = self._execute_discussion(
+                step, previous_output, input, all_variables, model, verbose, stream, depth=depth+1
+            )
+            return {
+                "step": f"discussion_{index}",
+                "output": discussion_result.get("output", ""),
+                # Propagate a nested stop request so a speaker with
+                # on_error="stop" halts the enclosing workflow, not just the
+                # discussion, and so a nested Discussion is not stringified into
+                # a Task action by _normalize_single_step.
+                "stop": discussion_result.get("stop", False),
+                "variables": discussion_result.get("variables", all_variables)
             }
         
         if isinstance(step, If):
@@ -2580,8 +3276,12 @@ Create a brief execution plan (2-3 sentences) describing how to best accomplish 
         if step_error is not None:
             if hasattr(normalized, 'status'):
                 normalized.status = "failed"
-            self.step_statuses[normalized.name] = "failed"
-            self.status = "failed"
+            # Suppress shared-status writes from a branch that outlived its run: a
+            # fail_fast/timeout Parallel block abandons still-running branches, and
+            # a late failure from one must not corrupt a *subsequent* run's status.
+            if self._is_current_run_generation():
+                self.step_statuses[normalized.name] = "failed"
+                self.status = "failed"
             if getattr(normalized, 'on_error', 'stop') == 'stop':
                 if verbose:
                     print(f"🛑 Step '{normalized.name}' failed (on_error='stop'): {step_error}")
@@ -2854,6 +3554,155 @@ CONCISE SUMMARY:"""
             return min(user_max, n)
         return min(DEFAULT_MAX_PARALLEL_WORKERS, n)
     
+    @staticmethod
+    def _branch_variable_delta(
+        branch_variables: Optional[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """Return only the variables a parallel branch actually wrote.
+
+        A branch runs against its *own* ``copy.deepcopy`` of the shared scope, so
+        merging the whole returned dict back would copy every untouched key as
+        well - replacing the parent's objects with per-branch clones and letting a
+        stale copy overwrite a value some other part of the run had moved on from.
+        Only the delta is merged: the keys the branch actually assigned.
+
+        Writes are read from ``_WriteTrackingDict.written_keys`` - the exact set of
+        keys the branch bound via ``variables[name] = ...`` (an ``output_variable``
+        write, a ``StepResult.variables`` merge, or a nested pattern's own merge).
+        Recording the assignment itself is the only detection that is always right:
+
+        * value **equality** dropped an equal-valued write (writing a variable back
+          to the value it already held), losing declaration-order semantics on a
+          reused ``output_variable``, and it misclassified an untouched value whose
+          ``!=`` is not a bool (numpy arrays, some ORM/pydantic objects) as a write;
+        * object **identity** still could not see a write whose value is an interned
+          immutable (``x = "SAME"`` rebinds to the very object already there).
+
+        Tracking the assignment sidesteps both: an untouched key is never in
+        ``written_keys`` (so the parent keeps its own object and no ``!=`` is ever
+        evaluated), and every real write is present regardless of its value.
+        """
+        if not branch_variables:
+            return {}
+        written = getattr(branch_variables, "written_keys", None)
+        if written is None:
+            # Not a tracking dict (a branch replaced ``ctx.variables`` wholesale, or
+            # a nested pattern returned a plain dict). Fall back to merging every
+            # key so a real write is never dropped - the bug this method prevents.
+            return dict(branch_variables)
+        return {key: branch_variables[key] for key in written if key in branch_variables}
+
+    @staticmethod
+    def _loop_control_variables(
+        loop_step: Any, item: Any, idx: int
+    ) -> Dict[str, Any]:
+        """The variables a ``Loop`` injects itself for one iteration.
+
+        ``item`` (or the loop's ``var_name``), ``loop_index`` and the flattened
+        ``item.<key>`` accessors are loop *machinery*, not results the loop body
+        produced, so they stay scoped to the loop in **both** execution modes:
+        the sequential path restores whatever those names held before the loop,
+        and the parallel path drops them from the merged delta. Keeping the two
+        modes identical here is what lets the loop body's own writes - which do
+        escape - be compared between them.
+        """
+        control: Dict[str, Any] = {loop_step.var_name: item, "loop_index": idx}
+        # Also expand nested item properties for template access (e.g., {{item.title}})
+        if isinstance(item, dict):
+            for key, value in item.items():
+                control[f"{loop_step.var_name}.{key}"] = value
+        return control
+
+    @classmethod
+    def _loop_variable_delta(
+        cls, loop_variables: Optional[Dict[str, Any]], control: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Writes one parallel-loop iteration made, minus the loop's control vars."""
+        delta = cls._branch_variable_delta(loop_variables)
+        for key in control:
+            delta.pop(key, None)
+        return delta
+
+    @staticmethod
+    def _restore_loop_scope(
+        all_variables: Dict[str, Any],
+        saved: Dict[str, Any],
+        introduced: set,
+        preexisting_writes: set
+    ) -> None:
+        """Undo a sequential loop's own control variables once the loop is done.
+
+        The sequential loop runs against the shared scope (see ``_execute_loop``),
+        so ``item``/``loop_index`` would otherwise leak out of the loop - and, when
+        the loop sits inside a ``Parallel`` branch, would be merged back into the
+        enclosing workflow as if the branch had written them. Restore the previous
+        value (or remove the name) and un-record the write.
+        """
+        for key in introduced:
+            if key in saved:
+                all_variables[key] = saved[key]
+            else:
+                all_variables.pop(key, None)
+        written = getattr(all_variables, "written_keys", None)
+        if written is not None:
+            for key in introduced:
+                if key not in preexisting_writes:
+                    written.discard(key)
+
+    @staticmethod
+    def _merge_branch_variables(
+        all_variables: Dict[str, Any],
+        branch_deltas: List[Tuple[int, Dict[str, Any]]],
+        warn_on_collision: bool = True
+    ) -> None:
+        """Merge concurrent branches' variable writes back into the shared scope.
+
+        Used by ``Parallel`` (branch declaration order) and by the parallel
+        ``Loop`` (iteration order). ``warn_on_collision`` is the only difference
+        between them: two *branches* writing one variable is almost certainly an
+        authoring accident worth a warning, whereas N *iterations* of one loop
+        body necessarily write the loop body's ``output_variable`` N times - that
+        is the normal shape of a loop, not a mistake, so the loop passes False
+        rather than emitting a warning per item.
+
+        THE MERGE RULE (please do not "simplify" this back into a race):
+
+        1. Branches never share a variables dict - each gets a deep copy - because
+           concurrent writes to one dict is a data race. Isolation is the safe half
+           of the design; this function is the missing other half, the merge back.
+        2. Deltas are applied in **branch declaration order**, never completion
+           order, so the result does not depend on thread scheduling. Two runs of
+           the same workflow produce the same variables.
+        3. On a **key collision** - two branches writing the same variable with
+           different values - the later branch in declaration order wins, which is
+           exactly what would happen if the same steps ran sequentially (Parallel
+           is meant to be a faster way to run steps, not a different semantics).
+           The collision is logged as a warning naming the key and both branches,
+           because a silently discarded branch result is the bug this fixes; the
+           workflow author has almost certainly reused an ``output_variable`` or a
+           step name by accident.
+        4. Only real writes are merged (see ``_branch_variable_delta``), so an
+           untouched key keeps the parent's own object.
+        """
+        winners: Dict[str, int] = {}
+        for idx, delta in branch_deltas:
+            for key, value in delta.items():
+                previous_idx = winners.get(key)
+                if previous_idx is not None:
+                    try:
+                        conflicting = bool(all_variables[key] != value)
+                    except Exception:
+                        conflicting = True
+                    if conflicting and warn_on_collision:
+                        logger.warning(
+                            f"Parallel branches {previous_idx} and {idx} both wrote "
+                            f"variable '{key}' with different values; branch {idx} wins "
+                            f"(declaration order). Give the branches distinct "
+                            f"output_variable names to avoid losing a result."
+                        )
+                winners[key] = idx
+                all_variables[key] = value
+
     def _execute_parallel(
         self,
         parallel_step: Parallel,
@@ -2870,127 +3719,235 @@ CONCISE SUMMARY:"""
         
         results = []
         outputs = []
-        
+
+        # Start the wall-clock bound *before* any preparation work. The context
+        # summarisation below can make a blocking litellm.completion call, so a
+        # deadline started only at submission time would let a Parallel(timeout=N)
+        # block wait far longer than N before its clock even begins.
+        timeout = getattr(parallel_step, "timeout", None)
+        deadline = (time.monotonic() + timeout) if timeout else None
+
         if verbose:
             print(f"⚡ Running {len(parallel_step.steps)} steps in parallel...")
         
-        # Optimize: Use LLM-based summarization before distributing to parallel branches
-        # This prevents rate limits and reduces token waste
+        # Context distribution: by default every branch sees the exact upstream
+        # output (context="full", no data loss). Token-saving excerpting is opt-in
+        # via context="truncate"/"summarize" because silently handing downstream
+        # steps a smaller payload than the upstream produced is a correctness hazard.
         optimized_previous = previous_output
         num_branches = len(parallel_step.steps)
-        if previous_output and len(previous_output) > 3000:
+        context_mode = getattr(parallel_step, "context", "full")
+        if context_mode != "full" and previous_output and len(previous_output) > 3000:
             from ..context.tokens import estimate_tokens_heuristic
             tokens = estimate_tokens_heuristic(previous_output)
             if tokens > 1000:
-                # LLM summarisation only pays off for larger fan-outs; for small
-                # branch counts the extra call costs roughly what it saves, so use
-                # the cheaper truncation fallback instead.
-                if num_branches >= MIN_BRANCHES_FOR_LLM_SUMMARY:
-                    # Try LLM-based summarization first, fall back to truncation
+                if context_mode == "summarize" and num_branches >= MIN_BRANCHES_FOR_LLM_SUMMARY:
+                    # LLM summarisation only pays off for larger fan-outs; for small
+                    # branch counts the extra call costs roughly what it saves, so use
+                    # the cheaper truncation fallback instead.
                     try:
                         optimized_previous = self._llm_summarize_for_parallel(previous_output, num_branches, model, verbose)
                     except Exception:
                         # Fallback to truncation-based summarization
                         optimized_previous = self._truncate_context_for_branches(previous_output, num_branches)
-                elif tokens >= 1500:
-                    # Only truncate above the same threshold the LLM summariser uses;
-                    # below it, previous behaviour passed context through unchanged.
+                else:
                     optimized_previous = self._truncate_context_for_branches(previous_output, num_branches)
-                
-                if verbose and optimized_previous != previous_output:
+
+                if optimized_previous != previous_output:
                     new_tokens = estimate_tokens_heuristic(optimized_previous)
                     saved = tokens - new_tokens
-                    print(f"  📦 Optimized context for {num_branches} parallel branches: {tokens:,} → {new_tokens:,} tokens (saved {saved:,} per branch)")
+                    logger.warning(
+                        f"Parallel context='{context_mode}' reduced upstream output for "
+                        f"{num_branches} branches: {len(previous_output):,} → {len(optimized_previous):,} chars "
+                        f"({tokens:,} → {new_tokens:,} tokens). Middle content is dropped."
+                    )
+                    if verbose:
+                        print(f"  📦 Optimized context for {num_branches} parallel branches: {tokens:,} → {new_tokens:,} tokens (saved {saved:,} per branch)")
         
         # Use ThreadPoolExecutor for parallel execution
         from ..trace.context_events import copy_context_to_callable, get_context_emitter
         
+        branch_deltas = []  # [(branch_idx, {var: value}), ...] in declaration order
+
         # Determine effective workers based on user configuration
         user_max = getattr(parallel_step, 'max_workers', None)
         effective_workers = self._effective_workers(user_max, len(parallel_step.steps), label="Parallel")
-        with concurrent.futures.ThreadPoolExecutor(max_workers=effective_workers) as executor:
-            futures = []
+
+        # Index-keyed collectors so branches can be consumed in *completion*
+        # order (fail_fast must raise as soon as any branch fails, not after
+        # every earlier-declared branch finishes) while the final merge below
+        # still rebuilds results/outputs/branch_deltas in declaration order -
+        # so parallel_outputs[idx] alignment and fail_all ordering are unchanged.
+        succeeded = {}   # idx -> {"result": {...}, "delta": {...}, "stop": bool}
+        failed = {}      # idx -> {"error": e, "delta": {...} | None, "stop": bool}
+        parallel_stopped = False
+
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=effective_workers)
+        try:
+            future_to_idx = {}
             for idx, step in enumerate(parallel_step.steps):
                 # Wrap execution to propagate context and set branch_id for parallel tracking
-                def execute_with_branch(step=step, idx=idx, opt_prev=optimized_previous):
+                # Each branch writes into its OWN deep copy: concurrent writes to
+                # one shared dict would be a data race. The copy is a
+                # _WriteTrackingDict so the merge back (see _merge_branch_variables)
+                # knows exactly which keys the branch assigned - the branch's
+                # output_variable writes are not thrown away, and untouched keys are
+                # not merged as per-branch clones. Keys present at construction seed
+                # the scope and are not counted as writes.
+                branch_vars = _WriteTrackingDict(_isolate_scope(all_variables))
+
+                def execute_with_branch(step=step, idx=idx, opt_prev=optimized_previous, branch_vars=branch_vars):
                     emitter = get_context_emitter()
                     emitter.set_branch(f"parallel_{idx}")
                     try:
                         return self._execute_single_step_internal(
-                            step, opt_prev, input, copy.deepcopy(all_variables), model, False, idx, stream, depth=depth+1
+                            step, opt_prev, input, branch_vars, model, False, idx, stream, depth=depth+1
                         )
                     finally:
                         emitter.clear_branch()
-                
+
                 future = executor.submit(copy_context_to_callable(execute_with_branch))
-                futures.append((idx, future))
-            
-            errors = []
-            parallel_stopped = False
-            for idx, future in futures:
-                try:
-                    step_result = future.result()
-                except Exception as e:
-                    # A branch that raised before _apply_step_policies could catch
-                    # it (e.g. a pattern-level error). Treat like a branch failure.
-                    branch_error = e
-                    step_result = None
-                else:
-                    # A nested step that failed now surfaces its error via the
-                    # result dict instead of raising (so on_error can be honored),
-                    # so the future resolves successfully. Detect that here so the
-                    # Parallel on_failure modes still fire instead of silently
-                    # treating the exception text as a real branch output.
-                    branch_error = step_result.get("error")
-                    # A branch step with on_error="stop" (Task default) requests a
-                    # workflow-wide halt. Capture it so the enclosing workflow stops
-                    # after this parallel block, matching Loop/Route/Repeat/If.
-                    if step_result.get("stop"):
-                        parallel_stopped = True
+                future_to_idx[future] = idx
 
-                if branch_error is None:
-                    results.append({"step": step_result["step"], "output": step_result["output"]})
-                    outputs.append(step_result["output"])
-                    continue
-
-                logger.error(f"Parallel branch {idx} failed: {branch_error}")
-                errors.append({"step": idx, "error": branch_error})
-                # The whole run has a failed branch regardless of on_failure mode.
-                self.status = "failed"
-                if parallel_step.on_failure == "fail_fast":
-                    # Cancel remaining futures
-                    for _, f in futures:
+            pending = set(future_to_idx)
+            fail_fast_error = None  # (idx, branch_error) of the first fail_fast failure
+            while pending:
+                remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+                done, pending = concurrent.futures.wait(
+                    pending, timeout=remaining,
+                    return_when=concurrent.futures.FIRST_COMPLETED,
+                )
+                if not done:
+                    # Timed out with branches still running. Cancel what we can and
+                    # stop blocking the caller on threads that cannot be interrupted.
+                    for f in pending:
                         f.cancel()
-                    # Only chain a real exception; nested steps surface the error
-                    # as a string, so guard against `raise ... from <str>` which
-                    # would itself raise TypeError and mask the failure.
-                    cause = branch_error if isinstance(branch_error, BaseException) else None
+                    self.status = "failed"
                     raise WorkflowStepError(
-                        f"Parallel branch {idx} failed", cause=cause, errors=errors
-                    ) from cause
-                elif parallel_step.on_failure == "partial_ok":
-                    # Record the failure but continue with other branches. Do not
-                    # fold the exception text into outputs as if it were data.
-                    results.append({"step": f"parallel_{idx}", "output": None, "error": str(branch_error)})
-                    # Keep `outputs` index-aligned with parallel_step.steps so a
-                    # downstream reader of parallel_outputs[idx] cannot silently
-                    # receive a later branch's result once an earlier one fails.
-                    outputs.append(None)
-                    # A failed branch whose step requested on_error="stop" halts the
-                    # enclosing workflow even under partial_ok.
-                    if step_result is not None and step_result.get("stop"):
-                        parallel_stopped = True
-            
-            # Check if we should fail after all branches completed
-            if errors and parallel_step.on_failure == "fail_all":
-                first_error = errors[0]["error"]
-                cause = first_error if isinstance(first_error, BaseException) else None
+                        f"{len(pending)} parallel branch(es) timed out after {timeout}s",
+                        errors=[{"step": future_to_idx[f], "error": "timeout"} for f in pending],
+                    )
+
+                for future in done:
+                    idx = future_to_idx[future]
+                    try:
+                        step_result = future.result()
+                    except Exception as e:
+                        # A branch that raised before _apply_step_policies could catch
+                        # it (e.g. a pattern-level error). Treat like a branch failure.
+                        branch_error = e
+                        step_result = None
+                    else:
+                        # A nested step that failed now surfaces its error via the
+                        # result dict instead of raising (so on_error can be honored),
+                        # so the future resolves successfully. Detect that here so the
+                        # Parallel on_failure modes still fire instead of silently
+                        # treating the exception text as a real branch output.
+                        branch_error = step_result.get("error")
+
+                    branch_stop = bool(step_result and step_result.get("stop"))
+
+                    if branch_error is None:
+                        if step_result.get("skipped"):
+                            # A gated-out branch produced no output. Record it as
+                            # skipped and keep its index aligned, but merge no
+                            # variables and feed nothing into the combined output
+                            # (the executor returns the prior context as "output",
+                            # which must not be duplicated into sibling results).
+                            succeeded[idx] = {
+                                "result": {"step": step_result["step"], "output": None, "status": "skipped"},
+                                "output": None,
+                                "delta": None,
+                                "stop": branch_stop,
+                            }
+                            continue
+                        succeeded[idx] = {
+                            "result": {"step": step_result["step"], "output": step_result["output"]},
+                            "output": step_result["output"],
+                            "delta": self._branch_variable_delta(step_result.get("variables")),
+                            "stop": branch_stop,
+                        }
+                        continue
+
+                    logger.error(f"Parallel branch {idx} failed: {branch_error}")
+                    # The whole run has a failed branch regardless of on_failure mode.
+                    self.status = "failed"
+                    failed[idx] = {
+                        "error": branch_error,
+                        # partial_ok keeps the variables the branch's *completed*
+                        # steps wrote; fail_fast/fail_all raise, so nothing from a
+                        # failed branch is merged under those modes.
+                        "delta": self._branch_variable_delta(step_result.get("variables")) if step_result is not None else None,
+                        "stop": branch_stop,
+                    }
+                    if parallel_step.on_failure == "fail_fast":
+                        # Record the first failure, stop waiting, cancel the rest,
+                        # and raise immediately without blocking on running threads.
+                        fail_fast_error = (idx, branch_error)
+                        for f in pending:
+                            f.cancel()
+                        pending = set()
+                        break
+
+            if fail_fast_error is not None:
+                idx, branch_error = fail_fast_error
+                # Only chain a real exception; nested steps surface the error
+                # as a string, so guard against `raise ... from <str>` which
+                # would itself raise TypeError and mask the failure.
+                cause = branch_error if isinstance(branch_error, BaseException) else None
                 raise WorkflowStepError(
-                    f"{len(errors)} parallel branches failed", errors=errors, cause=cause
+                    f"Parallel branch {idx} failed", cause=cause,
+                    errors=[{"step": idx, "error": branch_error}],
                 ) from cause
+        finally:
+            # Do not block the caller on branches that cannot be interrupted.
+            # shutdown(wait=True) (the `with` default) is what held the fail_fast
+            # raise until the slowest sibling finished.
+            executor.shutdown(wait=False)
+
+        # Rebuild results/outputs/branch_deltas in declaration order so
+        # parallel_outputs[idx] alignment and fail_all ordering are preserved
+        # regardless of the order branches completed in.
+        errors = []
+        for idx in range(len(parallel_step.steps)):
+            if idx in succeeded:
+                info = succeeded[idx]
+                results.append(info["result"])
+                outputs.append(info["output"])
+                # A skipped branch carries delta=None: it wrote nothing, so it
+                # must not contribute a merge entry (the failed path guards the
+                # same way).
+                if info["delta"] is not None:
+                    branch_deltas.append((idx, info["delta"]))
+                if info["stop"]:
+                    parallel_stopped = True
+            elif idx in failed:
+                info = failed[idx]
+                errors.append({"step": idx, "error": info["error"]})
+                # partial_ok: record the failure but keep going; fold neither the
+                # exception text into outputs nor skip the index alignment.
+                results.append({"step": f"parallel_{idx}", "output": None, "error": str(info["error"])})
+                if info["delta"] is not None:
+                    branch_deltas.append((idx, info["delta"]))
+                outputs.append(None)
+                if info["stop"]:
+                    parallel_stopped = True
+
+        # Check if we should fail after all branches completed
+        if errors and parallel_step.on_failure == "fail_all":
+            first_error = errors[0]["error"]
+            cause = first_error if isinstance(first_error, BaseException) else None
+            raise WorkflowStepError(
+                f"{len(errors)} parallel branches failed", errors=errors, cause=cause
+            ) from cause
         
+        # Merge each branch's variable writes back into the shared scope. Without
+        # this every `output_variable` set inside a Parallel block was written to a
+        # deep copy that was discarded when the branch returned (silent data loss).
+        self._merge_branch_variables(all_variables, branch_deltas)
+
         # Combine outputs
-        combined_output = "\n---\n".join(str(o) for o in outputs)
+        combined_output = "\n---\n".join(str(o) for o in outputs if o is not None)
         all_variables["parallel_outputs"] = outputs
         
         if verbose:
@@ -3060,19 +4017,27 @@ CONCISE SUMMARY:"""
                 step_info = f" ({len(steps_to_run)} steps each)" if is_multi_step else ""
                 print(f"⚡🔁 Parallel looping over {num_items} items{step_info} (max_workers={max_workers})...")
             
-            # Optimize: Aggressively summarize large previous_output before distributing to parallel branches
-            # This reduces token waste and prevents rate limit issues
+            # Context distribution: by default each iteration sees the exact upstream
+            # output (context="full", no data loss). Token-saving excerpting is opt-in
+            # via context="truncate".
             optimized_previous = previous_output
-            if previous_output and len(previous_output) > 3000:
+            context_mode = getattr(loop_step, "context", "full")
+            if context_mode != "full" and previous_output and len(previous_output) > 3000:
                 from ..context.tokens import estimate_tokens_heuristic
                 tokens = estimate_tokens_heuristic(previous_output)
                 # Target: max 800 tokens per branch to stay well under rate limits
                 if tokens > 1000:
                     optimized_previous = self._truncate_context_for_branches(previous_output, num_items)
-                    if verbose and optimized_previous != previous_output:
+                    if optimized_previous != previous_output:
                         new_tokens = estimate_tokens_heuristic(optimized_previous)
                         saved = tokens - new_tokens
-                        print(f"  📦 Optimized context for {num_items} parallel branches: {tokens:,} → {new_tokens:,} tokens (saved {saved:,} per branch)")
+                        logger.warning(
+                            f"Loop context='{context_mode}' reduced upstream output for "
+                            f"{num_items} branches: {len(previous_output):,} → {len(optimized_previous):,} chars "
+                            f"({tokens:,} → {new_tokens:,} tokens). Middle content is dropped."
+                        )
+                        if verbose:
+                            print(f"  📦 Optimized context for {num_items} parallel branches: {tokens:,} → {new_tokens:,} tokens (saved {saved:,} per branch)")
             
             # Use copy_context_to_callable to propagate contextvars (needed for trace emission)
             from ..trace.context_events import copy_context_to_callable, get_context_emitter
@@ -3086,16 +4051,19 @@ CONCISE SUMMARY:"""
                 emitter.set_branch(f"loop_{idx}")
                 
                 try:
-                    # CRITICAL: Deep copy variables to ensure thread isolation (per-branch context isolation)
-                    import copy
-                    loop_vars = copy.deepcopy(all_variables)
-                    loop_vars[loop_step.var_name] = item
-                    loop_vars["loop_index"] = idx
-                    
-                    # Also expand nested item properties for template access (e.g., {{item.title}})
-                    if isinstance(item, dict):
-                        for key, value in item.items():
-                            loop_vars[f"{loop_step.var_name}.{key}"] = value
+                    # CRITICAL: Deep copy variables to ensure thread isolation
+                    # (concurrent iterations writing one dict is a data race).
+                    # Isolation is only half of the design: whatever the iteration
+                    # writes must still be merged back, or every output_variable
+                    # set inside the loop body is silently discarded. The copy is a
+                    # _WriteTrackingDict so the merge (see below) knows exactly
+                    # which keys this iteration assigned. The loop's own control
+                    # variables are seeded at construction time and are therefore
+                    # deliberately not counted as writes.
+                    control = self._loop_control_variables(loop_step, item, idx)
+                    seed = _isolate_scope(all_variables)
+                    seed.update(control)
+                    loop_vars = _WriteTrackingDict(seed)
                     
                     # Execute all steps sequentially within this iteration
                     iteration_output = opt_prev
@@ -3107,9 +4075,13 @@ CONCISE SUMMARY:"""
                         )
                         iteration_output = step_result.get("output")
                         iteration_results.append(step_result)
-                        # Update variables if step set any
-                        if step_result.get("variables"):
-                            loop_vars.update(step_result["variables"])
+                        # Update variables if step set any. _execute_single_step_internal
+                        # writes into - and returns - the very dict it was handed, so
+                        # ``loop_vars.update(loop_vars)`` would record every key as
+                        # written and defeat the delta detection below.
+                        step_vars = step_result.get("variables")
+                        if step_vars and step_vars is not loop_vars:
+                            loop_vars.update(step_vars)
                         # A failed step with on_error="stop" signals a stop; halt
                         # this iteration instead of feeding later steps forward.
                         if step_result.get("stop"):
@@ -3122,7 +4094,11 @@ CONCISE SUMMARY:"""
                         "step": f"loop_{idx}",
                         "output": iteration_output,
                         "steps": iteration_results,
-                        "stop": iteration_stopped
+                        "stop": iteration_stopped,
+                        # Only what this iteration actually wrote, so untouched
+                        # variables keep the parent's own objects instead of being
+                        # replaced by this iteration's deep-copied clones.
+                        "variable_delta": self._loop_variable_delta(loop_vars, control),
                     }
                     return idx, final_result
                 finally:
@@ -3153,11 +4129,25 @@ CONCISE SUMMARY:"""
                 # Sort by index to maintain order
                 indexed_results.sort(key=lambda x: x[0])
                 
+                iteration_deltas = []  # [(iteration_idx, {var: value}), ...] in item order
                 for idx, step_result in indexed_results:
                     results.append({"step": f"{step_result['step']}_{idx}", "output": step_result["output"]})
                     outputs.append(step_result["output"])
+                    iteration_deltas.append((idx, step_result.get("variable_delta") or {}))
                     if step_result.get("stop"):
                         loop_stopped = True
+
+            # Merge each iteration's writes back into the shared scope. Without
+            # this every output_variable set inside the loop body was written to a
+            # deep copy discarded when the iteration returned (silent data loss).
+            # Deltas are applied in *item* order, never completion order, so the
+            # surviving value does not depend on thread scheduling - it is the
+            # last item's, exactly what the sequential loop above produces. A
+            # cross-iteration collision is inherent to looping, so unlike Parallel
+            # it is not warned about.
+            self._merge_branch_variables(
+                all_variables, iteration_deltas, warn_on_collision=False
+            )
             
             if verbose:
                 print(f"✅ Parallel loop complete: {len(outputs)} results")
@@ -3167,44 +4157,71 @@ CONCISE SUMMARY:"""
                 step_info = f" ({len(steps_to_run)} steps each)" if is_multi_step else ""
                 print(f"🔁 Looping over {num_items} items{step_info}...")
             
-            for idx, item in enumerate(items):
-                # Add current item to variables
-                import copy
-                loop_vars = copy.deepcopy(all_variables)
-                loop_vars[loop_step.var_name] = item
-                loop_vars["loop_index"] = idx
-                
-                # Also expand nested item properties for template access (e.g., {{item.title}})
-                if isinstance(item, dict):
-                    for key, value in item.items():
-                        loop_vars[f"{loop_step.var_name}.{key}"] = value
-                
-                # Execute all steps sequentially within this iteration
-                iteration_output = previous_output
-                iteration_stopped = False
-                for step_idx, step in enumerate(steps_to_run):
-                    step_result = self._execute_single_step_internal(
-                        step, iteration_output, input, loop_vars, model, verbose, step_idx, stream=stream, depth=depth+1
-                    )
-                    iteration_output = step_result.get("output")
-                    # Update variables if step set any
-                    if step_result.get("variables"):
-                        loop_vars.update(step_result["variables"])
-                    # A failed step with on_error="stop" signals a stop; halt this
-                    # iteration instead of feeding later steps the error forward.
-                    if step_result.get("stop"):
-                        iteration_stopped = True
-                        break
-                
-                results.append({"step": f"loop_{idx}", "output": iteration_output})
-                outputs.append(iteration_output)
-                previous_output = iteration_output
+            # A sequential loop is simply its body unrolled, so - like Repeat,
+            # If and Route - it runs against the shared scope. There is no
+            # concurrency to isolate from here, and the per-iteration
+            # ``copy.deepcopy(all_variables)`` that used to sit in this loop
+            # bought no safety while silently discarding every output_variable
+            # the body wrote and hiding iteration N-1's writes from iteration N.
+            # Only the loop's own control variables stay loop-scoped; they are
+            # saved here and restored in the finally below.
+            control_saved: Dict[str, Any] = {}
+            control_introduced = set()
+            preexisting_writes = set(getattr(all_variables, "written_keys", None) or ())
+            prev_control_keys: set = set()
+            try:
+                for idx, item in enumerate(items):
+                    # Add current item (and loop_index / item.<key>) to variables
+                    control = self._loop_control_variables(loop_step, item, idx)
+                    # Drop the previous item's flattened ``item.<key>`` accessors
+                    # that this item does not have. Because the loop runs against
+                    # the shared scope, ``update`` alone would leave a stale
+                    # ``item.k`` visible while iterating an item that only has
+                    # ``item.m`` - the body would read the previous item's value.
+                    # ``_restore_loop_scope`` already cleans these up after the
+                    # loop; this keeps each iteration's view correct too.
+                    for stale_key in prev_control_keys - control.keys():
+                        all_variables.pop(stale_key, None)
+                    prev_control_keys = set(control.keys())
+                    for key in control:
+                        if key not in control_introduced:
+                            control_introduced.add(key)
+                            if key in all_variables:
+                                control_saved[key] = all_variables[key]
+                    all_variables.update(control)
 
-                # Abort the remaining items too: a step that asked to stop the
-                # workflow (on_error="stop") must not silently keep looping.
-                if iteration_stopped:
-                    loop_stopped = True
-                    break
+                    # Execute all steps sequentially within this iteration
+                    iteration_output = previous_output
+                    iteration_stopped = False
+                    for step_idx, step in enumerate(steps_to_run):
+                        step_result = self._execute_single_step_internal(
+                            step, iteration_output, input, all_variables, model, verbose, step_idx, stream=stream, depth=depth+1
+                        )
+                        iteration_output = step_result.get("output")
+                        # Update variables if step set any. The step writes into the
+                        # dict it was handed, so guard against self-update.
+                        step_vars = step_result.get("variables")
+                        if step_vars and step_vars is not all_variables:
+                            all_variables.update(step_vars)
+                        # A failed step with on_error="stop" signals a stop; halt this
+                        # iteration instead of feeding later steps the error forward.
+                        if step_result.get("stop"):
+                            iteration_stopped = True
+                            break
+
+                    results.append({"step": f"loop_{idx}", "output": iteration_output})
+                    outputs.append(iteration_output)
+                    previous_output = iteration_output
+
+                    # Abort the remaining items too: a step that asked to stop the
+                    # workflow (on_error="stop") must not silently keep looping.
+                    if iteration_stopped:
+                        loop_stopped = True
+                        break
+            finally:
+                self._restore_loop_scope(
+                    all_variables, control_saved, control_introduced, preexisting_writes
+                )
         # Store outputs in user-specified variable or default to loop_outputs
         output_var_name = loop_step.output_variable or "loop_outputs"
         all_variables[output_var_name] = outputs
@@ -3324,6 +4341,89 @@ CONCISE SUMMARY:"""
         # 4. Fallback: wrap as single item
         return [text]
     
+    def _execute_discussion(
+        self, discussion, previous_output, input, all_variables, model, verbose, stream=True, depth=0
+    ):
+        """Run a round-robin discussion and return the same shape as the other patterns."""
+        results = []
+        output = previous_output
+        transcript = []
+        stopped = False
+        discussion_stopped = False
+
+        if verbose:
+            names = [getattr(a, "name", getattr(a, "__name__", str(a))) for a in discussion.agents]
+            print(f"💬 Discussion: {' → '.join(names)} for {discussion.rounds} round(s)")
+
+        turn = 0
+        for round_index in range(discussion.rounds):
+            for position in range(len(discussion.agents)):
+                context = WorkflowContext(
+                    input=input,
+                    previous_result=str(output) if output else None,
+                    current_step=f"{discussion.name}_r{round_index}",
+                    variables=all_variables.copy(),
+                )
+                # A custom selector may repeat or skip a speaker; round-robin is
+                # only the default, not an assumption baked into the loop.
+                speaker = (
+                    discussion.select(turn, context) if discussion.select
+                    else discussion.agents[position]
+                )
+                step_result = self._execute_single_step_internal(
+                    speaker, output, input, all_variables, model, verbose,
+                    turn, stream=stream, depth=depth + 1,
+                )
+                output = step_result["output"]
+                speaker_name = getattr(speaker, "name", getattr(speaker, "__name__", step_result["step"]))
+                # The transcript is what makes this a conversation rather than N
+                # independent answers: each speaker is handed what came before.
+                transcript.append(f"{speaker_name}: {output}")
+                all_variables.update(step_result.get("variables", {}))
+                all_variables["discussion_transcript"] = "\n".join(transcript)
+                results.append({
+                    "step": f"{discussion.name}_r{round_index}_{speaker_name}",
+                    "output": output,
+                })
+                turn += 1
+
+                # A speaker with on_error="stop" (the Task default) halts the
+                # whole workflow, not just the discussion: honor its stop signal
+                # rather than burning the rest of the round budget.
+                if step_result.get("stop"):
+                    stopped = True
+                    discussion_stopped = True
+                    break
+
+                if discussion.until:
+                    check = WorkflowContext(
+                        input=input,
+                        previous_result=str(output) if output else None,
+                        current_step=discussion.name,
+                        variables=all_variables.copy(),
+                    )
+                    try:
+                        if discussion.until(check):
+                            stopped = True
+                            break
+                    except Exception as exc:
+                        # A broken until() must not silently mean "never stop":
+                        # that turns a bounded discussion into rounds of spend.
+                        raise ValueError(
+                            f"Discussion until() raised {type(exc).__name__}: {exc}. "
+                            f"It is checked after every turn, so a failing "
+                            f"condition would run the full round budget."
+                        ) from exc
+            if stopped:
+                break
+
+        return {
+            "steps": results,
+            "output": output,
+            "variables": {"discussion_transcript": "\n".join(transcript)},
+            "stop": discussion_stopped,
+        }
+
     def _execute_repeat(
         self,
         repeat_step: Repeat,
@@ -3343,13 +4443,41 @@ CONCISE SUMMARY:"""
         if verbose:
             print(f"🔄 Repeating up to {repeat_step.max_iterations} times...")
         
+        # ``Repeat.step`` is typed ``Any`` and was handed straight to the
+        # single-step executor, so ``repeat([a, b])`` was ACCEPTED and then
+        # stringified into a prompt -- the list became text and the default
+        # agent answered it. Since there is no N-agent discussion loop, that is
+        # exactly the workaround people reach for, which made the silent
+        # misbehaviour worse than a rejection. A list now runs its members in
+        # order, once per iteration.
+        steps = repeat_step.step if isinstance(repeat_step.step, (list, tuple)) else [repeat_step.step]
+
         for iteration in range(repeat_step.max_iterations):
-            step_result = self._execute_single_step_internal(
-                repeat_step.step, output, input, all_variables, model, verbose, iteration, stream=stream, depth=depth+1
-            )
-            results.append({"step": f"{step_result['step']}_{iteration}", "output": step_result["output"]})
-            output = step_result["output"]
-            all_variables.update(step_result.get("variables", {}))
+            last_name = None
+            for position, inner_step in enumerate(steps):
+                step_result = self._execute_single_step_internal(
+                    inner_step, output, input, all_variables, model, verbose, iteration, stream=stream, depth=depth+1
+                )
+                last_name = step_result['step']
+                # Each member sees the previous member's output, so a two-step
+                # repeat composes the way a two-step flow does.
+                output = step_result["output"]
+                all_variables.update(step_result.get("variables", {}))
+                if len(steps) > 1:
+                    results.append({
+                        "step": f"{last_name}_{iteration}_{position}",
+                        "output": step_result["output"],
+                    })
+                # A member that requests a stop must halt the remaining members
+                # immediately; otherwise a later member's success would silently
+                # discard the stop request and let the flow continue.
+                if step_result.get("stop"):
+                    repeat_stopped = True
+                    break
+            if len(steps) == 1 and last_name is not None:
+                results.append({"step": f"{last_name}_{iteration}", "output": output})
+            if repeat_stopped:
+                break
             
             # Check until condition
             if repeat_step.until:
@@ -3366,12 +4494,8 @@ CONCISE SUMMARY:"""
                         break
                 except Exception as e:
                     logger.error(f"Repeat until condition failed: {e}")
-            
-            if step_result.get("stop"):
-                repeat_stopped = True
-                break
         
-        all_variables["repeat_iterations"] = iteration + 1
+        all_variables["repeat_iterations"] = iteration + 1 if repeat_step.max_iterations > 0 else 0
         return {"steps": results, "output": output, "variables": all_variables, "stop": repeat_stopped}
     
     def _execute_if(
@@ -3555,6 +4679,7 @@ CONCISE SUMMARY:"""
             
             # Load tools from the recipe's tools.py if present (opt-in only)
             tool_registry = {}
+            tools_snapshot = None
             tools_py = recipe_path / "tools.py"
             if tools_py.exists():
                 try:
@@ -3569,7 +4694,10 @@ CONCISE SUMMARY:"""
                         import importlib.util
                         spec = importlib.util.spec_from_file_location("recipe_tools", tools_py)
                         recipe_module = importlib.util.module_from_spec(spec)
-                        spec.loader.exec_module(recipe_module)
+                        # Execute and cache the same source snapshot, bypassing stale pyc files.
+                        tools_content = tools_py.read_bytes()
+                        exec(compile(tools_content, str(tools_py), "exec"), recipe_module.__dict__)
+                        tools_snapshot = (str(tools_py.resolve()), tools_content)
                     else:
                         logger.warning(
                             "Skipping included recipe tools.py: set PRAISONAI_ALLOW_LOCAL_TOOLS "
@@ -3605,7 +4733,18 @@ CONCISE SUMMARY:"""
             # Parse and execute the included workflow
             from .yaml_parser import YAMLWorkflowParser
             parser = YAMLWorkflowParser(tool_registry=tool_registry)
-            included_workflow = parser.parse_file(str(recipe_yaml))
+            # Match parse_file's decoding policy, but read only once: the cache
+            # namespace must describe the same snapshot that the parser saw.
+            with open(recipe_yaml, 'r') as recipe_file:
+                recipe_content = recipe_file.read()
+            included_workflow = parser.parse_string(recipe_content)
+            parent_cache = getattr(self, "_step_cache", None)
+            if parent_cache is not None:
+                from .step_cache import _ScopedStepCache
+                included_workflow._step_cache = _ScopedStepCache(
+                    parent_cache,
+                    f"{recipe_yaml.resolve()}:{recipe_content}:{tools_snapshot!r}"
+                )
             
             # Merge parent variables into included workflow
             included_workflow.variables.update(all_variables)
@@ -4514,7 +5653,21 @@ class WorkflowManager:
                         "continuing at the same step index because --rebase-checkpoint was set."
                     )
                 results = checkpoint_data.get("results", [])
-                all_variables = checkpoint_data.get("variables", all_variables)
+                # Layer, do not replace. The checkpoint's variables used to
+                # overwrite the caller's outright, so a value supplied ON the
+                # resume was accepted and silently thrown away:
+                #
+                #   praisonai workflow run wf --resume --var reviewer_decision=approved
+                #
+                # which is precisely how a human hands their answer back to a
+                # run that paused for review. Precedence is workflow defaults,
+                # then the checkpoint, then whatever the caller supplied now --
+                # the freshest statement of intent wins.
+                all_variables = {
+                    **all_variables,
+                    **(checkpoint_data.get("variables") or {}),
+                    **(variables or {}),
+                }
                 start_step = checkpoint_data.get("completed_steps", 0)
                 resumed_from_step = start_step
                 self._log(f"Resuming workflow from step {start_step + 1}")
@@ -4825,6 +5978,59 @@ class WorkflowManager:
         }
 
     def _execute_single_step(
+        self,
+        step: Task,
+        step_idx: int,
+        results: List[Dict[str, Any]],
+        all_variables: Dict[str, Any],
+        executor: Optional[Callable[[str], str]] = None,
+        default_agent: Optional[Any] = None,
+        default_llm: Optional[str] = None,
+        memory: Optional[Any] = None,
+        planning: bool = False,
+        verbose: int = 0,
+        on_step: Optional[Callable[[Task, int], None]] = None,
+        on_result: Optional[Callable[[Task, str], None]] = None,
+        original_input: str = ""
+    ) -> Dict[str, Any]:
+        """Cache wrapper for the top-level run() path.
+
+        There are two step executors -- this one and
+        _execute_single_step_internal, used inside patterns. Both are wrapped,
+        because caching only one would make the feature work or not depending on
+        whether the step happened to sit inside a Parallel or an If.
+        """
+        cache = getattr(self, "_step_cache", None)
+        if cache is None:
+            return self._execute_single_step_nocache(
+                step, step_idx, results, all_variables, executor, default_agent,
+                default_llm, memory, planning, verbose, on_step, on_result, original_input,
+            )
+        from .step_cache import make_step_key
+        key = make_step_key(step, None, original_input, all_variables)
+        try:
+            hit = copy.deepcopy(cache.get(key))
+        except Exception:
+            hit = None
+            logger.warning("Could not restore cached workflow step")
+        if hit is not None:
+            if verbose:
+                print(f"↩︎  cache hit: {getattr(step, 'name', getattr(step, '__name__', step))}")
+            return dict(hit)
+        result = self._execute_single_step_nocache(
+            step, step_idx, results, all_variables, executor, default_agent,
+            default_llm, memory, planning, verbose, on_step, on_result, original_input,
+        )
+        # Only cache a successful result -- a failed step must be free to retry
+        # on the next run rather than replay a cached failure forever.
+        if isinstance(result, dict) and not result.get("error"):
+            try:
+                cache.set(key, copy.deepcopy(result))
+            except Exception:
+                logger.warning("Could not cache workflow step")
+        return result
+
+    def _execute_single_step_nocache(
         self,
         step: Task,
         step_idx: int,
@@ -5371,9 +6577,13 @@ class WorkflowManager:
             "saved_at_iso": datetime.now().isoformat()
         }
         
-        with open(checkpoint_file, 'w') as f:
-            json.dump(checkpoint_data, f, indent=2, default=str)
-        
+        # Atomic write: serialise to a temp file and os.replace into place so a
+        # crash/OOM/kill mid-write cannot destroy the previous good checkpoint
+        # (which would force the workflow to restart from step 0 and re-run and
+        # re-bill completed steps).
+        from ..utils.atomic_io import atomic_write_json
+        atomic_write_json(str(checkpoint_file), checkpoint_data, indent=2, default=str)
+
         self._log(f"Saved checkpoint '{name}' at step {completed_steps}")
         return str(checkpoint_file)
     

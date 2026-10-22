@@ -9,6 +9,7 @@ Provides both legacy API (classify_error) and new structured classification
 """
 
 import re
+import math
 import random
 from dataclasses import dataclass
 from enum import Enum
@@ -21,6 +22,7 @@ __all__ = [
     "classify_llm_error",
     "should_retry", 
     "is_replay_unsafe",
+    "is_replay_unsafe_chain",
     "get_retry_delay",
     "extract_retry_after",
     "get_error_context",
@@ -478,6 +480,11 @@ _REPLAY_UNSAFE_EXCEPTION_NAMES = frozenset({
 
 # Signals that a transient failure happened BEFORE the request was dispatched,
 # so the provider provably did not process it — safe to replay automatically.
+# ``sslerror`` is deliberately NOT listed here: the stdlib ``ssl.SSLError`` is
+# also raised for mid-response failures (e.g. "SSL connection reset by peer"),
+# so a bare SSLError class is not proof of a pre-dispatch failure. It is treated
+# as safe only when the message carries an explicit pre-dispatch TLS signal
+# (handshake / certificate verification) and no post-dispatch signal — see below.
 _REPLAY_SAFE_EXCEPTION_NAMES = frozenset({
     "connecttimeout",           # TCP connect never completed
     "connecttimeouterror",      # urllib3 connect timeout
@@ -485,14 +492,14 @@ _REPLAY_SAFE_EXCEPTION_NAMES = frozenset({
     "connecterror",             # httpx connect error (pre-dispatch)
     "newconnectionerror",       # urllib3: connection never established
     "gaierror",                 # DNS resolution failure
-    "sslerror",                 # TLS handshake failure (pre-dispatch)
-    "sslcertverificationerror",
+    "sslcertverificationerror", # certificate verification fails before dispatch
 })
 
 _REPLAY_UNSAFE_MESSAGE_PATTERNS = (
     r"read.?timed?.?out",
     r"read.?timeout",
     r"connection.?reset",
+    r"reset.?by.?peer",
     r"peer.?closed",
     r"incomplete.?read",
     r"chunked",
@@ -500,6 +507,25 @@ _REPLAY_UNSAFE_MESSAGE_PATTERNS = (
     r"server.?disconnected",
 )
 
+# Phase-specific pre-dispatch signals. The TLS handshake and certificate
+# verification both complete *before* any request byte is written, so a failure
+# naming either phase is pre-dispatch even when it also mentions a reset or
+# disconnect (e.g. "connection reset by peer during TLS handshake"). These win
+# over the generic post-dispatch patterns below, which otherwise match the bare
+# "reset"/"disconnect" token. Kept deliberately narrow — only phases that are
+# provably pre-request — so a true mid-response reset stays replay-unsafe.
+_REPLAY_SAFE_PHASE_PATTERNS = (
+    r"handshake",
+    r"certificate.?verif",
+    r"certificate.?verify.?failed",
+    r"cert.?verif",
+)
+
+# Explicit pre-dispatch signals. These establish that the request never reached
+# the provider (connect never completed, TLS handshake/certificate failed) and
+# therefore win even over a generic transport label. A bare "tls"/"ssl" token is
+# intentionally excluded: a transport label alone does not prove pre-dispatch
+# failure, and matching it would mask a post-dispatch read/reset signal.
 _REPLAY_SAFE_MESSAGE_PATTERNS = (
     r"connect.?timed?.?out",
     r"connection.?timed?.?out",
@@ -507,26 +533,56 @@ _REPLAY_SAFE_MESSAGE_PATTERNS = (
     r"name.?resolution",
     r"failed.?to.?resolve",
     r"getaddrinfo",
-    r"ssl",
-    r"handshake",
-    r"tls",
-)
+) + _REPLAY_SAFE_PHASE_PATTERNS
 
 
 def is_replay_unsafe(error: Exception) -> bool:
     """Return True if replaying the request could double-execute the turn.
 
     Distinguishes *pre-dispatch* failures (the request provably never reached
-    the provider — DNS/connect/TLS failures) which are safe to replay, from
-    *post-dispatch* failures (read timeout, connection reset mid-response) where
-    the provider may already have produced output and any side-effecting tool
-    calls may already have run. Post-dispatch failures are replay-unsafe.
+    the provider — DNS/connect failures, TLS handshake and certificate
+    verification failures) which are safe to replay, from *post-dispatch*
+    failures (read timeout, connection reset mid-response) where the provider
+    may already have produced output and any side-effecting tool calls may
+    already have run. Post-dispatch failures are replay-unsafe.
+
+    A generic TLS/SSL transport label does NOT establish a pre-dispatch failure:
+    ``ssl.SSLError`` is raised both for handshake failures (pre-dispatch) and for
+    mid-response read/reset failures (post-dispatch). So an explicit post-dispatch
+    signal (read timeout, connection reset) always wins over the transport label,
+    while explicit connect-timeout, TLS handshake and certificate-verification
+    signals remain safe.
+
+    A *phase-specific* pre-dispatch signal (TLS handshake, certificate
+    verification) is the one exception that wins over a post-dispatch token: both
+    phases complete before any request byte is written, so a reset or disconnect
+    *during the handshake* (e.g. "connection reset by peer during TLS handshake")
+    is pre-dispatch and safe to replay, not a mid-response failure.
 
     Defaults to ``False`` (safe/retryable) for ambiguous transient errors so
     existing auto-retry behaviour is preserved unless a post-dispatch signal is
     present. Callers should only block the retry when the turn is side-effecting.
     """
-    # 1. Exception type (walk the MRO to catch provider subclasses) — most stable.
+    error_text = f"{type(error).__name__} {error}".lower()
+
+    # 1. A phase-specific pre-dispatch signal (TLS handshake / certificate
+    #    verification) wins first: these phases finish before any request byte is
+    #    sent, so a reset/disconnect naming the handshake is pre-dispatch and
+    #    safe to replay — it must not be masked by the post-dispatch patterns.
+    for pattern in _REPLAY_SAFE_PHASE_PATTERNS:
+        if re.search(pattern, error_text):
+            return False
+
+    # 2. An explicit post-dispatch signal in the message wins next — even when
+    #    the error is an SSLError or carries a generic TLS/SSL label. A read
+    #    timeout or connection reset means bytes were already on the wire.
+    for pattern in _REPLAY_UNSAFE_MESSAGE_PATTERNS:
+        if re.search(pattern, error_text):
+            return True
+
+    # 3. Exception type (walk the MRO to catch provider subclasses) — stable, and
+    #    checked only after ruling out a post-dispatch message signal above so a
+    #    mid-response SSLError is not misclassified as a pre-dispatch handshake.
     for cls in type(error).__mro__:
         name = cls.__name__.lower()
         if name in _REPLAY_SAFE_EXCEPTION_NAMES:
@@ -534,15 +590,34 @@ def is_replay_unsafe(error: Exception) -> bool:
         if name in _REPLAY_UNSAFE_EXCEPTION_NAMES:
             return True
 
-    # 2. Message text — pre-dispatch signals win over the generic "timeout".
-    error_text = f"{type(error).__name__} {error}".lower()
+    # 4. Explicit pre-dispatch message signals (connect timeout, handshake,
+    #    certificate verification) establish the request never reached the
+    #    provider — safe to replay.
     for pattern in _REPLAY_SAFE_MESSAGE_PATTERNS:
         if re.search(pattern, error_text):
             return False
-    for pattern in _REPLAY_UNSAFE_MESSAGE_PATTERNS:
-        if re.search(pattern, error_text):
-            return True
 
+    return False
+
+
+def is_replay_unsafe_chain(error: BaseException) -> bool:
+    """Like :func:`is_replay_unsafe` but also inspects the exception cause chain.
+
+    A streaming attempt often re-raises a post-dispatch failure wrapped in a
+    generic exception (``raise Exception(...) from read_timeout``), so the
+    replay-unsafe signal lives on ``__cause__``/``__context__`` rather than the
+    outermost exception. Returning ``True`` when *any* link in the chain is
+    replay-unsafe keeps a wrapped read timeout from being silently replayed by a
+    higher-level fallback. A pre-dispatch (replay-safe) link does not override an
+    unsafe one found elsewhere in the chain; the chain is unsafe if any link is.
+    """
+    seen: set = set()
+    current: Optional[BaseException] = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if is_replay_unsafe(current):
+            return True
+        current = current.__cause__ or current.__context__
     return False
 
 
@@ -588,12 +663,48 @@ def get_retry_delay(category: ErrorCategory, attempt: int = 1, base_delay: float
     return 0
 
 
-def extract_retry_after(error: Exception) -> Optional[float]:
+def _retry_after_http_date_delay(value: str) -> Optional[float]:
+    """Return seconds until an HTTP-date ``Retry-After`` value, else ``None``.
+
+    RFC 7231 allows ``Retry-After`` to be either delta-seconds or an absolute
+    HTTP-date. Delta-seconds is handled by the caller; this parses the date
+    form using the stdlib (no new dependency) and returns the non-negative
+    delay from now. A value in the past or unparseable yields ``None`` so the
+    caller falls through to its other signals.
+    """
+    try:
+        from email.utils import parsedate_to_datetime
+    except Exception:  # pragma: no cover - stdlib always present
+        return None
+    try:
+        when = parsedate_to_datetime(value.strip())
+    except (TypeError, ValueError):
+        return None
+    if when is None:
+        return None
+    import time as _time
+    from datetime import timezone
+
+    # An HTTP-date is UTC; a naive parse result is treated as UTC per the RFC.
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    delay = when.timestamp() - _time.time()
+    return delay if delay > 0 else None
+
+
+def extract_retry_after(
+    error: Exception, cap_seconds: float = 300.0,
+) -> Optional[float]:
     """Extract Retry-After header value from rate limit errors.
-    
+
     Args:
         error: Exception potentially containing Retry-After info
-        
+        cap_seconds: Upper bound applied to the parsed value. Defaults to 300s
+            (5 minutes) for in-tick backoff callers. A scheduler *hold* passes a
+            larger cap so a job can be parked past a long provider reset window
+            (e.g. an hourly quota) instead of re-firing every tick — capping at
+            5 minutes there would defeat the park.
+
     Returns:
         Delay in seconds if found, None otherwise
     """
@@ -608,31 +719,60 @@ def extract_retry_after(error: Exception) -> Optional[float]:
             retry_after = None
         if retry_after is not None:
             try:
-                return min(float(retry_after), 300.0)  # Cap at 5 minutes
+                delay = float(retry_after)
+                if math.isfinite(delay) and delay >= 0:
+                    return min(delay, cap_seconds)
             except (ValueError, TypeError):
-                pass  # Not a plain number (could be an HTTP-date); fall through
+                # Not a plain delta-seconds value — RFC 7231 also permits an
+                # HTTP-date. Parse it so a provider that sends an absolute reset
+                # instant still yields a usable delay (else a long quota window
+                # would leave the job un-parked). A past/unparseable date yields
+                # no delay and falls through to the other signals.
+                delay = _retry_after_http_date_delay(str(retry_after))
+                if delay is not None:
+                    return min(delay, cap_seconds)
 
     # 2. Some SDKs expose a numeric ``retry_after`` attribute directly.
     retry_after_attr = getattr(error, "retry_after", None)
     if isinstance(retry_after_attr, (int, float)):
-        return min(float(retry_after_attr), 300.0)
+        try:
+            delay = float(retry_after_attr)
+        except OverflowError:
+            delay = float("inf")
+        if math.isfinite(delay) and delay >= 0:
+            return min(delay, cap_seconds)
 
     error_str = str(error)
     
     # 3. Fall back to parsing common Retry-After patterns from the message.
+    #    Capture the full signed token so a negative hint (e.g. "-3600 seconds")
+    #    is rejected by the finite/non-negative check below instead of being
+    #    silently read as a positive delay. Match a whole numeric token so
+    #    leading-dot fractions, exponents and malformed suffixes cannot be
+    #    mistaken for an unrelated positive integer.
+    # A period may terminate a sentence, but may not split an embedded token.
+    number = (
+        r"(?<![\w.+-])([+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?)"
+        r"(?![\deE+-]|\.(?!\s|$|[\"')\]}])|\.\s*(?:seconds?|s)\b)"
+    )
     patterns = [
-        r"retry.?after[:\s]+(\d+)",
-        r"retry[:\s]+(\d+)",
-        r"wait[:\s]+(\d+)",
-        r"(\d+).*second",
+        # Quoted duration values must close immediately after the unit.
+        r'"?retryDelay"?\s*:\s*"' + number + r's"',
+        r'"?retryDelay"?\s*:\s*' + number + r's(?=$|[\s,;}\]])',
+        r"try again in\s+" + number,
+        r"retry.?after[:\s]+" + number,
+        r"retry[:\s]+" + number,
+        r"wait[:\s]+" + number,
+        number + r"\s*second",
     ]
     
     for pattern in patterns:
-        match = re.search(pattern, error_str, re.IGNORECASE)
-        if match:
+        # Invalid earlier hints must not hide a later valid hint of this form.
+        for match in re.finditer(pattern, error_str, re.IGNORECASE):
             try:
                 delay = float(match.group(1))
-                return min(delay, 300.0)  # Cap at 5 minutes
+                if math.isfinite(delay) and delay >= 0:
+                    return min(delay, cap_seconds)
             except (ValueError, IndexError):
                 continue
     

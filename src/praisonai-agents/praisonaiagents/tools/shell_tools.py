@@ -13,6 +13,7 @@ import logging
 import os
 import time
 import platform
+import threading
 # psutil is imported lazily inside methods that need it
 # to avoid hard failure when the package is not installed
 from typing import Dict, List, Optional, Union
@@ -33,12 +34,70 @@ class _StreamDrainTimeout(Exception):
     process.
     """
 
+
+class _CommandCancelled(Exception):
+    """Raised when a cooperative cancellation signal fires while the child
+    process is still running, so the caller kills the process group and reports
+    an ``interrupted`` outcome instead of waiting for the timeout."""
+
+# Shell metacharacters this executor cannot honour. Detection is quote-aware:
+# `git commit -m "fix: a > b"` is a legitimate command whose ">" is inside a
+# quoted argument, and rejecting it would be its own false failure.
+#
+# A newline separates commands just as ";" does: `echo first\ntouch proof.txt`
+# is two commands, and passing it to shell=False runs only `echo` while `touch`
+# silently never runs -- exactly the false-success this guard exists to stop.
+_SHELL_METACHARS = (">>", "<<", "&&", "||", ">", "<", "|", ";", "&", "`", "$(", "\n", "\r")
+
+# A command substitution keeps its power inside DOUBLE quotes -- POSIX shells
+# still evaluate `$(...)` and backticks there -- so `echo "$(whoami)"` is not an
+# inert literal. Single quotes DO make them literal, so those stay honoured.
+_DQUOTE_SUBSTITUTIONS = ("$(", "`")
+
+
+def _find_shell_syntax(command: str):
+    """Return the first unquoted shell metacharacter in *command*, else None.
+
+    Command substitutions (``$(`` and backticks) are also reported when they
+    appear inside double quotes, because a POSIX shell evaluates them there;
+    single-quoted content stays literal and is left alone.
+    """
+    if not isinstance(command, str):
+        return None
+    quote = None
+    i = 0
+    while i < len(command):
+        ch = command[i]
+        if quote:
+            if quote == '"':
+                for token in _DQUOTE_SUBSTITUTIONS:
+                    if command.startswith(token, i):
+                        return token
+            if ch == quote:
+                quote = None
+            elif ch == "\\" and quote == '"':
+                i += 1
+        elif ch in ("'", '"'):
+            quote = ch
+        elif ch == "\\":
+            i += 1
+        else:
+            for token in _SHELL_METACHARS:
+                if command.startswith(token, i):
+                    return token
+        i += 1
+    return None
+
+
 class ShellTools:
     """Tools for executing shell commands safely."""
     
     def __init__(self):
         """Initialize ShellTools."""
         self._check_dependencies()
+        # Commands started with run_in_background=True, keyed by process_id
+        self._background: Dict[str, Dict] = {}
+        self._background_lock = threading.Lock()
     
     def _check_dependencies(self):
         """Check if required packages are installed (lazy — no hard failure)."""
@@ -53,7 +112,8 @@ class ShellTools:
         env: Optional[Dict[str, str]] = None,
         max_output_size: int = 10000,
         spill: bool = True,
-        spill_dir: Optional[str] = None
+        spill_dir: Optional[str] = None,
+        run_in_background: bool = False
     ) -> Dict[str, Union[str, int, bool]]:
         """Execute a shell command safely.
         
@@ -72,7 +132,12 @@ class ShellTools:
             spill_dir: Optional directory for overflow artifacts (defaults to a
                 session/workspace dir via ``PRAISONAI_TOOL_OUTPUT_DIR`` or the
                 system temp dir).
-            
+            run_in_background: When True, start the command and return
+                immediately with a ``process_id`` instead of waiting (use for
+                dev servers, watchers, long builds/test suites). ``timeout`` is
+                ignored. Inspect it with ``get_command_output`` and end it with
+                ``stop_command``.
+
         Returns:
             Dictionary with execution results
         """
@@ -83,6 +148,34 @@ class ShellTools:
             # Treat empty-string cwd same as None to avoid subprocess failure
             if not cwd:
                 cwd = None
+            # REFUSE shell syntax rather than silently mangling it.
+            #
+            # This executor runs shell=False, so a redirect, pipe, chain or
+            # substitution is NOT interpreted -- it is passed to the program as
+            # a literal argument. `echo written > redir.txt` therefore returned
+            # exit_code 0, success True, stdout "written > redir.txt", and
+            # created no file. The caller (often a model deciding what to do
+            # next) was told its redirect had SUCCEEDED, which is worse than an
+            # error: there is no signal to correct on.
+            #
+            # shell=True is not the fix -- running model-authored strings
+            # through a shell is the injection surface this executor exists to
+            # avoid. Failing loudly is.
+            _unsupported = _find_shell_syntax(command)
+            if _unsupported:
+                return {
+                    "error": (
+                        f"Shell syntax {_unsupported!r} is not supported by this executor, "
+                        "which runs commands directly (shell=False) so untrusted input cannot "
+                        "reach a shell. Run the steps separately, or use a tool that provides "
+                        "a real shell inside a sandbox."
+                    ),
+                    "stdout": "",
+                    "stderr": "",
+                    "exit_code": 1,
+                    "success": False,
+                }
+
             # Always split command for safety (no shell execution)
             # Use shlex.split with appropriate posix flag
             if platform.system() == 'Windows':
@@ -112,7 +205,10 @@ class ShellTools:
             process_env = os.environ.copy()
             if env:
                 process_env.update(env)
-            
+
+            if run_in_background:
+                return self._start_background(command, cwd, process_env)
+
             # Start process
             start_time = time.time()
             process = subprocess.Popen(
@@ -125,11 +221,17 @@ class ShellTools:
                 text=True
             )
             
+            # Observe the agent's cooperative cancellation signal (when running
+            # inside an agent tool call) so an interrupt (/stop, Ctrl-C) aborts
+            # this subprocess promptly instead of waiting for the timeout. When
+            # run standalone the event is None and behaviour is unchanged.
+            cancel_event = self._current_cancel_event()
+
             try:
                 # Read stdout/stderr incrementally so a progress channel (when
                 # active) can surface output live while the command runs. Falls
                 # back to fully-buffered behaviour when no sink is listening.
-                stdout, stderr = self._communicate_streaming(process, timeout)
+                stdout, stderr = self._communicate_streaming(process, timeout, cancel_event)
 
                 # Handle over-budget output. Rather than permanently discarding
                 # the middle (often where the real error lives), spill the full
@@ -154,6 +256,20 @@ class ShellTools:
                     result['stderr_artifact'] = stderr_path
                 return result
             
+            except _CommandCancelled:
+                # A cooperative interrupt (/stop, Ctrl-C) fired while the child
+                # was still running. Kill the whole process group so descendants
+                # do not keep mutating state, then report an interrupted outcome.
+                self._kill_process_tree(process)
+                return {
+                    'stdout': '',
+                    'stderr': 'Command interrupted by user',
+                    'exit_code': -1,
+                    'success': False,
+                    'interrupted': True,
+                    'execution_time': time.time() - start_time
+                }
+
             except _StreamDrainTimeout:
                 # The direct child already exited; only an inherited pipe kept a
                 # reader blocked. Report a timeout but do NOT kill — the direct
@@ -169,20 +285,7 @@ class ShellTools:
 
             except subprocess.TimeoutExpired:
                 # Kill process on timeout
-                try:
-                    import psutil
-                    parent = psutil.Process(process.pid)
-                    children = parent.children(recursive=True)
-                    for child in children:
-                        child.kill()
-                    parent.kill()
-                except ImportError:
-                    # Fallback: kill without psutil
-                    process.kill()
-                except psutil.NoSuchProcess:
-                    # Process already gone — nothing to kill.
-                    pass
-                
+                self._kill_process_tree(process)
                 return {
                     'stdout': '',
                     'stderr': f'Command timed out after {timeout} seconds',
@@ -192,8 +295,17 @@ class ShellTools:
                 }
                 
         except Exception as e:
-            error_msg = f"Error executing command: {str(e)}"
-            logging.error(error_msg)
+            # Name the exception type and log the traceback. Some exceptions
+            # here really are command-execution failures caused by bad caller
+            # input (e.g. a non-string command, or an env value that is not a
+            # string), which must keep returning a result dict the model can
+            # recover from rather than propagating. But an internal programming
+            # error (a signature mismatch, say) lands here too, and reporting it
+            # as a bare "Error executing command: <message>" is how such a bug
+            # gets mistaken for a command failure. The type name plus a
+            # traceback makes the difference visible at a glance.
+            error_msg = f"Error executing command: {type(e).__name__}: {e}"
+            logging.error(error_msg, exc_info=True)
             return {
                 'stdout': '',
                 'stderr': error_msg,
@@ -202,7 +314,183 @@ class ShellTools:
                 'execution_time': 0
             }
     
-    def _communicate_streaming(self, process, timeout):
+    def _start_background(self, command, cwd, process_env):
+        """Start *command* detached, writing stdout+stderr to a log file."""
+        import tempfile
+        import uuid
+
+        fd, log_path = tempfile.mkstemp(prefix="praisonai-bg-", suffix=".log")
+        with os.fdopen(fd, "wb") as log_file:
+            process = subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                cwd=cwd,
+                shell=False,  # Always use shell=False for security
+                env=process_env,
+                # Own process group so stop_command can reach the whole tree
+                start_new_session=platform.system() != 'Windows',
+            )
+        process_id = uuid.uuid4().hex[:8]
+        with self._background_lock:
+            if not self._background:
+                import atexit
+                atexit.register(self._stop_all_background)
+            self._background[process_id] = {"process": process, "log_path": log_path}
+        return {
+            'success': True,
+            'process_id': process_id,
+            'pid': process.pid,
+            'status': 'running',
+            'log_file': log_path,
+        }
+
+    def get_command_output(self, process_id: str, tail: int = 200) -> Dict[str, Union[str, int, bool, None]]:
+        """Get status and latest output of a command started with run_in_background=True.
+
+        Args:
+            process_id: The process_id returned by execute_command
+            tail: Number of most recent output lines to return
+
+        Returns:
+            Dictionary with status ("running" or "exited"), exit_code and output
+        """
+        entry = self._background.get(process_id)
+        if entry is None:
+            return {'success': False, 'error': f'No background command with process_id {process_id!r}'}
+        process = entry["process"]
+        exit_code = process.poll()
+        # Read only the end of the log so a chatty process stays bounded.
+        max_bytes = 64 * 1024
+        try:
+            with open(entry["log_path"], "rb") as f:
+                f.seek(0, os.SEEK_END)
+                f.seek(max(0, f.tell() - max_bytes))
+                data = f.read(max_bytes).decode("utf-8", errors="replace")
+        except OSError as e:
+            data = f"<unable to read output: {e}>"
+        lines = data.splitlines()[-tail:] if tail > 0 else []
+        return {
+            'success': exit_code in (None, 0),
+            'process_id': process_id,
+            'pid': process.pid,
+            'status': 'running' if exit_code is None else 'exited',
+            'exit_code': exit_code,
+            'output': "\n".join(lines),
+            'log_file': entry["log_path"],
+        }
+
+    def stop_command(self, process_id: str) -> Dict[str, Union[str, int, bool, None]]:
+        """Stop a command started with run_in_background=True (and its children).
+
+        Args:
+            process_id: The process_id returned by execute_command
+
+        Returns:
+            Dictionary with the final status and exit_code
+        """
+        entry = self._background.get(process_id)
+        if entry is None:
+            return {'success': False, 'error': f'No background command with process_id {process_id!r}'}
+        process = entry["process"]
+        if process.poll() is None:
+            self._terminate_background(process)
+        return {
+            'success': True,
+            'process_id': process_id,
+            'status': 'exited',
+            'exit_code': process.returncode,
+        }
+
+    def _terminate_background(self, process):
+        """Terminate a background process group, escalating to kill."""
+        if platform.system() != 'Windows':
+            import signal
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+            # The parent exiting does not mean its children did: SIGKILL
+            # whatever is left in the group so nothing outlives stop_command.
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+        else:
+            self._kill_process_tree(process)
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+
+    def _stop_all_background(self):
+        """Do not leave dev servers/watchers orphaned when the interpreter exits."""
+        for entry in list(self._background.values()):
+            try:
+                if entry["process"].poll() is None:
+                    self._terminate_background(entry["process"])
+            except Exception as exc:
+                logging.debug("Failed to stop background command: %s", exc, exc_info=True)
+
+    def _current_cancel_event(self):
+        """Return the agent's cooperative cancellation Event, if any.
+
+        Sourced from the injected AgentState set by the agent tool-execution
+        loop. Returns ``None`` when the tool runs outside an agent (standalone),
+        keeping behaviour and imports lazy with zero overhead.
+        """
+        try:
+            from .injected import get_current_state
+            state = get_current_state()
+        except Exception:
+            return None
+        if state is None:
+            return None
+        return getattr(state, 'cancel_event', None)
+
+    def _kill_process_tree(self, process):
+        """Kill a child process and its descendants (best-effort).
+
+        Uses psutil to reach the whole tree when available, falling back to
+        ``taskkill /T`` on Windows or ``process.kill()`` otherwise. Safe to
+        call if the process already exited.
+        """
+        try:
+            import psutil
+            parent = psutil.Process(process.pid)
+            children = parent.children(recursive=True)
+            for child in children:
+                try:
+                    child.kill()
+                except psutil.NoSuchProcess:
+                    pass
+            parent.kill()
+        except ImportError:
+            if platform.system() == 'Windows':
+                # Own try: a missing/hung taskkill must not skip process.kill().
+                try:
+                    subprocess.run(
+                        ['taskkill', '/F', '/T', '/PID', str(process.pid)],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        timeout=10,
+                    )
+                except Exception:
+                    pass
+            try:
+                process.kill()
+            except Exception:
+                pass
+        except psutil.NoSuchProcess:
+            # Process already gone — nothing to kill.
+            pass
+
+    def _communicate_streaming(self, process, timeout, cancel_event=None):
         """Read stdout/stderr line-buffered, emitting live progress.
 
         Reads both streams concurrently in background threads so a line on
@@ -273,16 +561,38 @@ class ShellTools:
         t_err.start()
 
         deadline = None if timeout is None else time.monotonic() + timeout
-        try:
-            process.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            # The direct child is still running. Disable any further emission and
-            # re-raise TimeoutExpired so the caller's timeout path KILLS the
-            # process before returning — a recorded read error must not short-
-            # circuit that cleanup (otherwise the still-running child leaks with
-            # its pipes open).
-            stop_emitting.set()
-            raise
+        if cancel_event is None:
+            try:
+                process.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                # The direct child is still running. Disable any further emission
+                # and re-raise TimeoutExpired so the caller's timeout path KILLS
+                # the process before returning — a recorded read error must not
+                # short-circuit that cleanup (otherwise the still-running child
+                # leaks with its pipes open).
+                stop_emitting.set()
+                raise
+        else:
+            # Poll in short slices so a cooperative interrupt aborts the child
+            # promptly (within the poll interval) rather than only on timeout.
+            _POLL = 0.1
+            while True:
+                if cancel_event.is_set():
+                    stop_emitting.set()
+                    raise _CommandCancelled()
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        stop_emitting.set()
+                        raise subprocess.TimeoutExpired(process.args, timeout)
+                    wait_slice = min(_POLL, remaining)
+                else:
+                    wait_slice = _POLL
+                try:
+                    process.wait(timeout=wait_slice)
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
 
         # Wait for the readers to drain the pipe buffers before returning,
         # preserving subprocess.communicate()'s "all captured output" semantics.
@@ -464,6 +774,8 @@ _shell_tools = ShellTools()
 execute_command = _shell_tools.execute_command
 list_processes = _shell_tools.list_processes
 kill_process = _shell_tools.kill_process
+get_command_output = _shell_tools.get_command_output
+stop_command = _shell_tools.stop_command
 get_system_info = _shell_tools.get_system_info
 
 if __name__ == "__main__":

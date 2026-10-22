@@ -11,7 +11,7 @@ from datetime import datetime
 from typing import Optional, Dict, Any, Callable, Union
 from abc import ABC, abstractmethod
 
-from .shared import ScheduleParser, ScheduleTicker, backoff_delay, safe_call
+from .shared import ScheduleParser, ScheduleTicker, backoff_delay, safe_call, safe_call_async
 from ._base_scheduler import (
     _BaseAgentScheduler,
     _compute_run_cost,
@@ -174,6 +174,8 @@ class AsyncAgentScheduler(_BaseAgentScheduler):
         self._execution_count = 0
         self._success_count = 0
         self._failure_count = 0
+        self._undelivered_count = 0
+        self._delivered_count = 0
         self._start_time: Optional[datetime] = None
         
         # Sync lock for async primitives creation and bound loop tracking
@@ -381,23 +383,9 @@ class AsyncAgentScheduler(_BaseAgentScheduler):
             execs=execs, success=success, failed=failed, total_cost=total_cost
         )
     
-    def get_stats_sync(self) -> Dict[str, Any]:
-        """
-        Synchronous alias for get_stats() for clarity.
-        
-        Returns:
-            Dictionary with execution stats (best-effort)
-        """
-        # Always do best-effort synchronous read for simplicity
-        return {
-            "is_running": self.is_running,
-            "total_executions": self._execution_count,
-            "successful_executions": self._success_count,
-            "failed_executions": self._failure_count,
-            "success_rate": (self._success_count / self._execution_count * 100) if self._execution_count > 0 else 0,
-            "total_cost_usd": round(self._total_cost, 4),
-            "remaining_budget": round(self.max_cost - self._total_cost, 4) if self.max_cost is not None else None,
-        }
+    # get_stats_sync is inherited from _BaseAgentScheduler so the sync and async
+    # surfaces return the same dict shape (incl. runtime_seconds /
+    # cost_per_execution) and read the delivery counters under the delivery lock.
     
     async def _run_schedule(self, ticker: "ScheduleTicker", max_retries: int):
         """Internal method to run scheduled agent executions.
@@ -497,11 +485,27 @@ class AsyncAgentScheduler(_BaseAgentScheduler):
                 )
                 
                 # Deliver to the configured chat target (if any) off the event
-                # loop, since the shared delivery helper uses the sync bridge.
+                # loop, since the shared delivery helper uses the sync bridge,
+                # and fold the outcome into truthful accounting (Issue #4454):
+                # a run whose delivery fails is recorded ``undelivered`` and
+                # fires ``on_failure`` instead of a silent ``on_success``.
+                delivered_ok = True
                 if self.deliver:
-                    await asyncio.to_thread(self._deliver_result, result)
+                    delivered_ok = await asyncio.to_thread(
+                        self._finalize_delivery, result
+                    )
 
-                safe_call(self.on_success, result)
+                if delivered_ok:
+                    safe_call(self.on_success, result)
+                else:
+                    logger.error(
+                        "Scheduled run executed but its result could not be "
+                        "delivered to the configured target"
+                    )
+                    safe_call(
+                        self.on_failure,
+                        "scheduled result could not be delivered",
+                    )
                 await asyncio.to_thread(self._update_state_if_daemon)
                 return
                 
@@ -511,7 +515,8 @@ class AsyncAgentScheduler(_BaseAgentScheduler):
                 if attempt < max_retries - 1:
                     wait_time = backoff_delay(attempt)
                     logger.info(f"Waiting {wait_time}s before async retry after timeout...")
-                    await asyncio.sleep(wait_time)
+                    if await self._sleep_or_stop(wait_time):
+                        return
             except Exception as e:
                 last_exc = e
                 logger.error(f"Async agent execution failed on attempt {attempt + 1}: {e}")
@@ -519,7 +524,8 @@ class AsyncAgentScheduler(_BaseAgentScheduler):
                 if attempt < max_retries - 1:
                     wait_time = backoff_delay(attempt)
                     logger.info(f"Waiting {wait_time}s before async retry...")
-                    await asyncio.sleep(wait_time)
+                    if await self._sleep_or_stop(wait_time):
+                        return
         
         async with self._stats_lock:
             self._failure_count += 1
@@ -530,7 +536,26 @@ class AsyncAgentScheduler(_BaseAgentScheduler):
             else RuntimeError(f"Failed after {max_retries} attempts")
         )
         await asyncio.to_thread(self._update_state_if_daemon)
-    
+
+    async def _sleep_or_stop(self, wait_time: float) -> bool:
+        """Interruptible retry backoff.
+
+        Mirrors the sync scheduler's ``self._stop_event.wait(wait_time)`` and
+        the scheduled-run sleep elsewhere in this file: waits ``wait_time``
+        seconds but returns immediately if ``stop()`` is called, so a graceful
+        shutdown is never held hostage for the full backoff ``cap``.
+
+        Returns ``True`` if stop() was requested during the wait.
+        """
+        if self._stop_event is None:
+            await asyncio.sleep(wait_time)
+            return False
+        try:
+            await asyncio.wait_for(self._stop_event.wait(), timeout=wait_time)
+            return True  # event fired → stop requested
+        except asyncio.TimeoutError:
+            return False  # normal backoff completed
+
     async def execute_once(self) -> Any:
         """
         Execute agent immediately (one-time execution).
@@ -539,6 +564,9 @@ class AsyncAgentScheduler(_BaseAgentScheduler):
             Agent execution result
         """
         logger.info("Executing agent once (async)")
+        if self._budget_exceeded():
+            logger.warning(f"Budget limit reached: ${self._total_cost:.4f} >= ${self.max_cost}; skipping run")
+            return None
         try:
             result = await self._executor.execute(self.task)
             logger.info(f"One-time async execution successful: {result}")
@@ -547,8 +575,18 @@ class AsyncAgentScheduler(_BaseAgentScheduler):
             # since the shared delivery helper uses the sync bridge. Mirrors the
             # scheduled-loop success path so a one-time async run is not silently
             # undelivered.
+            delivered_ok = True
             if self.deliver:
-                await asyncio.to_thread(self._deliver_result, result)
+                delivered_ok = await asyncio.to_thread(self._finalize_delivery, result)
+
+            if delivered_ok:
+                await safe_call_async(self.on_success, result)
+            else:
+                logger.error(
+                    "One-time async run executed but its result could not be "
+                    "delivered to the configured target"
+                )
+                await safe_call_async(self.on_failure, "scheduled result could not be delivered")
 
             return result
         except Exception as e:

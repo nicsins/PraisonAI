@@ -15,12 +15,13 @@ use std::time::Duration;
 use praisonai_desktop_core::adopt::Decision;
 use tauri_plugin_window_state::{AppHandleExt, StateFlags};
 use praisonai_desktop_core::platform::Platform;
+use praisonai_desktop_core::lockfile::{parse, LockState};
 use praisonai_desktop_core::reclaim::{kill_pid, no_console, reclaim};
 use praisonai_desktop_core::engine_paths::{
     app_bundle, data_dir, python_candidates, resolve_engine, RealFs as PathFs,
 };
 use praisonai_desktop_core::supervisor::{self, Engine, StartError};
-use praisonai_desktop_core::venv_resolve::{venv_root_for_python, RealFs};
+use praisonai_desktop_core::venv_resolve::{spawn_env, venv_root_for_python, RealFs};
 use serde::Serialize;
 use tauri::{Emitter, Manager};
 
@@ -82,6 +83,85 @@ fn resolve_python(user_data: Option<&Path>) -> Result<PathBuf, String> {
         }
     }
     Err(format!("no usable Python found. Tried: {}", tried.join("; ")))
+}
+
+/// Bring an existing venv up to the current `ENGINE_PACKAGES` if it drifted.
+///
+/// The venv is built once, on first run, and then left alone -- so a fix
+/// shipped in `praisonaiagents` after that never reaches the user, and raising
+/// the pin in `ENGINE_PACKAGES` changes only what *new* installs get. This
+/// compares a stamp written beside the venv against the current requirement
+/// and, when they differ, re-runs the single install step (uv is near-instant
+/// when nothing changed) and rewrites the stamp.
+///
+/// Returns whether an install was attempted, so the caller can label the tray.
+/// Best effort throughout: a failure here must not block starting the engine,
+/// because a stale-but-working engine is better than no engine, and the UI
+/// reports the truth of what version is actually running.
+///
+/// `python` is the interpreter startup resolved. Reconciliation only touches
+/// the venv that interpreter belongs to: `python_candidates` may resolve a
+/// `PRAISONAI_PYTHON` override or a checkout venv ahead of `data/venv`, and
+/// installing into `data/venv` in that case would modify an environment the
+/// engine is not running from -- or fail every launch against a `data/venv`
+/// that was never provisioned. The stamp lives beside that same venv, so a
+/// non-`data/venv` interpreter is left untouched: its owner manages its
+/// packages.
+/// Returns whether packages were actually installed. A `true` means the venv's
+/// code changed underneath any engine still running from it, so the caller must
+/// not adopt that stale process: it is still executing the old package code and
+/// only a restart picks up the new one.
+fn reconcile_engine_packages(data: &Path, python: &Path, app: &tauri::AppHandle) -> bool {
+    use praisonai_desktop_core::provision::{
+        deps_step, locate_uv, needs_reprovision, stamp_contents, stamp_path, uv_candidates,
+        venv_python, Uv, ENGINE_PACKAGES,
+    };
+    // Only reconcile the venv we own and provisioned. If startup picked some
+    // other interpreter, its packages are not ours to rewrite.
+    if python != venv_python(data, Platform::current()) {
+        return false;
+    }
+    let stamp = std::fs::read_to_string(stamp_path(data)).ok();
+    if !needs_reprovision(stamp.as_deref(), ENGINE_PACKAGES) {
+        return false;
+    }
+    let Some(home) = home_dir() else { return false };
+    let platform = Platform::current();
+    let uv = match locate_uv(&uv_candidates(&home, data, platform), |p| p.is_file()) {
+        Uv::Found(p) => p,
+        // No uv means no first-run provision has completed; there is nothing to
+        // reconcile, and fetching one here would turn a normal launch into a
+        // download.
+        Uv::Fetch => return false,
+    };
+    let step = deps_step(&uv, data, ENGINE_PACKAGES, platform);
+    let mut command = std::process::Command::new(&step.program);
+    no_console(&mut command);
+    // "updating…" is shown only around the install that is actually running,
+    // and "starting…" restored before returning -- so no path out of here
+    // leaves the tray claiming an update that has finished or never ran.
+    praisonai_desktop_core::tray::set_engine_label(app, "Engine: updating\u{2026}");
+    let installed = match command.args(&step.args).output() {
+        Ok(out) if out.status.success() => {
+            // Only stamp on success: a failed install must be retried next
+            // launch, not silently recorded as done.
+            let _ = std::fs::write(stamp_path(data), stamp_contents(ENGINE_PACKAGES));
+            true
+        }
+        Ok(out) => {
+            eprintln!(
+                "[praisonai] package update failed, starting with what is installed: {}",
+                String::from_utf8_lossy(&out.stderr).lines().last().unwrap_or("")
+            );
+            false
+        }
+        Err(e) => {
+            eprintln!("[praisonai] could not run package update: {e}");
+            false
+        }
+    };
+    praisonai_desktop_core::tray::set_engine_label(app, "Engine: starting\u{2026}");
+    installed
 }
 
 /// Build the engine's Python environment, reporting each step as it starts.
@@ -232,7 +312,32 @@ async fn provision_engine(app: tauri::AppHandle) -> Result<String, String> {
     if !py.is_file() {
         return Err(format!("finished, but {} is not there", py.display()));
     }
+    // Record what was installed, so a later launch can tell whether the venv is
+    // still current or predates a raised requirement and needs re-applying.
+    // Best effort: a venv that provisioned correctly must not be reported as a
+    // failure because a note beside it could not be written.
+    let _ = std::fs::write(
+        praisonai_desktop_core::provision::stamp_path(&data),
+        praisonai_desktop_core::provision::stamp_contents(ENGINE_PACKAGES),
+    );
     Ok(py.display().to_string())
+}
+
+/// Stop the shell-held engine and any adopted lockfile process, then spawn fresh.
+#[tauri::command]
+fn restart_engine(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> EngineStatus {
+    if let Some(mut engine) = state.engine.lock().unwrap().take() {
+        engine.shutdown();
+    }
+    if let Some(dir) = user_data_dir() {
+        let lock_path = dir.join("engine.lock");
+        let contents = std::fs::read_to_string(&lock_path).ok();
+        if let LockState::Present(lock) = parse(contents.as_deref()) {
+            kill_pid(lock.pid);
+        }
+        let _ = std::fs::remove_file(lock_path);
+    }
+    engine_status(app, state)
 }
 
 #[tauri::command]
@@ -258,16 +363,52 @@ fn engine_status(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> En
             }
         }
     };
+    // The engine exposes this beside its own package version in /health. Read
+    // from Tauri package metadata, which the release workflow derives from the
+    // tag, rather than from Cargo.toml's development-only package version.
+    let shell_version = app.package_info().version.to_string();
+    // A resolved Python means a venv exists. Before starting the engine from
+    // it, bring it up to the current package requirement if it drifted -- the
+    // venv is provisioned once and otherwise never revisited, so a library fix
+    // shipped after first run would never reach this user. On failure the
+    // engine still starts, reporting whatever version is actually installed.
+    // `reconcile_engine_packages` shows "updating…" itself only while an
+    // install actually runs, and always restores "starting…" on return -- so a
+    // no-drift launch, a non-owned interpreter, or a subsequent `resolve_engine`
+    // failure never strands the tray on "updating…" reporting an update that is
+    // not running. It returns whether it actually installed: a fresh install
+    // means any engine still running from this venv is executing the old code,
+    // so that process must be reaped and restarted rather than adopted.
+    let reinstalled = match user_data.as_deref() {
+        Some(dir) => reconcile_engine_packages(dir, &python, &app),
+        None => false,
+    };
     // Reap or adopt whatever the last run left. Neither `Drop` nor the reap on
     // exit runs when the shell is killed by a signal, and that was observed:
     // `kill -TERM` on the app left the Python child alive with a lockfile still
     // claiming it, and the next launch started a second engine beside it.
+    //
+    // When packages were just reinstalled, adoption is suppressed: the survivor
+    // imported the old code at its own start and cannot see the new files, so
+    // it is killed and its lock cleared, and the fresh `start` below launches
+    // one that loads what was installed. Nothing is adopted stale.
     if let Some(dir) = user_data.as_deref() {
         let venv = venv_root_for_python(&python, &RealFs, Platform::current())
             .map(|l| l.root.display().to_string())
             .unwrap_or_default();
-        match reclaim(dir, &python.display().to_string(), &venv,
-                      supervisor::probe_health, kill_pid) {
+        // A fresh install forces the survivor to be treated as unhealthy: the
+        // probe closure returns `false`, so a matching engine is killed and its
+        // lock cleared (`KillAndRespawn`) rather than adopted, and the PID-reuse
+        // guard in `reclaim` still protects an unrelated process on the same
+        // PID. Otherwise probe for real and adopt a healthy survivor.
+        let decision = reclaim(
+            dir,
+            &python.display().to_string(),
+            &venv,
+            |port| !reinstalled && supervisor::probe_health(port, &shell_version),
+            kill_pid,
+        );
+        match decision {
             Decision::Adopt { port } => {
                 log_decision(&Decision::Adopt { port });
                 praisonai_desktop_core::tray::set_engine_label(
@@ -301,11 +442,31 @@ fn engine_status(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> En
         Some(b) => std::env::set_var("PRAISONAI_APP_BUNDLE", b),
         None => std::env::remove_var("PRAISONAI_APP_BUNDLE"),
     }
-
+    // Resolve the environment the engine actually spawns with, rather than
+    // inheriting the shell's. An exported PYTHONHOME or PYTHONPATH would
+    // otherwise redirect the engine's stdlib or site-packages away from the
+    // venv the resolver just proved. Collect *after* setting
+    // PRAISONAI_APP_BUNDLE above so it survives the `env_clear` in `start`.
+    //
+    // `vars_os`, not `vars`: `vars` panics on any non-Unicode key or value,
+    // and with `panic = "abort"` in release that would take the whole app down
+    // before the engine ever started -- a single stray byte in the inherited
+    // environment (a locale-encoded value, a foreign tool's export) would abort
+    // startup. `spawn_env` only handles `String` anyway, so drop undecodable
+    // entries rather than aborting; a variable Python could not have received
+    // as UTF-8 is no loss.
+    let inherited: std::collections::BTreeMap<String, String> = std::env::vars_os()
+        .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
+        .collect();
+    let spawn = venv_root_for_python(&python, &RealFs, Platform::current())
+        .map(|layout| spawn_env(&layout, &inherited, Platform::current()))
+        .unwrap_or(inherited);
     match supervisor::start(
         &python.display().to_string(),
         &layout.script.display().to_string(),
         Duration::from_secs(30),
+        &shell_version,
+        &spawn,
     ) {
         Ok(engine) => {
             let port = engine.port;
@@ -338,7 +499,66 @@ fn engine_status(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> En
 /// Debounce flag for geometry saves; see the window event handler.
 static SAVE_PENDING: AtomicBool = AtomicBool::new(false);
 
+/// Leave a line on disk saying this launch happened, before anything can exit.
+///
+/// The Windows first-run report was a launch that left "no window, no folder,
+/// no logs" -- and with the single-instance guard exiting a secondary with
+/// code 0, there was no way after the fact to tell a shell that died from one
+/// that simply handed off to the primary and quit. This writes that fact
+/// somewhere that exists whether or not `%APPDATA%\PraisonAI` does. Best
+/// effort: a shell must never fail to start because it could not write a log.
+fn breadcrumb(primary: bool) {
+    use praisonai_desktop_core::startup_log::{line, log_path};
+    use std::io::Write;
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let entry = line(secs, Platform::current(), primary, std::process::id());
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path(&std::env::temp_dir()))
+    {
+        let _ = f.write_all(entry.as_bytes());
+    }
+}
+
+/// Create the user data directory on the primary launch, before any window.
+///
+/// The first-run report was a clean machine where the window opened, the setup
+/// screen appeared, and yet `%APPDATA%\PraisonAI` never came into existence:
+/// the only code that made the directory was `provision_engine`, which runs
+/// only after the user clicks "Get started". So a fresh install that a user
+/// merely opened -- or a machine whose data folder was deleted to repair a
+/// corrupt state -- left no Roaming directory at all, indistinguishable to a
+/// clean-start check from a shell that never started. Making it here, on the
+/// primary path (a secondary never reaches `setup()`), means the directory
+/// exists the moment the app is running, whether or not provisioning has begun.
+/// Best effort: a shell must never fail to start because it could not create
+/// its data directory -- `engine_status` and `provision_engine` still create
+/// it later if this could not.
+fn ensure_data_dir() {
+    if let Some(dir) = user_data_dir() {
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            eprintln!("[praisonai] could not create {}: {e}", dir.display());
+        }
+    }
+}
+
 fn main() {
+    // Before the single-instance guard can quit this process: a launch that
+    // hands off to the primary and exits 0 must still leave a trace, or it is
+    // indistinguishable from one that crashed on the way up. Every launch
+    // records itself as `secondary` here -- honest, because this process does
+    // not yet know it is the first, and the pid is its own. The true primary
+    // upgrades its own line from `setup()` below, which the single-instance
+    // plugin runs only in the first instance. That keeps each line's pid and
+    // role telling the truth about the *same* process: a secondary that exits 0
+    // leaves `secondary pid=<its own>`, and the primary leaves `primary
+    // pid=<its own>`. Writing `primary` here and `secondary` in the guard
+    // callback (which runs in the primary, not the secondary) reversed both.
+    breadcrumb(false);
     // First, before anything can open an X connection. GTK will not do this
     // for us and the failure without it is a silent exit(1) with no message.
     praisonai_desktop_core::x11_threads::init();
@@ -346,6 +566,13 @@ fn main() {
         // Must be registered first: the guard has to run before anything else
         // touches the lockfile or the engine.
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            // Runs in the *primary* when a secondary launches. The secondary has
+            // already recorded its own `secondary` line and is exiting 0; the
+            // primary already recorded its own `primary` line in `setup()`. Do
+            // not write here: this process is the primary, and its pid is not
+            // the secondary's, so any line written here would mislabel one of
+            // them.
+            //
             // A second launch raises the window that already exists rather than
             // starting a rival shell.
             if let Some(w) = app.get_webview_window("main") {
@@ -357,6 +584,14 @@ fn main() {
         .plugin(tauri_plugin_window_state::Builder::default().build())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
+            // Only the first instance reaches `setup()`; a secondary is told to
+            // exit by the guard before it gets here. So this is where the
+            // primary honestly upgrades its own breadcrumb, with its own pid.
+            breadcrumb(true);
+            // And where the primary makes its data directory exist, so a clean
+            // machine that is merely opened -- not yet provisioned -- has the
+            // Roaming folder it was reported to be missing.
+            ensure_data_dir();
             app.manage(AppState { engine: Mutex::new(None) });
             // Deliberately not `?`. On Linux the tray goes through
             // libappindicator, which is dlopen'd at first use and *panics* if
@@ -402,10 +637,37 @@ fn main() {
                 let _ = window.hide();
             }
         })
-        .invoke_handler(tauri::generate_handler![engine_status, provision_engine])
+        .invoke_handler(tauri::generate_handler![engine_status, restart_engine, provision_engine])
         .build(tauri::generate_context!())
         .expect("error while building the PraisonAI desktop shell")
         .run(|app, event| {
+            // macOS reports a Dock-icon reopen through this native event, not
+            // the single-instance callback. The close handler hides `main`,
+            // so restore it when the user reopens the app without a visible
+            // window.
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Reopen {
+                has_visible_windows,
+                ..
+            } = &event
+            {
+                if !*has_visible_windows {
+                    if let Some(window) = app.get_webview_window("main") {
+                        if let Err(error) = window.show() {
+                            eprintln!("[praisonai] failed to show main window on reopen: {error}");
+                        }
+                        if let Err(error) = window.unminimize() {
+                            eprintln!(
+                                "[praisonai] failed to unminimize main window on reopen: {error}"
+                            );
+                        }
+                        if let Err(error) = window.set_focus() {
+                            eprintln!("[praisonai] failed to focus main window on reopen: {error}");
+                        }
+                    }
+                }
+            }
+
             // Dropping managed state on exit is not guaranteed, so reap here
             // explicitly. Verified by `pgrep -f server.py` after quit.
             if matches!(event, tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit) {

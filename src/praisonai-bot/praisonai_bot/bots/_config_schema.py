@@ -9,11 +9,53 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Union
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PrivateAttr,
+    field_validator,
+    model_validator,
+)
 
 logger = logging.getLogger(__name__)
+
+
+#: Stable, published URL for the ``gateway.yaml`` / ``bot.yaml`` JSON Schema,
+#: mirroring the ``agents.yaml`` convention (``AGENTS_SCHEMA_URL``). Editors that
+#: speak the YAML language server use this via a leading
+#: ``# yaml-language-server: $schema=<url>`` header to provide autocomplete,
+#: inline validation, and hover docs while authoring the gateway/bot config.
+GATEWAY_SCHEMA_URL = (
+    "https://raw.githubusercontent.com/MervinPraison/PraisonAI/main/"
+    "src/praisonai-bot/praisonai_bot/bots/gateway.schema.json"
+)
+
+#: Leading YAML comment prepended to scaffolded ``gateway.yaml`` / ``bot.yaml``
+#: files so editors wire up validation out of the box. A leading comment is
+#: ignored by ``yaml.safe_load``, so execution is unaffected.
+GATEWAY_SCHEMA_HEADER = f"# yaml-language-server: $schema={GATEWAY_SCHEMA_URL}\n"
+
+
+def resolve_model_by_provider() -> str:
+    """Resolve a default model for whichever provider credential is present.
+
+    Reuses the existing detection helper
+    (``praisonai_code.llm.env.default_model_for_available_provider``) through
+    the lazy cross-tier bridge so the gateway path leads with the provider the
+    operator already has (Anthropic/Gemini/Ollama/…) instead of assuming
+    OpenAI. Falls back to ``gpt-4o-mini`` only when no provider is detected or
+    the helper is unavailable.
+    """
+    try:
+        from praisonai_bot._code_bridge import import_code_module
+
+        env = import_code_module("praisonai_code.llm.env")
+        return env.default_model_for_available_provider()
+    except Exception:  # pragma: no cover - detection is best-effort
+        return "gpt-4o-mini"
 
 
 def _register_redaction(value: str) -> None:
@@ -34,7 +76,12 @@ class AgentConfigSchema(BaseModel):
     """Schema for agent configuration in bot.yaml."""
     name: str = "assistant"
     instructions: str = ""
-    model: Optional[str] = "gpt-4o-mini"
+    # Provider-agnostic by default (Issue #5609). ``None`` / ``"auto"`` resolve
+    # at load time to the model for whichever provider credential is actually
+    # present (via ``resolved_model()``), so an operator with only an
+    # Anthropic/Gemini/Ollama key is not silently handed an OpenAI model. An
+    # explicit ``model:`` always wins.
+    model: Optional[str] = None
     llm: Optional[str] = None  # Alias for model
     memory: bool = False
     tools: List[str] = Field(default_factory=list)
@@ -50,6 +97,19 @@ class AgentConfigSchema(BaseModel):
         if self.llm and "model" not in self.model_fields_set:
             self.model = self.llm
         return self
+
+    def resolved_model(self) -> str:
+        """Return the effective model, detecting the provider when unset.
+
+        An explicit, non-``"auto"`` ``model`` (or ``llm`` alias) always wins.
+        When the model is unset or ``"auto"``, resolve it to the detected
+        provider's default (Issue #5609), with ``gpt-4o-mini`` as the
+        last-resort fallback handled inside ``resolve_model_by_provider``.
+        """
+        model = self.model
+        if model and model.strip().lower() != "auto":
+            return model
+        return resolve_model_by_provider()
 
 
 class SessionResetConfigSchema(BaseModel):
@@ -182,6 +242,12 @@ class StreamingConfigSchema(BaseModel):
     flood_backoff_factor: float = 2.0  # Multiply interval on each flood/429
     max_interval: float = 30.0  # Cap for the adaptively-widened interval
     strip_reasoning_tags: bool = True  # Strip <think>/<reasoning> from output
+    # Opt-in privacy-safe activity surface (PROGRESS mode). Retained here so the
+    # documented ``activity_status: {enabled, phrases}`` block (and the inline
+    # ``activity_phrases`` catalogue) reach ``StreamingConfig.from_dict`` instead
+    # of being silently dropped by the schema. Off by default.
+    activity_status: Optional[Dict[str, Any]] = None
+    activity_phrases: Optional[Dict[str, str]] = None
     
     @field_validator("mode")
     @classmethod
@@ -287,6 +353,11 @@ class TtsConfigSchema(BaseModel):
     speed: Optional[float] = None  # Optional speaking-rate multiplier
     format: str = "ogg"  # Voice-note native formats: ogg/opus
     max_chars: int = Field(default=4000, ge=0)  # Skip TTS above this length (0 = no cap)
+    # Incremental (sentence-level) synthesis (Issue #4918). When true the reply
+    # is chunked into sentences and each is synthesised & delivered as it becomes
+    # available, cutting time-to-first-audio to first-sentence latency. Off by
+    # default (whole-clip synthesis).
+    stream: bool = False
 
 
 class BotCommandsConfigSchema(BaseModel):
@@ -309,6 +380,95 @@ class BotCommandsConfigSchema(BaseModel):
     include_user_scope: bool = False
 
 
+class DeliveryTargetSchema(BaseModel):
+    """Schema for a scheduled job's delivery target (Issue #4913).
+
+    Where a recurring job's output is posted. Mirrors the core
+    ``praisonaiagents.scheduler.DeliveryTarget`` fields so the same dict shape
+    is accepted from YAML, CLI and Python. ``channel`` is the platform name
+    (``telegram``/``discord``/...) and ``channel_id`` the platform chat id.
+    """
+
+    channel: str
+    channel_id: str = ""
+    thread_id: Optional[str] = None
+    # One-way notification vs. a resumable conversation opener. Default keeps
+    # the core's continuable behaviour so a reply in the same chat resumes.
+    continuable: bool = True
+
+
+class ScheduleConfigSchema(BaseModel):
+    """Schema for a declarative recurring agent→channel delivery (Issue #4913).
+
+    One entry under ``schedules:`` in gateway.yaml. Coerced at boot into the
+    existing core ``ScheduleJob`` + ``DeliveryTarget`` and upserted into the
+    ``ScheduleRunner`` store, so a recurring channel delivery is a few lines of
+    YAML with no Python — reaching CLI+YAML+Python parity with every other
+    gateway capability. Exactly one of ``cron``/``every``/``at`` must be set.
+    """
+
+    agent: str
+    prompt: str
+    cron: Optional[str] = None
+    every: Optional[str] = None
+    at: Optional[str] = None
+    deliver: Optional[DeliveryTargetSchema] = None
+    # Optional cheap go/no-go gate run before the (expensive) model turn — an
+    # existing core capability (a shell/python command). "nothing to do" skips
+    # the run with no tokens spent and no delivery.
+    pre_run: Optional[str] = None
+    enabled: bool = True
+
+    @model_validator(mode="after")
+    def validate_one_trigger(self):
+        set_triggers = [
+            name for name in ("cron", "every", "at") if getattr(self, name)
+        ]
+        if len(set_triggers) == 0:
+            raise ValueError(
+                "schedule requires exactly one of 'cron', 'every' or 'at'"
+            )
+        if len(set_triggers) > 1:
+            raise ValueError(
+                "schedule accepts only one of 'cron', 'every' or 'at'; got "
+                f"{', '.join(set_triggers)}"
+            )
+        return self
+
+
+def _normalize_unknown_user_policy(v: Optional[str]) -> Optional[str]:
+    """Validate + normalize an inbound admission policy (Issue #5093).
+
+    Shared by the channel-level and top-level single-bot fields so a typo
+    (``alow``/``deney``) fails closed at load time in either position rather
+    than being silently accepted and ignored. ``None`` passes through so the
+    secure ``deny`` default (applied by ``BotConfig``) still wins when omitted.
+    """
+    if v is None:
+        return v
+    allowed = {"deny", "pair", "allow"}
+    normalized = str(v).strip().lower()
+    if normalized not in allowed:
+        raise ValueError(
+            f"Invalid unknown_user_policy '{v}'. Must be one of: "
+            f"{', '.join(sorted(allowed))}"
+        )
+    return normalized
+
+
+def _coerce_owner_user_id(v):
+    """Coerce a numeric or string owner id to a trimmed string (Issue #5093).
+
+    Telegram/Discord owner ids are naturally numeric, so an unquoted YAML
+    ``owner_user_id: 987654321`` arrives as an ``int``. Mirror the gateway
+    path's ``str(...)`` coercion so the typed single-bot schema accepts it.
+    """
+    if v is None:
+        return None
+    text = str(v).strip()
+    return text or None
+
+
 class ChannelConfigSchema(BaseModel):
     """Schema for a single channel configuration.
 
@@ -322,6 +482,11 @@ class ChannelConfigSchema(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     platform: Optional[str] = None
+    # Explicit enable/disable switch (Issue #4779). Defaults to True so every
+    # declared channel keeps working. Set ``enabled: false`` to opt a channel
+    # out — an explicit opt-out that also suppresses credential-presence
+    # auto-enablement for that platform even when its token env var is set.
+    enabled: bool = True
     # Zero-code custom channel (Issue #4104): point a channel at an adapter
     # class by dotted import string (``"pkg.mod:AdapterClass"``) so a custom
     # platform is reachable from YAML/CLI with no packaging or bootstrap Python.
@@ -338,16 +503,34 @@ class ChannelConfigSchema(BaseModel):
     group_policy: str = "mention_only"  # respond_all, mention_only, command_only, observe (record unmentioned msgs as context)
     allow_silence: bool = False  # Allow agent to return NO_REPLY to stay silent
     silence_token: Optional[str] = None  # Custom silence token (defaults to NO_REPLY)
+    # Bot-to-bot inbound (#5062). Off by default: bot-authored inbound messages
+    # are dropped as before. When ``allow_bots: true`` the channel accepts
+    # bot-authored messages and the core ``BotLoopGuard`` auto-breaks a runaway
+    # A<->B reply loop using ``bot_loop_protection``'s sliding-window pair budget
+    # (enabled / max_events_per_window / window_seconds / cooldown_seconds).
+    allow_bots: bool = False
+    bot_loop_protection: Optional[Dict[str, Any]] = None
     allowlist: List[str] = Field(default_factory=list)
     blocklist: List[str] = Field(default_factory=list)
     allowed_users: List[str] = Field(default_factory=list)  # Changed to List for consistency
+    # Inbound admission policy for users not on the allowlist (Issue #2855 /
+    # #5093): "deny" (default, silently drop), "pair" (route through pairing),
+    # or "allow" (open DMs). Declared here so both the gateway and the
+    # ``praisonai bot start`` CLI wire it into BotConfig from the same field.
+    unknown_user_policy: Optional[str] = None
+    owner_user_id: Optional[str] = None  # Owner user ID for pairing approvals
     admin_users: Optional[str] = None  # Comma-separated list of admin user IDs
     user_allowed_commands: Optional[str] = None  # Comma-separated list of allowed commands
     routes: Dict[str, str] = Field(default_factory=dict)  # Context -> agent_id mapping
     routing: Optional[Dict[str, str]] = None  # Alias for routes
     bindings: List[Dict[str, Any]] = Field(default_factory=list)  # Priority-ordered route bindings (Issue #2225)
     webhook_url: Optional[str] = None
-    webhook_port: int = 8080
+    # Issue #5146: default is now None ("shared-listener" mode) so a webhook
+    # channel is served through the gateway's single HTTP listener at
+    # ``/webhooks/<channel>`` — one port, one public URL, routed by path — with
+    # no per-channel port collision. Setting an explicit port keeps the legacy
+    # standalone-server behaviour (backward-compatible opt-out).
+    webhook_port: Optional[int] = None
     streaming: Optional[StreamingConfigSchema] = None
     home_channel: Optional[str] = None  # Default channel for this platform
     aliases: Dict[str, str] = Field(default_factory=dict)  # Friendly name -> channel_id mapping
@@ -411,6 +594,25 @@ class ChannelConfigSchema(BaseModel):
             )
         return v
     
+    @field_validator("allowlist", "blocklist", "allowed_users", mode="before")
+    @classmethod
+    def split_comma_separated(cls, v):
+        """Accept a comma-separated string, not just a list.
+
+        These were widened to List[str] "for consistency", which made YAML
+        reject the exact form the CLI accepts: `--respond-to 123,456` is split
+        on commas in bots_cli (allowed_numbers = respond_to_raw.split(",")),
+        but `allowed_users: "123,456"` in bot.yaml raised a ValidationError.
+        Same setting, same value, two entry points, one of them broken.
+
+        Comma-separated strings are already this schema's convention -- see
+        admin_users and user_allowed_commands directly below these fields.
+        Lists pass through untouched.
+        """
+        if isinstance(v, str):
+            return [item.strip() for item in v.split(",") if item.strip()]
+        return v
+
     @field_validator("token", "app_token", "verify_token", mode="before")
     @classmethod
     def resolve_secret_ref(cls, v):
@@ -477,6 +679,26 @@ class ChannelConfigSchema(BaseModel):
             return ""
         return result.value
     
+    @field_validator("unknown_user_policy")
+    @classmethod
+    def validate_unknown_user_policy(cls, v: str) -> str:
+        """Fail-closed on an unknown access policy selector (Issue #5092).
+
+        The runtime ``BotConfig`` rejects anything outside deny/allow/pair, so
+        a typo (``alow``/``dney``) must be caught at load time here rather than
+        passing schema validation, being reported as ``deny`` by the startup
+        banner, and then silently disabling the channel when ``BotConfig`` is
+        constructed later.
+        """
+        allowed = {"deny", "allow", "pair"}
+        normalized = (v or "deny").strip().lower()
+        if normalized not in allowed:
+            raise ValueError(
+                f"Invalid unknown_user_policy '{v}'. Must be one of: "
+                f"{', '.join(sorted(allowed))}"
+            )
+        return normalized
+
     @field_validator("group_policy")
     @classmethod
     def validate_group_policy(cls, v: str) -> str:
@@ -486,6 +708,29 @@ class ChannelConfigSchema(BaseModel):
                 f"Invalid group_policy '{v}'. Must be one of: {', '.join(sorted(allowed))}"
             )
         return v
+
+    @field_validator("unknown_user_policy")
+    @classmethod
+    def validate_unknown_user_policy(cls, v: Optional[str]) -> Optional[str]:
+        """Fail-closed on a typo'd admission policy (Issue #5093).
+
+        A misspelled ``unknown_user_policy`` (``alow``/``deney``) must be
+        rejected at load time rather than silently falling back to the secure
+        ``deny`` default and leaving the operator debugging a "broken" bot.
+        """
+        return _normalize_unknown_user_policy(v)
+
+    @field_validator("owner_user_id", mode="before")
+    @classmethod
+    def coerce_owner_user_id(cls, v):
+        """Accept a numeric or string owner id (Issue #5093).
+
+        Telegram/Discord owner ids are naturally numeric, so an unquoted
+        ``owner_user_id: 987654321`` in YAML arrives as an ``int``. The gateway
+        path already coerces via ``str(...)``; mirror that here so the typed
+        ``praisonai bot start`` schema does not reject valid input.
+        """
+        return _coerce_owner_user_id(v)
 
     @field_validator("approval_mode")
     @classmethod
@@ -514,12 +759,31 @@ class ChannelConfigSchema(BaseModel):
         if self.routing and not self.routes:
             self.routes = self.routing
             
-        # Warn about empty allowed_users (open to everyone)
+        # Report the effective access policy for empty allowlists. With no
+        # allowlist configured the behaviour depends on unknown_user_policy, so
+        # the message must match the resolved policy rather than always claiming
+        # the bot responds to everyone (Issue #5092).
         if not self.allowed_users and not self.allowlist and not self.blocklist:
-            logger.warning(
-                "Channel has no user restrictions (allowed_users/allowlist/blocklist). "
-                "Bot will respond to EVERYONE. Consider adding allowed_users for security."
-            )
+            policy = (self.unknown_user_policy or "deny").lower()
+            if policy == "allow":
+                logger.warning(
+                    "Channel has no user restrictions (allowed_users/allowlist/blocklist) "
+                    "and unknown_user_policy=allow. Bot will respond to EVERYONE. "
+                    "Consider adding allowed_users for security."
+                )
+            elif policy == "pair":
+                logger.info(
+                    "Channel has no allowed_users and unknown_user_policy=pair. "
+                    "Unknown users must complete pairing before the bot replies."
+                )
+            else:  # deny (the validated default)
+                logger.warning(
+                    "Channel has no allowed_users and unknown_user_policy=deny. "
+                    "DMs from users not in allowed_users (and not already paired) "
+                    "are dropped and the bot responds to NOBODY new. Set "
+                    "unknown_user_policy=allow or add allowed_users to let users "
+                    "through."
+                )
             
         # Warn about respond_all in production
         if self.group_policy == "respond_all":
@@ -689,6 +953,23 @@ class GatewayServerSchema(BaseModel):
         return v
 
 
+class HookCoalesceSchema(BaseModel):
+    """``hooks[].coalesce`` — mirrors core ``CoalesceConfig`` (#5867)."""
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+
+    group_key: str = Field(min_length=1)
+    window_seconds: float = Field(default=30.0, gt=0)
+    max_wait_seconds: float = Field(default=300.0, gt=0)
+
+    @model_validator(mode="after")
+    def validate_max_wait(self) -> "HookCoalesceSchema":
+        if not self.group_key.strip():
+            raise ValueError("coalesce.group_key must be a non-empty template")
+        if self.max_wait_seconds < self.window_seconds:
+            raise ValueError("coalesce.max_wait_seconds must be >= window_seconds")
+        return self
+
+
 class HookSchema(BaseModel):
     """Schema for a single inbound trigger hook (``hooks:`` entries, #2281).
 
@@ -713,11 +994,19 @@ class HookSchema(BaseModel):
     signature_header: Optional[str] = None
     signature_algo: str = "sha256"
     signature_prefix: Optional[str] = None
+    # Signature scheme + replay window (#5866)
+    signature_scheme: Literal[
+        "hmac_hex", "hmac_base64", "hmac_timestamped", "structured"
+    ] = "hmac_hex"
+    timestamp_header: Optional[str] = None
+    signature_tolerance_seconds: int = Field(default=300, ge=0)
     # Event-type filtering (#3165)
     events: Optional[List[str]] = None
     event_header: Optional[str] = None
     # No-LLM pass-through delivery (#3165)
     deliver_only: bool = False
+    # Burst coalescing (#5867): {group_key, window_seconds, max_wait_seconds}
+    coalesce: Optional[HookCoalesceSchema] = None
 
     @field_validator("path")
     @classmethod
@@ -753,13 +1042,44 @@ class GatewayConfigSchema(BaseModel):
     # Top-level fields for single-bot compatibility
     platform: Optional[str] = None
     token: Optional[str] = None
-    
+    # Slack Socket Mode needs an app-level token in addition to the bot token.
+    # Accepted at the top level of a single-bot ``bot.yaml`` and carried into
+    # the migrated Slack channel below so ``app_token`` is not silently dropped
+    # (a plaintext top-level ``app_token`` used to never reach the adapter).
+    app_token: Optional[Union[str, Dict[str, Any]]] = None
+    # Single-bot admission policy (Issue #5093): a ``bot.yaml`` may declare
+    # ``unknown_user_policy``/``owner_user_id`` at the top level alongside
+    # ``platform:``/``token:``. These are migrated onto the synthesised channel
+    # below so the ``praisonai bot start`` path wires them into BotConfig.
+    unknown_user_policy: Optional[str] = None
+    owner_user_id: Optional[str] = None
+
+    # Set by the single-bot migration when a top-level ``platform:`` was
+    # declared. Credential-presence autofill uses it to refuse to bring up any
+    # *other* platform behind the operator's back (a ``platform: telegram``
+    # config must never start a Discord bot because ``DISCORD_BOT_TOKEN``
+    # happened to be exported).
+    _explicit_single_platform: Optional[str] = PrivateAttr(default=None)
+
     # Agent configuration (single or multiple)
     agent: Optional[AgentConfigSchema] = None
     agents: Optional[Dict[str, AgentConfigSchema]] = None
     
     # Channel configuration
     channels: Dict[str, ChannelConfigSchema] = Field(default_factory=dict)
+
+    # Named sender sets referenced from channel allow/block lists as
+    # ``group:<name>`` (Issue #5775); expanded by the gateway loader.
+    access_groups: Optional[Dict[str, Union[List[str], str]]] = None
+
+    # Credential-presence auto-enablement (Issue #4779). When true (default),
+    # the gateway auto-registers a channel for any known platform whose
+    # credential env var(s) are present and that the user has neither declared
+    # nor explicitly disabled — so ``export TELEGRAM_BOT_TOKEN=... && praisonai
+    # gateway`` brings up a working bot with no ``channels:`` block. Explicit
+    # ``channels:`` entries and ``enabled: false`` always win. Set to false to
+    # restore the strict "must declare a channel" behaviour.
+    auto_enable_from_env: bool = True
     
     # Platform dict for BotOS compatibility
     platforms: Optional[Dict[str, Dict[str, Any]]] = None
@@ -767,6 +1087,24 @@ class GatewayConfigSchema(BaseModel):
     # Routing and daemon config
     routing: Optional[RoutingConfigSchema] = None
     daemon: Optional[DaemonConfigSchema] = None
+
+    # Declarative recurring agent→channel deliveries (Issue #4913). Each entry
+    # is coerced into a core ``ScheduleJob`` and loaded into the existing
+    # ``ScheduleRunner`` store at boot, so an unattended automation lives in the
+    # same file as agents/channels (config-as-code parity). Keyed by a stable
+    # name used to derive an idempotent job id.
+    #
+    # Kept as raw dicts (not strict ``ScheduleConfigSchema``) so a single
+    # malformed entry does not reject the entire gateway config and block
+    # startup — the boot-time loader validates each entry independently and
+    # skips only the bad one (best-effort). ``normalize_and_validate`` still
+    # surfaces a warning per invalid entry so the operator sees it.
+    schedules: Optional[Dict[str, Dict[str, Any]]] = None
+
+    # Multi-agent conversation rooms (Issue #5768). Each ``rooms.<name>`` entry
+    # (``agents:``/``roster:``, ``max_rounds``, ``max_messages``) is parsed by
+    # core ``RoomConfig.from_dict`` and bound like an agent via ``room:<name>``.
+    rooms: Optional[Dict[str, Dict[str, Any]]] = None
 
     # Gateway server settings (host/port, drain_timeout, admission control,
     # etc.) and inbound trigger hooks. Kept as dicts/lists on this model so
@@ -777,7 +1115,43 @@ class GatewayConfigSchema(BaseModel):
     # friendly, field-named error instead of being silently dropped (#3050).
     gateway: Optional[Dict[str, Any]] = None
     hooks: Optional[List[Dict[str, Any]]] = None
-    
+
+    @field_validator("rooms")
+    @classmethod
+    def validate_rooms(
+        cls, v: Optional[Dict[str, Dict[str, Any]]]
+    ) -> Optional[Dict[str, Dict[str, Any]]]:
+        """Reject an unbuildable room at load time, naming it (Issue #5768)."""
+        if v:
+            from praisonaiagents.rooms import RoomConfig
+
+            for name, data in v.items():
+                try:
+                    RoomConfig.from_dict(str(name), data or {})
+                except (TypeError, ValueError) as e:
+                    raise ValueError(f"rooms.{name}: {e}") from e
+        return v
+
+    @field_validator("unknown_user_policy")
+    @classmethod
+    def validate_top_level_unknown_user_policy(
+        cls, v: Optional[str]
+    ) -> Optional[str]:
+        """Fail-closed on a typo'd top-level admission policy (Issue #5093).
+
+        A top-level ``unknown_user_policy`` is only migrated onto a synthesised
+        channel when ``platform`` is set and no ``channels:`` block exists, so
+        without this it could be silently accepted (and ignored) in mixed
+        configs. Validate it here too, sharing the channel-level rule.
+        """
+        return _normalize_unknown_user_policy(v)
+
+    @field_validator("owner_user_id", mode="before")
+    @classmethod
+    def coerce_top_level_owner_user_id(cls, v):
+        """Coerce an unquoted numeric top-level owner id (Issue #5093)."""
+        return _coerce_owner_user_id(v)
+
     @model_validator(mode="after")
     def normalize_and_validate(self):
         """Normalize different config formats to canonical form and validate."""
@@ -791,15 +1165,71 @@ class GatewayConfigSchema(BaseModel):
         if self.hooks is not None:
             for entry in self.hooks:
                 HookSchema(**entry)
-        # Migrate single-bot format (platform + token at top level)
-        if self.platform and self.token and not self.channels:
-            self.channels = {
-                self.platform: ChannelConfigSchema(
-                    platform=self.platform,
-                    token=self.token
-                )
+        # Validate declarative schedules per-entry, non-fatally (#4913). A bad
+        # schedule must NOT block the whole gateway from starting — the
+        # boot-time loader already skips invalid entries — so we surface a
+        # warning here for early operator feedback instead of raising.
+        if self.schedules:
+            import logging as _logging
+            _log = _logging.getLogger(__name__)
+            for _name, _spec in self.schedules.items():
+                if not isinstance(_spec, dict):
+                    _log.warning(
+                        "Ignoring malformed schedule %r (not a mapping)", _name
+                    )
+                    continue
+                try:
+                    ScheduleConfigSchema(**_spec)
+                except Exception as _e:
+                    _log.warning("Ignoring invalid schedule %r: %s", _name, _e)
+        # Migrate single-bot format (``platform:`` at top level).
+        #
+        # ``token:`` is deliberately NOT required here. Supplying the token via
+        # the environment (``export TELEGRAM_BOT_TOKEN=...``) is the documented
+        # way to run a single-bot ``bot.yaml``, and the old ``and self.token``
+        # guard dropped the declared platform entirely in that case — leaving
+        # ``channels`` empty so ``_autofill_channels_from_env`` below invented
+        # channels from whatever unrelated credentials happened to be in the
+        # environment. A config saying ``platform: telegram`` could therefore
+        # start a *Discord* bot with no warning. The declared platform now
+        # always wins, wherever its token comes from.
+        if self.platform and not self.channels:
+            declared_platform = self.platform.lower().strip()
+            token = self.token
+            if not token:
+                # No inline token: point the channel at the declared platform's
+                # own credential env var. This narrows nothing and widens
+                # nothing — it resolves exactly the variable this platform
+                # already documents, and an unset one degrades through the
+                # existing "channel skipped" path rather than silently
+                # switching platforms.
+                token = self._credential_env_ref(declared_platform)
+            channel_kwargs: Dict[str, Any] = {
+                "platform": declared_platform,
+                "token": token,
             }
-            
+            # Carry a top-level ``app_token`` (Slack Socket Mode's app-level
+            # token) into the channel so it reaches the adapter. Without this a
+            # plaintext top-level ``app_token`` was silently dropped and Socket
+            # Mode fell back to (or failed on) the env var alone. Scoped to
+            # Slack: ``app_token`` is Slack-specific, so forwarding it to a
+            # non-Slack custom adapter with a strict constructor could keep the
+            # channel from starting.
+            if declared_platform == "slack" and self.app_token is not None:
+                channel_kwargs["app_token"] = self.app_token
+            # Carry the top-level single-bot admission policy (Issue #5093) onto
+            # the synthesised channel so ``praisonai bot start`` wires it into
+            # BotConfig. Only forward when set so channel defaults/validation are
+            # unaffected when the operator omits them.
+            if self.unknown_user_policy is not None:
+                channel_kwargs["unknown_user_policy"] = self.unknown_user_policy
+            if self.owner_user_id is not None:
+                channel_kwargs["owner_user_id"] = self.owner_user_id
+            self.channels = {
+                declared_platform: ChannelConfigSchema(**channel_kwargs)
+            }
+            self._explicit_single_platform = declared_platform
+
         # Migrate BotOS platforms format to channels
         if self.platforms and not self.channels:
             for platform_name, platform_config in self.platforms.items():
@@ -808,11 +1238,30 @@ class GatewayConfigSchema(BaseModel):
                     **platform_config
                 )
                 
+        # Credential-presence auto-enablement (Issue #4779). Runs BEFORE the
+        # "no channels configured" guard so a present platform credential
+        # brings a channel up with zero ``channels:`` config. Explicit
+        # ``channels:`` entries and ``enabled: false`` always win (handled
+        # inside), so this is fully backward compatible.
+        self._autofill_channels_from_env()
+
+        # Drop channels the user explicitly disabled (``enabled: false``) so
+        # they are neither started nor validated as active. Captured after
+        # auto-enable (which already skips disabled platforms) so an explicit
+        # opt-out stays authoritative.
+        self.channels = {
+            name: channel
+            for name, channel in self.channels.items()
+            if getattr(channel, "enabled", True)
+        }
+
         # Ensure at least one channel is configured
         if not self.channels:
             raise ValueError(
                 "No channels configured. Add at least one channel "
-                "(telegram, discord, slack, whatsapp) to your config"
+                "(telegram, discord, slack, whatsapp) to your config, "
+                "or set a platform credential env var (e.g. "
+                "TELEGRAM_BOT_TOKEN) to auto-enable one."
             )
             
         # Zero-code custom channels (Issue #4104): a channel may point at an
@@ -887,6 +1336,123 @@ class GatewayConfigSchema(BaseModel):
                     channel.apply_channel_descriptor(descriptor)
 
         return self
+
+    def _default_agent_id(self) -> str:
+        """Resolve the agent id to route auto-enabled channels to (#4779).
+
+        Prefers an explicit ``routing.default``; then the first declared
+        ``agents:`` key; then the single-bot ``agent`` name; falling back to
+        ``"assistant"`` (the default agent name). This mirrors how a
+        hand-written channel's ``routes.default`` would name its agent.
+        """
+        if self.routing and self.routing.default:
+            return self.routing.default
+        if self.agents:
+            return next(iter(self.agents))
+        if self.agent and getattr(self.agent, "name", None):
+            return self.agent.name
+        return "assistant"
+
+    def _autofill_channels_from_env(self) -> None:
+        """Auto-register channels from present platform credentials (#4779).
+
+        For every registered platform whose credential env var(s) are all
+        present, and which the user has neither declared under ``channels:``
+        nor explicitly disabled (``enabled: false``), register a channel with
+        default routes (all traffic → the default agent). No-op when
+        ``auto_enable_from_env`` is false. Explicit config always wins: a
+        platform already present in ``self.channels`` (enabled or disabled) is
+        never touched. Best-effort — a registry failure leaves ``channels``
+        unchanged so the existing "no channels" guard still applies.
+        """
+        if not self.auto_enable_from_env:
+            return
+        try:
+            from ._registry import (
+                get_platform_credential_env,
+                list_platforms,
+            )
+        except Exception:  # pragma: no cover - registry always in-tree
+            return
+
+        # Platforms the user already spoke to — by config key or by the
+        # channel's ``platform`` — must not be auto-enabled again (explicit
+        # config, incl. an explicit ``enabled: false`` opt-out, wins).
+        declared = set()
+        for name, channel in self.channels.items():
+            declared.add(name.lower())
+            plat = getattr(channel, "platform", None)
+            if plat:
+                declared.add(plat.lower())
+
+        try:
+            platforms = list(list_platforms())
+        except Exception:
+            return
+
+        default_agent = self._default_agent_id()
+        # A single-bot config that names one ``platform:`` has *declared* what
+        # it wants to run. Auto-enabling a second platform from an unrelated
+        # credential that happens to be in the environment would silently widen
+        # the config beyond what the operator wrote, so it is refused — loudly,
+        # naming each platform that was skipped and how to opt in.
+        explicit_single = self._explicit_single_platform
+        skipped_for_explicit: List[str] = []
+        for platform in platforms:
+            key = platform.lower()
+            if key in declared:
+                continue
+            try:
+                cred_vars = get_platform_credential_env(key)
+            except Exception:
+                cred_vars = ()
+            if not cred_vars:
+                continue
+            if not all(os.environ.get(v) for v in cred_vars):
+                continue
+            if explicit_single is not None and key != explicit_single:
+                skipped_for_explicit.append(key)
+                continue
+            self.channels[key] = ChannelConfigSchema(
+                platform=key,
+                token="${%s}" % cred_vars[0],
+                routes={
+                    "dm": default_agent,
+                    "group": default_agent,
+                    "default": default_agent,
+                },
+            )
+            logger.info(
+                "Auto-enabled channel %r from %s", key, cred_vars[0]
+            )
+
+        if skipped_for_explicit:
+            logger.warning(
+                "Config declares 'platform: %s'; NOT auto-enabling %s despite "
+                "their credentials being present in the environment. The "
+                "declared platform wins. To run them too, list them under "
+                "'channels:' explicitly.",
+                explicit_single,
+                ", ".join(sorted(skipped_for_explicit)),
+            )
+
+    @staticmethod
+    def _credential_env_ref(platform: str) -> str:
+        """``"${ENV}"`` for a platform's primary credential var, else ``""``.
+
+        Used by the single-bot migration when ``platform:`` is declared without
+        an inline ``token:``. Resolves only the variable that *this* platform
+        already documents — it discovers nothing new from the environment.
+        """
+        try:
+            from ._registry import get_platform_credential_env
+
+            cred_vars = get_platform_credential_env(platform)
+        except Exception:
+            return ""
+        if not cred_vars:
+            return ""
+        return "${%s}" % cred_vars[0]
 
     def _register_adapter_refs(self) -> None:
         """Import & self-register any channel declaring an ``adapter:`` ref.
@@ -1010,6 +1576,8 @@ class GatewayConfigSchema(BaseModel):
         agent_ids = set(self.agents or {})
         if not agent_ids:
             return
+        # Declared rooms are routable as ``room:<name>`` (Issue #5768).
+        agent_ids |= {f"room:{name}" for name in (self.rooms or {})}
 
         import difflib
 
@@ -1041,6 +1609,184 @@ class GatewayConfigSchema(BaseModel):
 
 # Legacy alias for backward compatibility
 BotYamlSchema = GatewayConfigSchema
+
+
+def _allow_integer_owner_id(node: Any) -> None:
+    """Widen an ``owner_user_id`` property to also accept an integer (#5414).
+
+    ``GatewayConfigSchema``/``ChannelConfigSchema`` type ``owner_user_id`` as
+    ``Optional[str]`` but a ``mode="before"`` validator (``_coerce_owner_user_id``)
+    accepts an unquoted numeric YAML id (``owner_user_id: 987654321``) by casting
+    it to ``str``. Pydantic emits the schema from the *field type* only, so the
+    published schema would reject a config the runtime explicitly accepts. Mirror
+    the runtime coercion by adding ``integer`` to the allowed types so editor/CI
+    validation agrees with the gateway.
+    """
+    if not isinstance(node, dict):
+        return
+    props = node.get("properties")
+    if not isinstance(props, dict):
+        return
+    owner = props.get("owner_user_id")
+    if not isinstance(owner, dict):
+        return
+    variants = owner.get("anyOf")
+    if isinstance(variants, list):
+        has_int = any(
+            isinstance(v, dict) and v.get("type") == "integer" for v in variants
+        )
+        if not has_int:
+            variants.append({"type": "integer"})
+    elif owner.get("type") == "string":
+        owner.pop("type", None)
+        owner["anyOf"] = [{"type": "string"}, {"type": "integer"}]
+
+
+def _allow_env_ref_list(node: Any, field_names: tuple) -> None:
+    """Allow an array-typed field to also be a single ``${ENV}`` string (#5414).
+
+    ``${VAR}`` references are expanded *before* validation at load time, so an
+    operator may author ``allowed_users: ${TELEGRAM_ALLOWED_USERS}`` and have it
+    expand to a list. Editors validate the *unexpanded* YAML, so the published
+    schema must accept the string form for these fields too; otherwise it
+    false-flags a config the runtime happily accepts.
+    """
+    if not isinstance(node, dict):
+        return
+    props = node.get("properties")
+    if not isinstance(props, dict):
+        return
+    for name in field_names:
+        field = props.get(name)
+        if not isinstance(field, dict):
+            continue
+        if field.get("type") == "array":
+            array_variant = {k: v for k, v in field.items() if k not in ("default", "title")}
+            new_field: Dict[str, Any] = {
+                "anyOf": [array_variant, {"type": "string"}]
+            }
+            if "default" in field:
+                new_field["default"] = field["default"]
+            if "title" in field:
+                new_field["title"] = field["title"]
+            props[name] = new_field
+        elif isinstance(field.get("anyOf"), list):
+            variants = field["anyOf"]
+            if not any(
+                isinstance(v, dict) and v.get("type") == "string" for v in variants
+            ):
+                variants.append({"type": "string"})
+
+
+def gateway_config_json_schema() -> Dict[str, Any]:
+    """Canonical JSON Schema for ``gateway.yaml`` / ``bot.yaml`` (draft-07).
+
+    Derived directly from :class:`GatewayConfigSchema` (Pydantic's
+    ``model_json_schema``) and decorated with the standard ``$schema``/``$id``/
+    ``title`` metadata so the artefact is self-describing and mirrors the
+    ``agents.yaml`` convention (``generate_agents_schema``). This is the single
+    source of truth surfaced to editors (via the ``# yaml-language-server``
+    header) and to CI linting, so a mistyped key is flagged at author time
+    instead of only at gateway startup.
+
+    The raw ``model_json_schema()`` is post-processed so the *published* schema
+    faithfully reflects what the runtime actually validates (#5414):
+
+    - ``gateway`` / ``hooks`` are stored as opaque ``Dict``/``List[Dict]`` on the
+      model for downstream dict-style access, but validated field-by-field at
+      load time via :class:`GatewayServerSchema` / :class:`HookSchema`
+      (``extra="forbid"`` for the server block). Inline those typed schemas so a
+      misspelled server knob (``drain_timout``) or hook key is caught at author
+      time, not only at startup.
+    - ``owner_user_id`` (top-level and per-channel) also accepts an integer,
+      mirroring the runtime ``str(...)`` coercion of unquoted numeric ids.
+    - Unknown top-level keys are rejected so a typo (``auto_enable_from_en``)
+      that the runtime silently ignores is surfaced while authoring. Channel
+      configs keep ``additionalProperties`` open for plugin-declared keys.
+    """
+    base = GatewayConfigSchema.model_json_schema()
+    defs = base.setdefault("$defs", {})
+
+    # Inline the typed gateway-server + hook schemas so the published schema
+    # carries the same field-by-field constraints the runtime enforces, instead
+    # of the opaque ``{"type": "object"}`` Pydantic emits for ``Dict[str, Any]``.
+    server_schema = GatewayServerSchema.model_json_schema(
+        ref_template="#/$defs/{model}"
+    )
+    for name, definition in server_schema.pop("$defs", {}).items():
+        defs.setdefault(name, definition)
+    defs["GatewayServerSchema"] = server_schema
+
+    hook_schema = HookSchema.model_json_schema(ref_template="#/$defs/{model}")
+    for name, definition in hook_schema.pop("$defs", {}).items():
+        defs.setdefault(name, definition)
+    defs["HookSchema"] = hook_schema
+
+    props = base.get("properties", {})
+    if "gateway" in props:
+        props["gateway"] = {
+            "anyOf": [{"$ref": "#/$defs/GatewayServerSchema"}, {"type": "null"}],
+            "default": None,
+            "title": props["gateway"].get("title", "Gateway"),
+        }
+    if "hooks" in props:
+        props["hooks"] = {
+            "anyOf": [
+                {"type": "array", "items": {"$ref": "#/$defs/HookSchema"}},
+                {"type": "null"},
+            ],
+            "default": None,
+            "title": props["hooks"].get("title", "Hooks"),
+        }
+
+    # Accept unquoted numeric owner ids wherever they appear (top level +
+    # ChannelConfigSchema), matching the runtime coercion.
+    _allow_integer_owner_id(base)
+    channel_def = defs.get("ChannelConfigSchema")
+    if isinstance(channel_def, dict):
+        _allow_integer_owner_id(channel_def)
+        # ``${VAR}`` env references are substituted BEFORE validation at load time
+        # (``validate_gateway_config``), so a list-typed field may legitimately be
+        # authored as a single ``${ENV}`` string that expands to a list. The
+        # scaffolder writes ``allowed_users: ${TELEGRAM_ALLOWED_USERS}``, so an
+        # editor validating the *authored* (unexpanded) YAML must accept the
+        # string form too — otherwise the schema false-flags a config the runtime
+        # accepts. Widen the array-typed env-ref channel fields accordingly.
+        _allow_env_ref_list(channel_def, ("allowed_users", "allowlist", "blocklist"))
+
+    # Reject unknown top-level keys so an author-time typo is caught (the runtime
+    # silently ignores it, keeping the mistyped opt-out ineffective). Channels
+    # keep ``additionalProperties`` open for plugin-declared config keys.
+    #
+    # ``config_version`` is not a ``GatewayConfigSchema`` field — it is stamped at
+    # the top level by the doctor/start config-version machinery (and shipped in
+    # the sample ``gateway.yaml``). Declare it so the stricter schema accepts a
+    # stamped/migrated config instead of false-flagging it.
+    base.setdefault("properties", {}).setdefault(
+        "config_version",
+        {
+            "type": "integer",
+            "title": "Config Version",
+            "description": (
+                "Stamped by `praisonai gateway doctor --fix` / `start` to track "
+                "config migrations. Managed automatically."
+            ),
+        },
+    )
+    base.setdefault("additionalProperties", False)
+
+    schema: Dict[str, Any] = {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "$id": GATEWAY_SCHEMA_URL,
+        **base,
+        "title": "PraisonAI Gateway / Bot Configuration",
+        "description": (
+            "Schema for gateway.yaml / bot.yaml consumed by the PraisonAI "
+            "gateway and single-bot runtime (gateway server, agents, channels, "
+            "routing, schedules, hooks, streaming and delivery)."
+        ),
+    }
+    return schema
 
 
 def validate_gateway_config(raw: Dict[str, Any], apply_env_substitution: bool = True) -> GatewayConfigSchema:

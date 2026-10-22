@@ -39,7 +39,13 @@ __all__ = [
     "register_resolver",
     "register_secret_for_redaction",
     "redact_secrets",
+    "redact_outbound",
+    "OutboundRedactor",
     "is_secret_ref",
+    "sentinelize",
+    "desentinelize",
+    "has_sentinel",
+    "EgressGuardProtocol",
 ]
 
 # Valid built-in secret sources. ``exec`` runs a command whose stdout is the
@@ -287,3 +293,206 @@ def redact_secrets(text: str) -> str:
         if secret in text:
             text = text.replace(secret, _REDACTED)
     return text
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Outbound redaction — the safe-by-default reply-path primitive (Issue #5055).
+#
+# ``redact_secrets`` masks only values the framework has *seen* (resolved
+# credentials). An unregistered secret surfaced in a tool result or a document
+# would still slip through, so the outbound primitive additionally masks tokens
+# by *shape* (API keys, bearer tokens, ``AKIA…``, private-key blocks). This is
+# the counterpart to log redaction: it is applied to text on its way to a chat
+# user, before dispatch, by the wrapper's delivery seam.
+# ────────────────────────────────────────────────────────────────────────────
+
+# Credential-shaped patterns, matched by value (not key=value), so a naked token
+# echoed by the model or embedded in a tool result is caught even when never
+# registered. Kept deliberately narrow to avoid over-redacting ordinary text.
+_CREDENTIAL_SHAPE_PATTERNS = (
+    # OpenAI-style keys (sk-..., sk-proj-...), Anthropic (sk-ant-...)
+    r"\bsk-(?:ant-|proj-)?[A-Za-z0-9_-]{16,}\b",
+    # AWS access key id
+    r"\bAKIA[0-9A-Z]{16}\b",
+    # GitHub tokens (ghp_, gho_, ghu_, ghs_, ghr_, github_pat_)
+    r"\bgh[pousr]_[A-Za-z0-9]{16,}\b",
+    r"\bgithub_pat_[A-Za-z0-9_]{22,}\b",
+    # Google API key
+    r"\bAIza[0-9A-Za-z_-]{35}\b",
+    # Slack token
+    r"\bxox[baprs]-[0-9A-Za-z-]{10,}\b",
+    # Bearer token in an Authorization-style value
+    r"\bBearer\s+[A-Za-z0-9._-]{16,}\b",
+    # PEM private-key block
+    r"-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----"
+    r"[\s\S]*?-----END (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----",
+)
+
+_credential_shape_re = None
+
+
+def _get_credential_shape_re():
+    """Compile the credential-shape matcher lazily (stdlib ``re`` only)."""
+    global _credential_shape_re
+    if _credential_shape_re is None:
+        import re
+
+        _credential_shape_re = re.compile(
+            "|".join(f"(?:{p})" for p in _CREDENTIAL_SHAPE_PATTERNS)
+        )
+    return _credential_shape_re
+
+
+def redact_outbound(text: str) -> str:
+    """Scrub secrets from text on its way to a chat user (safe-by-default).
+
+    Combines the registered-value registry (:func:`redact_secrets`, holding
+    every resolved gateway credential) with a credential-shape regex so an
+    *unregistered* token surfaced in a tool result is still masked. Personal
+    data is intentionally out of scope here — an opt-in PII policy layers on top
+    via the wrapper/plugin hook — so ordinary text is never over-redacted.
+
+    Zero dependency, never raises: a scrubber error returns the registered-value
+    result rather than blocking delivery.
+    """
+    if not text or not isinstance(text, str):
+        return text
+    text = redact_secrets(text)
+    try:
+        text = _get_credential_shape_re().sub(_REDACTED, text)
+    except Exception:  # pragma: no cover — never block delivery on a regex bug
+        pass
+    return text
+
+
+@runtime_checkable
+class OutboundRedactor(Protocol):
+    """Overridable contract for scrubbing outbound text before dispatch.
+
+    The default implementation is :func:`redact_outbound`. A deployment may
+    supply its own (e.g. one that also applies a PII policy) and inject it at
+    the wrapper's delivery seam without importing anything heavy into core.
+    """
+
+    def redact(self, text: str) -> str: ...
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Secret sentinelisation — the egress-firewall contract (Issue #5722).
+#
+# Redaction masks a secret *after the fact* (it replaces the plaintext with
+# ``[REDACTED]``, which cannot be substituted back). A gateway driven by
+# untrusted inbound chat needs the opposite: the model must be able to
+# *reference* a credential without the plaintext ever entering model-visible
+# context (prompt, tool arguments, transcript), and the real value must be
+# re-inserted only at the moment a request egresses to an allowlisted host.
+#
+# This core seam owns only the *contract* — a reversible, opaque, per-process
+# sentinel token — and nothing heavy. The wrapper's egress guard implements
+# :class:`EgressGuardProtocol`, deciding (via the existing
+# ``policy.engine.check_network``) whether to substitute the real secret or
+# refuse. Stdlib only, no hot-path cost until a sentinel is actually minted.
+# ────────────────────────────────────────────────────────────────────────────
+
+# Opaque, unguessable per-process prefix. The random suffix keeps a sentinel
+# from colliding with ordinary text and from being forged across processes.
+_SENTINEL_PREFIX = "oc-sent-"
+_sentinel_to_secret: Dict[str, str] = {}
+_secret_to_sentinel: Dict[str, str] = {}
+_sentinel_lock = threading.Lock()
+_sentinel_re = None
+
+
+def _get_sentinel_re():
+    """Lazily compile the sentinel-token matcher (stdlib ``re`` only).
+
+    Fixed token shape: prefix + 32 hex chars (``token_hex(16)``). Matching this
+    lets egress helpers look up only the sentinels actually present in a
+    request, rather than scanning every token ever minted.
+    """
+    global _sentinel_re
+    if _sentinel_re is None:
+        import re
+
+        _sentinel_re = re.compile(re.escape(_SENTINEL_PREFIX) + r"[0-9a-f]{32}")
+    return _sentinel_re
+
+
+def sentinelize(secret: str) -> str:
+    """Return an opaque sentinel token standing in for ``secret``.
+
+    The model only ever sees the returned token; the plaintext is held in a
+    per-process map and never placed in prompts, tool arguments, transcripts or
+    logs. Calling again with the same secret returns the same token (stable
+    within a process). The secret is also registered for log redaction so an
+    accidental leak of the plaintext is still masked.
+
+    Any non-empty string is sentinelised — the opaque, randomly-minted token
+    never collides with ordinary text, so there is no minimum length (a short
+    PIN or password must be hidden just as a long key is). Only an empty or
+    non-string value is returned verbatim.
+    """
+    if not secret or not isinstance(secret, str):
+        return secret
+    with _sentinel_lock:
+        existing = _secret_to_sentinel.get(secret)
+        if existing is not None:
+            return existing
+        import secrets as _stdlib_secrets
+
+        token = f"{_SENTINEL_PREFIX}{_stdlib_secrets.token_hex(16)}"
+        _sentinel_to_secret[token] = secret
+        _secret_to_sentinel[secret] = token
+    register_secret_for_redaction(secret)
+    return token
+
+
+def desentinelize(text: str) -> str:
+    """Substitute every known sentinel in ``text`` back to its real secret.
+
+    Called by an egress guard *only* once a host has been allowlisted, to put
+    the real credential on the wire. Text with no sentinel is returned
+    unchanged, so this is safe to call on every outbound request.
+    """
+    if not text or not isinstance(text, str) or _SENTINEL_PREFIX not in text:
+        return text
+    tokens = set(_get_sentinel_re().findall(text))
+    if not tokens:
+        return text
+    with _sentinel_lock:
+        mapping = {t: _sentinel_to_secret[t] for t in tokens if t in _sentinel_to_secret}
+    for token, secret in mapping.items():
+        text = text.replace(token, secret)
+    return text
+
+
+def has_sentinel(text: str) -> bool:
+    """True if ``text`` contains a minted sentinel token.
+
+    An egress guard uses this to detect that a request carries a credential and
+    must therefore pass the host allowlist before :func:`desentinelize` runs.
+    """
+    if not text or not isinstance(text, str) or _SENTINEL_PREFIX not in text:
+        return False
+    candidates = _get_sentinel_re().findall(text)
+    if not candidates:
+        return False
+    with _sentinel_lock:
+        return any(token in _sentinel_to_secret for token in candidates)
+
+
+@runtime_checkable
+class EgressGuardProtocol(Protocol):
+    """Contract for the wrapper's secret-egress firewall.
+
+    The real guard lives in the wrapper (``praisonai``): it inspects an
+    outbound request, decides via the operator host allowlist whether a
+    credential may leave, and either substitutes the sentinel for the real
+    secret (:func:`desentinelize`) or refuses with an audited event. Core owns
+    only this seam — no proxy, no host enforcement, no heavy imports — so a
+    deployment can inject a guard without pulling anything heavy into core.
+    """
+
+    def sentinel_for(self, ref: "SecretRef") -> str: ...
+
+    def allow_egress(self, host: str, ref: "SecretRef") -> bool: ...

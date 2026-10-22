@@ -8,7 +8,6 @@ import asyncio
 import atexit
 from praisonaiagents._logging import get_logger
 import threading
-import inspect
 import json
 import time
 import uuid
@@ -35,7 +34,8 @@ except ImportError:
 logger = get_logger("mcp-http-stream")
 
 # Import shared utilities for thread-safe event loop and schema fixing
-from .mcp_schema_utils import ThreadLocalEventLoop, build_openai_tool_dict
+from ..trace.redact import redact_string
+from .mcp_schema_utils import ThreadLocalEventLoop, build_openai_tool_dict, build_tool_signature, get_running_loop_or_none, remote_tool_error
 
 # Thread-local event loop for async operations (thread-safe)
 _event_loop_manager = ThreadLocalEventLoop()
@@ -71,10 +71,66 @@ def _register_cleanup():
         atexit.register(_cleanup_all_clients)
         _cleanup_registered = True
 
+def _bounded_httpx_client_factory(max_response_bytes):
+    import httpx
+
+    class BoundedStream(httpx.AsyncByteStream):
+        def __init__(self, stream):
+            self.stream = stream
+
+        async def __aiter__(self):
+            total_bytes = 0
+            async for chunk in self.stream:
+                total_bytes += len(chunk)
+                if total_bytes > max_response_bytes:
+                    raise ValueError(f"MCP response exceeded maximum of {max_response_bytes} bytes")
+                yield chunk
+
+        async def aclose(self):
+            await self.stream.aclose()
+
+    class BoundedClient(httpx.AsyncClient):
+        async def send(self, request, *, stream=False, **kwargs):
+            response = await super().send(request, stream=True, **kwargs)
+            encoding = response.headers.get("content-encoding", "identity").lower()
+            if encoding not in ("", "identity"):
+                await response.aclose()
+                raise ValueError("Compressed MCP responses are not supported with a response byte limit")
+            content_length = response.headers.get("content-length")
+            try:
+                content_length = int(content_length) if content_length is not None else None
+            except ValueError:
+                content_length = None
+            if content_length is not None and content_length > max_response_bytes:
+                await response.aclose()
+                raise ValueError(f"MCP response exceeded maximum of {max_response_bytes} bytes")
+            response.stream = BoundedStream(response.stream)
+            if not stream:
+                try:
+                    await response.aread()
+                except BaseException:
+                    await response.aclose()
+                    raise
+                await response.aclose()
+            return response
+
+    def create_client(headers=None, timeout=None, auth=None):
+        request_headers = dict(headers or {})
+        request_headers["Accept-Encoding"] = "identity"
+        return BoundedClient(
+            headers=request_headers,
+            timeout=timeout,
+            auth=auth,
+            trust_env=True,
+        )
+
+    return create_client
+
 class HTTPStreamMCPTool:
     """A wrapper for an MCP tool that can be used with praisonaiagents."""
     
     def __init__(self, name: str, description: str, session: ClientSession, input_schema: Optional[Dict[str, Any]] = None, timeout: int = 60):
+        """Store the tool metadata, build its call signature, and remember the session's event loop."""
         self.name = name
         self.__name__ = name  # Required for Agent to recognize it as a tool
         self.__qualname__ = name  # Required for Agent to recognize it as a tool
@@ -85,43 +141,16 @@ class HTTPStreamMCPTool:
         self.timeout = timeout
         
         # Create a signature based on input schema
-        params = []
-        if input_schema and 'properties' in input_schema:
-            for param_name, prop_schema in input_schema['properties'].items():
-                # Determine type annotation based on schema
-                prop_type = prop_schema.get('type', 'string') if isinstance(prop_schema, dict) else 'string'
-                if prop_type == 'string':
-                    annotation = str
-                elif prop_type == 'integer':
-                    annotation = int
-                elif prop_type == 'number':
-                    annotation = float
-                elif prop_type == 'boolean':
-                    annotation = bool
-                elif prop_type == 'array':
-                    annotation = list
-                elif prop_type == 'object':
-                    annotation = dict
-                else:
-                    annotation = Any
-                
-                params.append(
-                    inspect.Parameter(
-                        name=param_name,
-                        kind=inspect.Parameter.POSITIONAL_OR_KEYWORD,
-                        default=inspect.Parameter.empty if param_name in input_schema.get('required', []) else None,
-                        annotation=annotation
-                    )
-                )
-        
-        self.__signature__ = inspect.Signature(params)
+        self.__signature__ = build_tool_signature(input_schema)
+        # The client creates this wrapper on the loop that owns ``session``
+        self._loop = get_running_loop_or_none()
         
     def __call__(self, **kwargs):
         """Synchronous wrapper for the async call."""
         logger.debug(f"Tool {self.name} called with args: {kwargs}")
         
-        # Use the global event loop
-        loop = get_event_loop()
+        # Run on the session's loop; the caller's thread-local loop is not running
+        loop = self._loop or get_event_loop()
         
         # Run the async call in the event loop
         future = asyncio.run_coroutine_threadsafe(self._async_call(**kwargs), loop)
@@ -129,14 +158,17 @@ class HTTPStreamMCPTool:
             # Wait for the result with a timeout
             return future.result(timeout=self.timeout)
         except Exception as e:
-            logger.error(f"Error calling tool {self.name}: {e}")
-            return f"Error: {str(e)}"
+            future.cancel()
+            logger.error(f"Error calling tool {self.name}: {e!r}")
+            return remote_tool_error(self.name, e, self.timeout)
     
     async def _async_call(self, **kwargs):
         """Call the tool with the provided arguments."""
         logger.debug(f"Async calling tool {self.name} with args: {kwargs}")
         try:
             result = await self.session.call_tool(self.name, kwargs)
+            if getattr(result, 'isError', False):
+                raise RuntimeError(f"MCP tool {self.name} failed: {result.content}")
             
             # Extract text from result
             if hasattr(result, 'content') and result.content:
@@ -477,7 +509,8 @@ class HTTPStreamMCPClient:
             raise ImportError(
                 "The installed 'mcp' package does not provide the Streamable HTTP "
                 "client (mcp.client.streamable_http.streamablehttp_client). "
-                "Upgrade it with: pip install -U 'mcp'"
+                "This transport was removed in mcp 2.x; install a compatible "
+                "version with: pip install \"mcp<2\""
             )
 
         # Use the server URL exactly as provided. The official
@@ -490,6 +523,13 @@ class HTTPStreamMCPClient:
         self.debug = debug
         self.timeout = timeout
         self.options = options or {}
+        self.max_response_bytes = self.options.get('max_response_bytes')
+        if self.max_response_bytes is not None and (
+            isinstance(self.max_response_bytes, bool)
+            or not isinstance(self.max_response_bytes, int)
+            or self.max_response_bytes <= 0
+        ):
+            raise ValueError("max_response_bytes must be a positive integer")
         self.session = None
         self.tools = []
         self.transport = None
@@ -510,24 +550,23 @@ class HTTPStreamMCPClient:
         
     def _initialize(self):
         """Initialize the connection and tools."""
-        # Use the global event loop
         loop = get_event_loop()
-        
-        # Start a background thread to run the event loop
-        def run_event_loop():
-            asyncio.set_event_loop(loop)
-            loop.run_forever()
-        
-        self.loop_thread = threading.Thread(target=run_event_loop, daemon=True)
-        self.loop_thread.start()
-        
+        self.loop_thread = None
+        if not loop.is_running():
+            def run_event_loop():
+                asyncio.set_event_loop(loop)
+                loop.run_forever()
+
+            self.loop_thread = threading.Thread(target=run_event_loop, daemon=True)
+            self.loop_thread.start()
+
         # Run the initialization in the event loop
         future = asyncio.run_coroutine_threadsafe(self._async_initialize(), loop)
         self.tools = future.result(timeout=self.timeout)
     
     async def _async_initialize(self):
         """Asynchronously initialize the connection and tools."""
-        logger.debug(f"Connecting to MCP server at {self.base_url}")
+        logger.debug(f"Connecting to MCP server at {redact_string(self.base_url)}")
 
         # Use the official MCP SDK's Streamable HTTP client so that the read and
         # write streams are proper anyio memory-object streams that ClientSession
@@ -537,16 +576,22 @@ class HTTPStreamMCPClient:
             raise ImportError(
                 "The installed 'mcp' package does not provide "
                 "mcp.client.streamable_http.streamablehttp_client. "
-                "Upgrade it with: pip install -U 'mcp'"
+                "This transport was removed in mcp 2.x; install a compatible "
+                "version with: pip install \"mcp<2\""
             )
 
         headers = self.options.get('headers') or None
 
-        self._streams_context = streamablehttp_client(
-            url=self.base_url,
-            headers=headers,
-            timeout=self.timeout,
-        )
+        client_options = {
+            "url": self.base_url,
+            "headers": headers,
+            "timeout": self.timeout,
+        }
+        if self.max_response_bytes is not None:
+            client_options["httpx_client_factory"] = _bounded_httpx_client_factory(
+                self.max_response_bytes
+            )
+        self._streams_context = streamablehttp_client(**client_options)
 
         # If any step of the handshake fails after a context has been entered,
         # unwind the already-entered contexts so we don't leak the httpx/anyio

@@ -1,6 +1,10 @@
 """Tests for the canonical inbound admission primitive (Issue #3780)."""
 
-from praisonaiagents.bots import IngressDecision, resolve_ingress_admission
+from praisonaiagents.bots import (
+    IngressDecision,
+    MentionFacts,
+    resolve_ingress_admission,
+)
 from praisonaiagents.bots.admission import (
     GATE_ALLOWLIST,
     GATE_BLOCKLIST,
@@ -178,9 +182,123 @@ def test_decision_is_frozen():
         raise AssertionError("IngressDecision should be frozen")
 
 
+def test_reply_to_bot_is_implicit_mention_by_default():
+    # Issue #5029: replying to the bot in a mention_only group is admitted
+    # without a re-typed @mention (reply is on by default).
+    d = resolve_ingress_admission(
+        chat_type="group", sender_id="u1", group_policy="mention_only",
+        mention=MentionFacts(reply_to_bot=True),
+    )
+    assert d.admit is True
+    assert d.reason_code == REASON_ALLOWED
+
+
+def test_quote_not_implicit_mention_by_default():
+    # A quote is a noisier signal and is not enabled by default.
+    d = resolve_ingress_admission(
+        chat_type="group", sender_id="u1", group_policy="mention_only",
+        mention=MentionFacts(quoted_bot=True),
+    )
+    assert d.admit is False
+    assert d.reason_code == REASON_GROUP_MENTION_ONLY
+
+
+def test_quote_admitted_when_enabled():
+    d = resolve_ingress_admission(
+        chat_type="group", sender_id="u1", group_policy="mention_only",
+        mention=MentionFacts(quoted_bot=True),
+        implicit_mentions={"reply", "quote"},
+    )
+    assert d.admit is True
+
+
+def test_reply_dropped_when_implicit_disabled():
+    # An operator can opt out of implicit mentions entirely.
+    d = resolve_ingress_admission(
+        chat_type="group", sender_id="u1", group_policy="mention_only",
+        mention=MentionFacts(reply_to_bot=True),
+        implicit_mentions=frozenset(),
+    )
+    assert d.admit is False
+    assert d.reason_code == REASON_GROUP_MENTION_ONLY
+
+
+def test_explicit_mention_facts_admitted():
+    d = resolve_ingress_admission(
+        chat_type="group", sender_id="u1", group_policy="mention_only",
+        mention=MentionFacts(explicit=True),
+    )
+    assert d.admit is True
+
+
+def test_thread_participant_admitted_when_enabled():
+    d = resolve_ingress_admission(
+        chat_type="group", sender_id="u1", group_policy="mention_only",
+        mention=MentionFacts(thread_participant=True),
+        implicit_mentions={"thread"},
+    )
+    assert d.admit is True
+
+
+def test_observe_admits_reply_to_bot():
+    d = resolve_ingress_admission(
+        chat_type="group", sender_id="u1", group_policy="observe",
+        mention=MentionFacts(reply_to_bot=True),
+    )
+    assert d.admit is True
+    assert d.observe is False
+
+
+def test_is_mention_shim_still_works_without_mention_facts():
+    d = resolve_ingress_admission(
+        chat_type="group", sender_id="u1", group_policy="mention_only",
+        is_mention=True,
+    )
+    assert d.admit is True
+
+
 def test_deterministic_same_inputs_same_output():
     kwargs = dict(
         chat_type="group", sender_id="u1", group_policy="mention_only",
         is_mention=False,
     )
     assert resolve_ingress_admission(**kwargs) == resolve_ingress_admission(**kwargs)
+
+
+# ── Named access groups (Issue #5775) ──────────────────────────────────────
+
+def test_expand_access_groups_nested_and_dedup():
+    from praisonaiagents.bots.admission import expand_access_groups
+
+    groups = {
+        "admins": ["111", "222"],
+        "team": ["group:admins", "333", "111"],
+    }
+    assert expand_access_groups(["group:team", "444"], groups) == [
+        "111", "222", "333", "444",
+    ]
+
+
+def test_expand_access_groups_passthrough_and_comma_string():
+    from praisonaiagents.bots.admission import expand_access_groups
+
+    assert expand_access_groups(["1", "2"], None) == ["1", "2"]
+    assert expand_access_groups("group:a", {"a": "5, 6"}) == ["5", "6"]
+    # Env-expanded "${ADMINS}" inside a list must still split into ids.
+    assert expand_access_groups(["group:a"], {"a": ["5,6", "7"]}) == ["5", "6", "7"]
+
+
+def test_expand_access_groups_unknown_fails_closed():
+    import pytest
+    from praisonaiagents.bots.admission import expand_access_groups
+
+    with pytest.raises(ValueError, match="Unknown access group"):
+        expand_access_groups(["group:missing"], {})
+
+
+def test_expand_access_groups_cycle_rejected():
+    import pytest
+    from praisonaiagents.bots.admission import expand_access_groups
+
+    with pytest.raises(ValueError, match="cycle"):
+        expand_access_groups(["group:a"], {"a": ["group:b"], "b": ["group:a"]})

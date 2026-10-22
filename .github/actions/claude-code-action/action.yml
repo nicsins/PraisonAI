@@ -66,27 +66,46 @@ runs:
   steps:
     - name: Install Claude Code
       shell: bash
-      run: npm install -g @anthropic-ai/claude-code
+      run: |
+        set -euo pipefail
+        # Opus 5.5+ requires Claude Code >= 2.1.280 (bundled @beta action ships 1.0.x).
+        npm install -g @anthropic-ai/claude-code@latest
+        INSTALLED=$(claude --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+        export INSTALLED
+        echo "Claude Code version: ${INSTALLED}"
+        node -e "
+          const installed = process.env.INSTALLED;
+          const min = '2.1.280';
+          const parts = (v) => v.split('.').map(Number);
+          const gte = (a, b) => {
+            const A = parts(a); const B = parts(b);
+            for (let i = 0; i < 3; i++) {
+              if (A[i] > B[i]) return true;
+              if (A[i] < B[i]) return false;
+            }
+            return true;
+          };
+          if (!installed || !gte(installed, min)) {
+            console.error('Claude Code ' + installed + ' is below minimum ' + min);
+            process.exit(1);
+          }
+          console.log('Claude Code ' + installed + ' OK (>= ' + min + ')');
+        "
 
+    # Written to a file and passed with --strict-mcp-config, so a PR's .mcp.json
+    # (the working directory may be a PR checkout) never starts a server.
     - name: Install GitHub MCP Server
       shell: bash
       env:
         INPUT_GITHUB_TOKEN: ${{ inputs.github_token }}
       run: |
-        claude mcp add-json github '{
-          "command": "docker",
-          "args": [
-            "run",
-            "-i",
-            "--rm",
-            "-e",
-            "GITHUB_PERSONAL_ACCESS_TOKEN",
-            "ghcr.io/github/github-mcp-server:sha-ff3036d"
-          ],
-          "env": {
-            "GITHUB_PERSONAL_ACCESS_TOKEN": "'"${INPUT_GITHUB_TOKEN}"'"
-          }
-        }'
+        umask 077
+        jq -n --arg token "$INPUT_GITHUB_TOKEN" '{mcpServers: {github: {
+          command: "docker",
+          args: ["run", "-i", "--rm", "-e", "GITHUB_PERSONAL_ACCESS_TOKEN", "ghcr.io/github/github-mcp-server:sha-ff3036d"],
+          env: {GITHUB_PERSONAL_ACCESS_TOKEN: $token}
+        }}}' > "$RUNNER_TEMP/claude-mcp.json"
+        echo "CLAUDE_MCP_CONFIG=$RUNNER_TEMP/claude-mcp.json" >> "$GITHUB_ENV"
 
     - name: Extract GitHub Context and Create Prompt
       shell: bash
@@ -270,12 +289,16 @@ runs:
         INPUT_DISALLOWED_TOOLS: ${{ inputs.disallowed_tools }}
         INPUT_TIMEOUT_MINUTES: ${{ inputs.timeout_minutes }}
         CLAUDE_CODE_SUBAGENT_MODEL: inherit
-        ANTHROPIC_DEFAULT_SONNET_MODEL: claude-sonnet-4-6
+        ANTHROPIC_DEFAULT_OPUS_MODEL: claude-opus-5-5
+        ANTHROPIC_DEFAULT_SONNET_MODEL: claude-sonnet-5-5
       run: |
         echo "🚀 Running Claude Code with GitHub context..."
         
         # Build command arguments
         CMD_ARGS=("-p" "--verbose" "--output-format" "stream-json")
+        # The working directory may be a PR checkout: never load its project or
+        # local settings (hooks, env, apiKeyHelper) or its MCP servers.
+        CMD_ARGS+=("--setting-sources" "user" "--strict-mcp-config" "--mcp-config=$CLAUDE_MCP_CONFIG")
         
         if [[ -n "$INPUT_MODEL" ]]; then
           CMD_ARGS+=("--model" "$INPUT_MODEL")
@@ -288,7 +311,7 @@ runs:
         fi
         
         # Add allowed tools (include GitHub tools by default)
-        TOOLS="mcp__github__get_issue,mcp__github__get_issue_comments,mcp__github__update_issue,mcp__github__search_issues,mcp__github__list_issues,mcp__github__create_comment,Read,Write,Edit,Bash"
+        TOOLS="mcp__github__get_issue,mcp__github__get_issue_comments,mcp__github__update_issue,mcp__github__search_issues,mcp__github__list_issues,mcp__github__add_issue_comment,mcp__github__get_pull_request,mcp__github__get_pull_request_files,mcp__github__get_pull_request_reviews,mcp__github__get_pull_request_status,Read,Write,Edit,Bash"
         if [[ -n "$INPUT_ALLOWED_TOOLS" ]]; then
           TOOLS="$TOOLS,$INPUT_ALLOWED_TOOLS"
         fi
@@ -328,6 +351,7 @@ runs:
         
         # Execute Claude Code with timeout, using stdin for the prompt
         TIMEOUT_SECONDS=$(($INPUT_TIMEOUT_MINUTES * 60))
-        timeout $TIMEOUT_SECONDS claude "${CMD_ARGS[@]}" < "$PROMPT_FILE"
+        timeout $TIMEOUT_SECONDS claude "${CMD_ARGS[@]}" < "$PROMPT_FILE" \
+          | tee "$GITHUB_WORKSPACE/.claude-assess-output.jsonl"
         
         echo "✅ Claude Code execution completed" 

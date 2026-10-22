@@ -157,18 +157,18 @@ _LAZY_COMMANDS: Dict[str, Tuple[str, str, str]] = {
     "diag": (".commands.diag", "app", "Diagnostics export"),
     "doctor": (".commands.doctor", "app", "Health checks and diagnostics"),
     "setup": (".commands.setup", "app", "Interactive onboarding / configuration wizard"),
-    "onboard": (".commands.onboard", "app", "Messaging bot onboarding wizard"),
+    "onboard": ("praisonai_bot.cli.commands.onboard", "app", "Messaging bot onboarding wizard"),
     "obs": (".commands.obs", "app", "Observability diagnostics and management"),
-    "validate": (".commands.validate", "app", "Validate YAML configuration files"),
+    "validate": ("praisonai.cli.commands.validate", "app", "Validate YAML configuration files"),
     "acp": (".commands.acp", "app", "Agent Client Protocol server"),
-    "mcp": (".commands.mcp", "app", "MCP server management"),
+    "mcp": ("praisonai_mcp.cli.commands.mcp", "app", "MCP server management"),
     "serve": (".commands.serve", "app", "API server management"),
     "daemon": (".commands.daemon", "app", "Warm local runtime (keeps MCP/provider clients hot)"),
     "attach": (".commands.attach", "app", "Attach to a live session on the warm runtime"),
-    "schedule": (".commands.schedule", "app", "Scheduler management"),
+    "schedule": ("praisonai.cli.commands.schedule", "app", "Scheduler management"),
     "run": (".commands.run", "app", "Run agents"),
     "checkpoint": (".commands.checkpoint", "app", "File-level checkpoint management (save/restore/diff)"),
-    "profile": (".commands.profile", "app", "Performance profiling and diagnostics"),
+    "profile": ("praisonai.cli.commands.profile", "app", "Performance profiling and diagnostics"),
     "benchmark": (".commands.benchmark", "app", "Comprehensive performance benchmarking"),
     "paths": (".commands.paths", "app", "Storage path inspection and migration"),
     
@@ -176,26 +176,26 @@ _LAZY_COMMANDS: Dict[str, Tuple[str, str, str]] = {
     "chat": (".commands.chat", "app", "Terminal-native interactive chat (REPL)"),
     "code": (".commands.code", "app", "Terminal-native code assistant"),
     "call": (".commands.call", "app", "Voice/call interaction mode"),
-    "realtime": (".commands.realtime", "app", "Realtime interaction mode"),
-    "train": (".commands.train", "app", "Model training and fine-tuning"),
+    "realtime": ("praisonai.cli.commands.realtime", "app", "Realtime interaction mode"),
+    "train": ("praisonai_train.cli.commands.train", "app", "Model training and fine-tuning"),
     "ui": (".commands.ui", "app", "Clean Chat UI (praisonaiui)"),
-    "context": (".commands.context", "app", "Context management"),
+    "context": ("praisonai.cli.commands.context", "app", "Context management"),
     "research": (".commands.research", "app", "Research and analysis"),
     "memory": (".commands.memory", "app", "Memory management"),
     "workflow": (".commands.workflow", "app", "Workflow management"),
     "tools": (".commands.tools", "app", "Tool management"),
-    "n8n": (".commands.n8n", "app", "n8n visual workflow editor integration"),
-    "knowledge": (".commands.knowledge", "app", "Knowledge base management (legacy)"),
-    "rag": (".commands.rag", "app", "RAG commands (legacy - use index/query instead)"),
+    "n8n": ("praisonai.cli.commands.n8n", "app", "n8n visual workflow editor integration"),
+    "knowledge": ("praisonai.cli.commands.knowledge", "app", "Knowledge base management (legacy)"),
+    "rag": ("praisonai.cli.commands.rag", "app", "RAG commands (legacy - use index/query instead)"),
     "agents": (".commands.agents", "app", "Agent management"),
     "agent": (".commands.agent", "app", "Custom agent definitions management"),
     "command": (".commands.command", "app", "Custom command definitions management"),
     "skills": (".commands.skills", "app", "Skill management"),
     "eval": (".commands.eval", "app", "Evaluation and testing"),
     "templates": (".commands.templates", "app", "Template management"),
-    "recipe": (".commands.recipe", "app", "Recipe management"),
+    "recipe": ("praisonai.cli.commands.recipe", "app", "Recipe management"),
     "todo": (".commands.todo", "app", "Todo/task management"),
-    "docs": (".commands.docs", "app", "Documentation management"),
+    "docs": ("praisonai.cli.commands.docs", "app", "Documentation management"),
     "commit": (".commands.commit", "app", "AI-assisted git commits"),
     "publish": (".commands.publish", "app", "Package publishing"),
     "hooks": (".commands.hooks", "app", "Hook management"),
@@ -205,44 +205,46 @@ _LAZY_COMMANDS: Dict[str, Tuple[str, str, str]] = {
     "package": (".commands.package", "app", "Package management"),
     "endpoints": (".commands.endpoints", "app", "API endpoint management"),
     "test": (".commands.test", "app", "Run test suite with tier and provider options"),
-    "examples": (".commands.examples", "app", "Run and manage example files"),
-    "batch": (".commands.batch", "app", "Run all PraisonAI scripts in current folder"),
-    "replay": (".commands.replay", "app", "Context replay for debugging agent execution"),
+    "examples": ("praisonai.cli.commands.examples", "app", "Run and manage example files"),
+    "batch": ("praisonai.cli.commands.batch", "app", "Run all PraisonAI scripts in current folder"),
+    "replay": ("praisonai.cli.commands.replay", "app", "Context replay for debugging agent execution"),
     "loop": (".commands.loop", "app", "Autonomous agent execution loops"),
     "tracker": (".commands.tracker", "app", "Autonomous agent tracking with step-by-step analysis"),
     "github": (".commands.github", "app", "GitHub native context tracking and Issue triage"),
-    "audit": (".commands.audit", "audit", "Compliance auditing"),
-    "managed": (".commands.managed", "app", "Managed Agents (Anthropic cloud-hosted backend)"),
+    "audit": ("praisonai.cli.commands.audit", "audit", "Compliance auditing"),
+    "managed": ("praisonai.cli.commands.managed", "app", "Managed Agents (Anthropic cloud-hosted backend)"),
     "models": (".commands.models", "app", "List and describe available models"),
+    "decisions": (".commands.decisions", "app", "System One / Jev typed decision models"),
     "backends": (".commands.backends", "app", "List registered CLI backends"),
 
-    # Wrapper-resident commands — see ``_WRAPPER_RESIDENT_COMMANDS`` below. These entries keep
-    # relative ``.commands.*`` paths so they are advertised in ``--help``, but
-    # ``get_command()`` re-routes them to the absolute ``praisonai.cli.commands.*``
-    # path at invocation time (the modules live in the main wrapper).
-    "bot": (".commands.bot", "app", "Messaging bots with full agent capabilities"),
-    "gateway": (".commands.gateway", "app", "Multi-bot WebSocket gateway server"),
-    "pairing": (".commands.pairing", "app", "Manage bot user pairing"),
-    "identity": (".commands.identity", "app", "Manage cross-platform user identity links"),
-    "kanban": (".commands.kanban", "app", "Kanban task management"),
-    "claw": (".commands.claw", "app", "PraisonAI Dashboard (full UI)"),
-    "mint_link": (".commands.mint_link", "app", "Generate gateway magic links"),
-    "dashboard": (".commands.dashboard", "app", "Unified Dashboard (Flow + Claw + UI)"),
+    # Resident commands — see ``_*_RESIDENT_COMMANDS`` below. Their implementation
+    # lives in a sibling package, so the entry carries that package's absolute
+    # module path (the dispatcher imports exactly what is written here). The
+    # entry itself is what advertises the command in ``--help``; the resident
+    # sets only decide whether it is shown/served when that package is missing.
+    "bot": ("praisonai_bot.cli.commands.bot", "app", "Messaging bots with full agent capabilities"),
+    "gateway": ("praisonai_bot.cli.commands.gateway", "app", "Multi-bot WebSocket gateway server"),
+    "pairing": ("praisonai_bot.cli.commands.pairing", "app", "Manage bot user pairing"),
+    "identity": ("praisonai_bot.cli.commands.identity", "app", "Manage cross-platform user identity links"),
+    "kanban": ("praisonai_bot.cli.commands.kanban", "app", "Kanban task management"),
+    "claw": ("praisonai_bot.cli.commands.claw", "app", "PraisonAI Dashboard (full UI)"),
+    "mint_link": ("praisonai_bot.cli.commands.mint_link", "app", "Generate gateway magic links"),
+    "dashboard": ("praisonai.cli.commands.dashboard", "app", "Unified Dashboard (Flow + Claw + UI)"),
 
-    "browser": (".commands.browser", "app", "Browser automation (extension bridge, CDP, Playwright)"),
+    "browser": ("praisonai_browser.cli.commands.browser", "app", "Browser automation (extension bridge, CDP, Playwright)"),
     "browser-tool": (".commands.browser_tool", "app", "praisonai-tools browser automation (snapshot/click/navigate)"),
     "plugins": (".commands.plugins", "app", "Plugin management and inspection"),
     "sandbox": (".commands.sandbox", "app", "Sandbox container management"),
-    "flow": (".commands.flow", "app", "Visual workflow builder (Langflow)"),
-    "langfuse": (".commands.langfuse", "app", "Langfuse observability platform"),
-    "langextract": (".commands.langextract", "app", "Langextract visual trace layer"),
+    "flow": ("praisonai.cli.commands.flow", "app", "Visual workflow builder (Langflow)"),
+    "langfuse": ("praisonai.cli.commands.langfuse", "app", "Langfuse observability platform"),
+    "langextract": ("praisonai.cli.commands.langextract", "app", "Langextract visual trace layer"),
     "port": (".commands.port", "app", "Manage port usage and resolve conflicts"),
     "up": (".commands.up", "app", "Start unified PraisonAI stack (Langfuse + Langflow)"),
 }
 
 # C9: Bot/channel commands implemented in ``praisonai_bot.cli.commands.*``.
-# ``get_command()`` loads them via ``praisonai_bot.cli.commands.{name}`` when the
-# bot package is installed; standalone ``praisonai-code`` hides them from ``--help``.
+# Their ``_LAZY_COMMANDS`` entries point there; ``get_command()`` serves them only
+# when the bot package is installed; standalone ``praisonai-code`` hides them from ``--help``.
 _BOT_RESIDENT_COMMANDS = frozenset({
     "bot",
     "gateway",
@@ -288,8 +290,8 @@ _WRAPPER_RESIDENT_COMMANDS = frozenset({
 })
 
 # C10: Training commands implemented in ``praisonai_train.cli.commands.*``.
-# ``get_command()`` loads them via ``praisonai_train.cli.commands.{name}`` when the
-# train package is installed; standalone ``praisonai-code`` hides them from ``--help``.
+# Their ``_LAZY_COMMANDS`` entries point there; ``get_command()`` serves them only
+# when the train package is installed; standalone ``praisonai-code`` hides them from ``--help``.
 _TRAIN_RESIDENT_COMMANDS = frozenset({
     "train",
 })
@@ -300,8 +302,8 @@ _DEPLOY_RESIDENT_COMMANDS = frozenset({
 })
 
 # C11: Browser automation commands implemented in ``praisonai_browser.cli.commands.*``.
-# ``get_command()`` loads them via ``praisonai_browser.cli.commands.{name}`` when the
-# browser package is installed; standalone ``praisonai-code`` hides them from ``--help``.
+# Their ``_LAZY_COMMANDS`` entries point there; ``get_command()`` serves them only
+# when the browser package is installed; standalone ``praisonai-code`` hides them from ``--help``.
 _BROWSER_RESIDENT_COMMANDS = frozenset({
     "browser",
 })
@@ -418,29 +420,26 @@ class LazyCommandGroup(TyperGroup):
         # Check regular lazy commands
         if name in _LAZY_COMMANDS:
             module_path, attr_name, _ = _LAZY_COMMANDS[name]
+            # Resident commands are implemented in a sibling package. Hide them
+            # (return ``None``, matching ``list_commands``) when that package is
+            # not installed, so a standalone install never tries the import.
+            if name in _BOT_RESIDENT_COMMANDS and not bot_package_available():
+                return None
+            if name in _TRAIN_RESIDENT_COMMANDS and not train_package_available():
+                return None
+            if name in _BROWSER_RESIDENT_COMMANDS and not browser_package_available():
+                return None
+            if name in _MCP_RESIDENT_COMMANDS and not mcp_package_available():
+                return None
+            if name in _WRAPPER_RESIDENT_COMMANDS and not wrapper_available():
+                return None
             try:
-                if name in _BOT_RESIDENT_COMMANDS:
-                    if not bot_package_available():
-                        return None
-                    module = importlib.import_module(f"praisonai_bot.cli.commands.{name}")
-                elif name in _TRAIN_RESIDENT_COMMANDS:
-                    if not train_package_available():
-                        return None
-                    module = importlib.import_module(f"praisonai_train.cli.commands.{name}")
-                elif name in _BROWSER_RESIDENT_COMMANDS:
-                    if not browser_package_available():
-                        return None
-                    module = importlib.import_module(f"praisonai_browser.cli.commands.{name}")
-                elif name in _MCP_RESIDENT_COMMANDS:
-                    if not mcp_package_available():
-                        return None
-                    module = importlib.import_module(f"praisonai_mcp.cli.commands.{name}")
-                elif name in _WRAPPER_RESIDENT_COMMANDS:
-                    if not wrapper_available():
-                        return None
-                    module = importlib.import_module(f"praisonai.cli.commands.{name}")
-                else:
-                    module = importlib.import_module(module_path, __package__)
+                # The table is the single source of truth for where a command
+                # lives: resident entries carry an absolute path (``__package__``
+                # is ignored for those), local ones a relative ``.commands.*``.
+                # ``tests/unit/test_lazy_command_paths.py`` imports every entry
+                # this same way so a dangling path fails in CI, not at first use.
+                module = importlib.import_module(module_path, __package__)
                 sub_app = getattr(module, attr_name)
                 if isinstance(sub_app, click.Command):
                     return sub_app
@@ -802,6 +801,23 @@ def main_callback(
         help="Enable observability (langfuse, langextract)",
         envvar="PRAISONAI_OBSERVE",
     ),
+    continue_session: bool = typer.Option(
+        False,
+        "--continue",
+        "-c",
+        help="Resume the most recent session in the interactive launch",
+    ),
+    session: Optional[str] = typer.Option(
+        None,
+        "--session",
+        "-s",
+        help="Resume a specific session ID in the interactive launch",
+    ),
+    fork: bool = typer.Option(
+        False,
+        "--fork",
+        help="Fork from the resumed session (requires --continue/--session)",
+    ),
 ):
     """
     PraisonAI - AI Agents Framework CLI.
@@ -895,6 +911,22 @@ def main_callback(
         from praisonai_code.llm.credentials import ensure_configured_or_onboard
         from praisonai_code._wrapper_bridge import wrapper_available
 
+        # Validate the continuity flags up-front (parity with `run`) so an
+        # invalid combination fails closed before any onboarding/model work
+        # (Issue #4910).
+        if fork and not (continue_session or session):
+            typer.echo(
+                "--fork requires --continue or --session to specify which "
+                "session to fork from",
+                err=True,
+            )
+            raise typer.Exit(1)
+        if continue_session and session:
+            typer.echo(
+                "Cannot use both --continue and --session together", err=True
+            )
+            raise typer.Exit(1)
+
         # The bare invocation only launches the wrapper-resident interactive
         # TUI. On a bare `pip install praisonai-code` the wrapper is absent and
         # the TUI path fails fast with its own install hint. Running the
@@ -907,9 +939,80 @@ def main_callback(
 
         from .interactive.async_tui import AsyncTUI, AsyncTUIConfig
 
+        # Resolve a session to resume when a continuity flag is present (Issue
+        # #4910), reusing the exact `run`/`chat` machinery so the bare
+        # interactive surface gains --continue/--session/--fork parity without
+        # duplicating persistence logic. No flag → resume_id stays None and the
+        # launch is byte-identical to before (fresh session).
+        resume_id: Optional[str] = None
+        restored_model: Optional[str] = None
+        if continue_session or session:
+            try:
+                from .state.project_sessions import (
+                    find_last_session,
+                    find_session_model,
+                    session_exists_anywhere,
+                )
+
+                if session:
+                    if session_exists_anywhere(session):
+                        resume_id = session
+                    else:
+                        typer.echo(f"Session not found: {session}", err=True)
+                        raise typer.Exit(1)
+                else:
+                    resume_id = find_last_session()
+                    if not resume_id:
+                        typer.echo(
+                            "No previous sessions found. Starting new session.",
+                            err=True,
+                        )
+
+                # Fork non-destructively so the resumed transcript is branched
+                # rather than mutated in place (parity with `run --fork`). An
+                # explicit --fork must fail closed: silently falling back to the
+                # source session would violate the non-destructive guarantee and
+                # let subsequent turns mutate the original (Issue #4910).
+                if fork and resume_id:
+                    try:
+                        from praisonaiagents.session.hierarchy import (
+                            HierarchicalSessionStore,
+                        )
+                        from .utils.project import get_project_sessions_dir
+
+                        hierarchical_store = HierarchicalSessionStore(
+                            str(get_project_sessions_dir())
+                        )
+                        forked_id = hierarchical_store.fork_session(resume_id)
+                    except typer.Exit:
+                        raise
+                    except Exception as exc:
+                        typer.echo(f"Failed to fork session: {exc}", err=True)
+                        raise typer.Exit(1)
+                    if not forked_id:
+                        typer.echo(
+                            f"Failed to fork session: {resume_id}", err=True
+                        )
+                        raise typer.Exit(1)
+                    resume_id = forked_id
+
+                # Restore the recorded session model so resume continues on the
+                # same provider instead of the current default (Issue #3685).
+                if resume_id:
+                    try:
+                        restored_model = find_session_model(resume_id)
+                    except Exception:
+                        restored_model = None
+            except typer.Exit:
+                raise
+            except Exception:
+                # Continuity is opt-in and best-effort; never block launch.
+                resume_id = None
+
         # Route the bare-TUI launch through the shared resolver so a user with
         # only, say, ANTHROPIC_API_KEY set is defaulted to an appropriate model
-        # rather than an OpenAI one — matching `run`, `chat`, and `init`.
+        # rather than an OpenAI one — matching `run`, `chat`, and `init`. A
+        # restored session model (when resuming) takes precedence.
         try:
             from .configuration.model_resolver import resolve_default_model
             resolved_model = resolve_default_model(None)
@@ -917,9 +1020,11 @@ def main_callback(
             resolved_model = _DEFAULT_MODEL
 
         tui_config = AsyncTUIConfig(
-            model=resolved_model,
+            model=restored_model or resolved_model,
             show_logo=True,
             show_status_bar=state.output_format != OutputFormat.json,
+            session_id=resume_id,
+            resume=bool(resume_id),
         )
         
         tui = AsyncTUI(config=tui_config)

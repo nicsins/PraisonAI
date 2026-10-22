@@ -17,78 +17,79 @@ This report compares **Python SDK feature categories** against **Python document
 
 | Category | Features | Docs | Lines |
 |----------|----------|------|-------|
-| ✅ AGUI | 1 | 2 | 511 |
-| ✅ Agent | 22 | 54 | 17255 |
+| ✅ AGUI | 1 | 2 | 577 |
+| ✅ Agent | 22 | 62 | 19777 |
 | ✅ Agent-to-Agent (A2A) | 1 | 7 | 2996 |
-| ✅ Agent-to-User (A2U) | 1 | 3 | 689 |
-| ✅ Approval | 1 | 6 | 2915 |
+| ✅ Agent-to-User (A2U) | 1 | 3 | 701 |
+| ✅ Approval | 1 | 8 | 4164 |
 | ✅ Audio | 2 | 12 | 1000 |
-| ✅ Auto Generation | 5 | 11 | 3542 |
-| ✅ Autonomy | 3 | 7 | 2790 |
-| ✅ Bots | 7 | 32 | 13616 |
+| ✅ Auto Generation | 5 | 12 | 4003 |
+| ✅ Autonomy | 3 | 7 | 2808 |
+| ✅ Bots | 7 | 39 | 16365 |
 | ✅ Budget | 1 | 1 | 287 |
-| ✅ CLI | 5 | 122 | 36971 |
-| ✅ Chunking | 2 | 2 | 420 |
+| ✅ CLI | 5 | 124 | 39593 |
+| ✅ Chunking | 2 | 2 | 435 |
 | ✅ Citations | 2 | 1 | 202 |
-| ✅ Code Execution | 2 | 14 | 4855 |
-| ✅ Conditions | 1 | 3 | 1347 |
-| ✅ Configuration | 3 | 8 | 3173 |
-| ✅ Context Management | 16 | 36 | 13988 |
-| ✅ Deep Research | 8 | 2 | 587 |
-| ✅ Display | 6 | 3 | 741 |
-| ✅ Embeddings | 6 | 23 | 2049 |
-| ✅ Evaluation | 1 | 7 | 2920 |
-| ✅ Events | 1 | 2 | 749 |
-| ✅ Execution | 3 | 4 | 1606 |
-| ✅ Failover | 2 | 1 | 452 |
-| ✅ Files | 2 | 7 | 2275 |
-| ✅ Flow | 1 | 3 | 788 |
-| ✅ Gateway | 7 | 82 | 30269 |
-| ✅ Guardrails | 4 | 4 | 2228 |
-| ✅ Handoffs | 11 | 6 | 2626 |
-| ✅ Hooks | 2 | 9 | 4509 |
-| ✅ Image | 1 | 11 | 1255 |
-| ✅ Knowledge | 4 | 16 | 4967 |
-| ✅ LLM | 3 | 15 | 5376 |
-| ✅ Loops | 4 | 5 | 1475 |
-| ✅ MCP | 1 | 62 | 14278 |
-| ✅ Memory | 6 | 18 | 7193 |
+| ✅ Code Execution | 2 | 14 | 5022 |
+| ✅ Conditions | 1 | 3 | 1386 |
+| ✅ Configuration | 3 | 8 | 3350 |
+| ✅ Context Management | 16 | 37 | 14724 |
+| ✅ Deep Research | 8 | 2 | 591 |
+| ✅ Display | 6 | 3 | 844 |
+| ✅ Embeddings | 6 | 23 | 2074 |
+| ✅ Evaluation | 1 | 9 | 3709 |
+| ✅ Events | 1 | 2 | 782 |
+| ✅ Execution | 3 | 4 | 1697 |
+| ✅ Failover | 2 | 1 | 576 |
+| ✅ Files | 2 | 7 | 2376 |
+| ✅ Flow | 1 | 3 | 811 |
+| ✅ Gateway | 7 | 103 | 39991 |
+| ✅ Guardrails | 5 | 4 | 2631 |
+| ✅ Handoffs | 11 | 6 | 2812 |
+| ✅ Hooks | 2 | 9 | 5317 |
+| ✅ Image | 1 | 11 | 1346 |
+| ✅ Knowledge | 4 | 20 | 6264 |
+| ✅ LLM | 3 | 15 | 6160 |
+| ✅ Loops | 4 | 5 | 1511 |
+| ✅ MCP | 1 | 64 | 15388 |
+| ✅ Memory | 6 | 21 | 8484 |
 | ✅ OCR | 2 | 1 | 237 |
-| ✅ Observability | 2 | 23 | 2811 |
-| ✅ Optimizer | 1 | 2 | 792 |
-| ✅ Output | 3 | 5 | 1265 |
-| ✅ Parallel Execution | 3 | 2 | 497 |
-| ✅ Planning | 6 | 6 | 1605 |
-| ✅ Plugins | 8 | 5 | 3120 |
-| ✅ Prompts | 2 | 9 | 1971 |
-| ✅ Providers | 1 | 56 | 7781 |
+| ✅ Observability | 2 | 23 | 2859 |
+| ✅ Optimizer | 1 | 2 | 794 |
+| ✅ Output | 3 | 6 | 1573 |
+| ✅ Parallel Execution | 3 | 2 | 546 |
+| ✅ Planning | 6 | 7 | 1827 |
+| ✅ Plugins | 8 | 5 | 4114 |
+| ✅ Prompts | 2 | 9 | 2046 |
+| ✅ Providers | 1 | 57 | 8697 |
 | ✅ Query | 1 | 2 | 736 |
-| ✅ RAG | 5 | 15 | 3118 |
-| ✅ Realtime | 2 | 5 | 668 |
-| ✅ Reflection | 3 | 3 | 730 |
-| ✅ Retrieval | 2 | 5 | 1042 |
+| ✅ RAG | 5 | 15 | 3284 |
+| ✅ Realtime | 2 | 5 | 696 |
+| ✅ Reflection | 3 | 3 | 732 |
+| ✅ Retrieval | 2 | 5 | 1068 |
 | ✅ Routing | 1 | 2 | 430 |
-| ✅ Sandbox | 5 | 7 | 3556 |
-| ✅ Security | 1 | 3 | 3529 |
-| ✅ Sessions | 4 | 19 | 7644 |
-| ✅ Skills | 6 | 15 | 5638 |
-| ✅ Tasks | 2 | 6 | 2897 |
-| ✅ Telemetry | 1 | 2 | 648 |
-| ✅ Templates | 1 | 8 | 1663 |
-| ✅ Tools | 12 | 144 | 43272 |
+| ✅ Sandbox | 5 | 7 | 3720 |
+| ✅ Security | 1 | 3 | 3655 |
+| ✅ Sessions | 4 | 21 | 8752 |
+| ✅ Skills | 6 | 16 | 6045 |
+| ✅ Tasks | 2 | 8 | 3266 |
+| ✅ Telemetry | 1 | 2 | 660 |
+| ✅ Templates | 1 | 9 | 1859 |
+| ✅ Tools | 12 | 147 | 45636 |
 | ✅ Tracing | 3 | 2 | 139 |
-| ✅ Vector Store | 1 | 12 | 1215 |
-| ✅ Video | 2 | 6 | 649 |
+| ✅ Vector Store | 1 | 12 | 1219 |
+| ✅ Video | 2 | 10 | 1383 |
 | ✅ Vision | 2 | 1 | 329 |
-| ✅ Web | 3 | 9 | 2487 |
-| ✅ Workflows | 5 | 18 | 7406 |
+| ✅ Web | 3 | 10 | 2895 |
+| ✅ Workflows | 5 | 21 | 9251 |
 
 ## Documentation Without Features
 
 These docs exist but don't match any implemented feature category:
 
-- ℹ️ Database (42 docs, 6965 lines)
-- ℹ️ Documents (1 docs, 787 lines)
+- ℹ️ Database (44 docs, 8451 lines)
+- ℹ️ Documents (1 docs, 810 lines)
+- ℹ️ Teams (1 docs, 214 lines)
 
 ---
 

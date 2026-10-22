@@ -21,6 +21,7 @@ try:
     _HAS_FCNTL = True
 except ImportError:
     _HAS_FCNTL = False
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
@@ -86,6 +87,48 @@ DEFAULT_RETENTION = RETENTION_COMPACT
 # Emit a one-off warning once archived_messages under "compact" retention grows
 # past this many entries, so operators can spot runaway sessions on disk.
 ARCHIVE_WARN_THRESHOLD = 10_000
+
+# Bound the in-memory session cache so a long-lived gateway or bot process that
+# serves many users does not retain every session ever touched in RAM. The
+# on-disk file is already the source of truth, so an eviction just means the
+# next access reloads from disk. ``0`` or ``None`` disables the bound.
+DEFAULT_CACHE_MAXSIZE = 256
+
+
+class _LRUSessionCache(OrderedDict):
+    """An ``OrderedDict`` that evicts the least-recently-used entry once it
+    grows past ``maxsize``. Reads and writes refresh recency so the hot set
+    survives. ``maxsize <= 0`` disables eviction (unbounded, legacy behaviour).
+
+    All mutating/reading operations used by :class:`DefaultSessionStore`
+    (``in``, ``[]`` get/set, ``del``, ``pop``, ``clear``) work unchanged; only
+    insertion order is managed, so callers need no other changes.
+    """
+
+    def __init__(self, maxsize: int = DEFAULT_CACHE_MAXSIZE, on_evict=None):
+        super().__init__()
+        self.maxsize = maxsize
+        # Optional callback invoked with the key of each LRU-evicted entry, so a
+        # companion structure (e.g. the hierarchical store's _cache_mtimes) can
+        # drop the same key and stay bounded alongside this cache.
+        self._on_evict = on_evict
+
+    def __getitem__(self, key):
+        value = super().__getitem__(key)
+        self.move_to_end(key)
+        return value
+
+    def __setitem__(self, key, value):
+        if key in self:
+            super().__setitem__(key, value)
+            self.move_to_end(key)
+        else:
+            super().__setitem__(key, value)
+        if self.maxsize and self.maxsize > 0:
+            while len(self) > self.maxsize:
+                evicted_key, _ = self.popitem(last=False)
+                if self._on_evict is not None:
+                    self._on_evict(evicted_key)
 
 @dataclass
 class SessionMessage:
@@ -242,21 +285,39 @@ class SessionData:
         }
         if self.last_compaction is not None:
             data["last_compaction"] = self.last_compaction.to_dict()
-        for key in ("model", "llm", "total_tokens", "token_count", "cost", "source"):
+        for key in ("model", "llm", "total_tokens", "token_count", "cost", "source",
+                    "reasoning_effort"):
             if key in self.metadata:
                 data[key] = self.metadata[key]
         return data
     
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "SessionData":
-        """Create from dictionary."""
+        """Create from dictionary.
+
+        Transcript entries that are not JSON objects (``null``, a string, a
+        number, …) cannot become a ``SessionMessage`` and would otherwise raise
+        ``AttributeError`` from ``SessionMessage.from_dict``'s ``.get`` calls,
+        crashing gateway routing on a single malformed turn. Such entries are
+        skipped so a healthy session stays loadable; the original on-disk
+        transcript and its index record are left untouched (Issue #5672).
+
+        When a dropped active turn precedes the compaction anchor, the saved
+        ``last_compaction.message_index`` is shifted down by the number of
+        entries removed before it. Without this, ``get_working_history`` would
+        slice the retained tail from the wrong offset and silently drop a
+        healthy post-compaction turn (Issue #2741 interaction).
+        """
+        raw_messages = data.get("messages", [])
         messages = [
-            SessionMessage.from_dict(m) 
-            for m in data.get("messages", [])
+            SessionMessage.from_dict(m)
+            for m in raw_messages
+            if isinstance(m, dict)
         ]
         archived = [
             SessionMessage.from_dict(m)
             for m in (data.get("archived_messages") or [])
+            if isinstance(m, dict)
         ]
         last_compaction_data = data.get("last_compaction")
         last_compaction = (
@@ -264,13 +325,25 @@ class SessionData:
             if last_compaction_data
             else None
         )
+        if last_compaction is not None:
+            anchor = last_compaction.message_index
+            dropped_before_anchor = sum(
+                1
+                for m in raw_messages[:anchor]
+                if not isinstance(m, dict)
+            )
+            if dropped_before_anchor:
+                last_compaction.message_index = max(
+                    0, anchor - dropped_before_anchor
+                )
         # Backward compatibility: `to_dict` mirrors select metadata keys to the
         # top level, and older/externally-written session files may carry
         # `model`/`llm` (etc.) only there. Fold those back into `metadata` so
         # resume can recover the recorded model instead of silently reverting to
         # the current default (Issue #3685). Existing metadata always wins.
         metadata = dict(data.get("metadata") or {})
-        for key in ("model", "llm", "total_tokens", "token_count", "cost", "source"):
+        for key in ("model", "llm", "total_tokens", "token_count", "cost", "source",
+                    "reasoning_effort"):
             if key not in metadata and data.get(key) is not None:
                 metadata[key] = data[key]
         return cls(
@@ -523,7 +596,9 @@ class _SessionMirrorWriter:
         delay = 0.05
         for attempt in range(1, self._max_retries + 1):
             try:
-                self._mirror.append(session_id, records)
+                # A sink may mutate its input before failing. Keep the queued
+                # snapshot unchanged so each retry receives the same record.
+                self._mirror.append(session_id, copy.deepcopy(records))
                 return
             except Exception as e:  # pragma: no cover - defensive; mirror is external
                 if attempt >= self._max_retries:
@@ -597,6 +672,7 @@ class DefaultSessionStore:
         retention: Optional[str] = None,
         active_window: Optional[int] = None,
         mirror: Optional[Any] = None,
+        cache_maxsize: int = DEFAULT_CACHE_MAXSIZE,
     ):
         """
         Initialize session store.
@@ -623,6 +699,11 @@ class DefaultSessionStore:
                 appended to the mirror on a background thread (local-first: the
                 local write always happens first and a mirror outage never
                 blocks or fails the turn). Left ``None`` there is zero overhead.
+            cache_maxsize: Maximum number of sessions kept in the in-memory LRU
+                cache (default 256). A long-lived multi-tenant process otherwise
+                retains every session ever touched in RAM. Disk is the source of
+                truth, so an evicted session simply reloads on next access. Pass
+                ``0`` to disable the bound (legacy unbounded cache).
         """
         self.session_dir = session_dir or _resolve_default_session_dir()
         self.max_messages = max_messages
@@ -647,7 +728,11 @@ class DefaultSessionStore:
         self.active_window = active_window if active_window is not None else max_messages
 
         self._lock = threading.RLock()
-        self._cache: Dict[str, SessionData] = {}
+        # LRU-bounded so a long-lived multi-tenant process does not retain every
+        # session ever touched in RAM. Pass cache_maxsize=0 for the legacy
+        # unbounded cache. Disk remains the source of truth, so an eviction just
+        # triggers a reload on next access.
+        self._cache: Dict[str, SessionData] = _LRUSessionCache(cache_maxsize)
 
         self._mirror = mirror
 
@@ -977,6 +1062,16 @@ class DefaultSessionStore:
         except Exception:  # pragma: no cover - observability must never break load
             logger.debug("SESSION corruption hook failed", exc_info=True)
 
+    def _report_unreadable_session(self, session_id: str, filepath: str, error: Exception) -> None:
+        """Report decode failures during scans without modifying the source file."""
+        if isinstance(error, (UnicodeDecodeError, json.JSONDecodeError)):
+            logger.warning("Skipping unreadable session file %s: %s", filepath, error)
+            self._fire_corruption_hook(session_id, str(error), None)
+
+    def _dump_session_json(self, data: Any, stream) -> None:
+        """Write durable JSON; subclasses can format private storage records."""
+        json.dump(data, stream, indent=2, ensure_ascii=False)
+
     def _atomic_write_json(self, filepath: str, data: Any) -> bool:
         """Atomically write JSON data to disk (temp file + os.replace)."""
         temp_path = None
@@ -991,7 +1086,7 @@ class DefaultSessionStore:
                 suffix=".tmp",
             ) as f:
                 temp_path = f.name
-                json.dump(data, f, indent=2, ensure_ascii=False)
+                self._dump_session_json(data, f)
 
             os.replace(temp_path, filepath)
             return True
@@ -1151,16 +1246,55 @@ class DefaultSessionStore:
         except (IOError, OSError):
             return
 
-        seen = {
-            (m.role, m.content, m.timestamp) for m in session.messages
-        }
+        def _freeze(value: Any) -> Any:
+            # A flat, iterative key avoids recursion both while converting and
+            # hashing deeply nested JSON. Sort object keys to preserve equality
+            # independently of insertion order; keep scalar types distinct.
+            tokens = []
+            stack = [("visit", value)]
+            ancestors = set()
+            while stack:
+                operation, item = stack.pop()
+                if operation == "leave":
+                    ancestors.remove(item)
+                elif operation == "key":
+                    tokens.append(("key", type(item), item))
+                elif isinstance(item, (list, dict)):
+                    identity = id(item)
+                    if identity in ancestors:
+                        raise ValueError("cyclic spill content")
+                    ancestors.add(identity)
+                    stack.append(("leave", identity))
+                    tokens.append((type(item), len(item)))
+                    if isinstance(item, list):
+                        stack.extend(("visit", child) for child in reversed(item))
+                    else:
+                        for key in sorted(item, reverse=True):
+                            stack.append(("visit", item[key]))
+                            stack.append(("key", key))
+                else:
+                    tokens.append((type(item), item))
+            return tuple(tokens)
+
+        def _key(message: SessionMessage) -> tuple:
+            return tuple(_freeze(value) for value in (
+                message.role, message.content, message.timestamp,
+            ))
+
+        seen = set()
+        for message in session.messages:
+            try:
+                seen.add(_key(message))
+            except (RecursionError, TypeError, ValueError):
+                # An unsupported existing value must not stop other salvage.
+                continue
         recovered: List[tuple] = []  # (filepath, [SessionMessage])
         for filename in candidates:
             filepath = os.path.join(spill_dir, filename)
             try:
                 with open(filepath, "r", encoding="utf-8") as f:
                     data = json.load(f)
-            except (json.JSONDecodeError, IOError, OSError):
+            except (json.JSONDecodeError, UnicodeDecodeError, RecursionError, IOError, OSError):
                 continue
             # A syntactically valid spill can still carry an unexpected shape
             # (non-object root, non-list messages, non-object message). Guard
@@ -1174,15 +1308,21 @@ class DefaultSessionStore:
             if not isinstance(raw_messages, list):
                 continue
             msgs = []
-            for raw in raw_messages:
-                if not isinstance(raw, dict):
-                    continue
-                msg = SessionMessage.from_dict(raw)
-                key = (msg.role, msg.content, msg.timestamp)
-                if key in seen:
-                    continue
-                seen.add(key)
-                msgs.append(msg)
+            pending_keys = set()
+            try:
+                for raw in raw_messages:
+                    if not isinstance(raw, dict):
+                        continue
+                    msg = SessionMessage.from_dict(raw)
+                    key = _key(msg)
+                    if key in seen or key in pending_keys:
+                        continue
+                    pending_keys.add(key)
+                    msgs.append(msg)
+            except (RecursionError, TypeError, ValueError):
+                # Retain the entire spill, without poisoning neighbor dedup.
+                continue
+            seen.update(pending_keys)
             recovered.append((filepath, msgs))
 
         if not recovered:
@@ -1199,7 +1339,7 @@ class DefaultSessionStore:
             # expose an oversized transcript that stays inconsistent until a
             # later mutation happens to compact it.
             self._enforce_window(session)
-            if not self._atomic_write_json(filepath, session.to_dict()):
+            if not self._atomic_write_json(filepath, self._session_to_storage(session)):
                 # Could not fold the salvage back in durably — leave the spill
                 # files in place so a later load can retry.
                 return
@@ -1217,6 +1357,7 @@ class DefaultSessionStore:
         mutator: Callable[[SessionData], None],
         *,
         error_label: str = "modify session",
+        apply_retention: bool = True,
     ) -> bool:
         """Apply mutator after reloading from disk under FileLock."""
         filepath = self._get_session_path(session_id)
@@ -1232,9 +1373,10 @@ class DefaultSessionStore:
             mutator(session)
             session.updated_at = datetime.now(timezone.utc).isoformat()
 
-            self._enforce_window(session)
+            if apply_retention:
+                self._enforce_window(session)
 
-            if not self._atomic_write_json(filepath, session.to_dict()):
+            if not self._atomic_write_json(filepath, self._session_to_storage(session)):
                 logger.error(f"Failed to {error_label} {session_id}")
                 return False
 
@@ -1243,6 +1385,10 @@ class DefaultSessionStore:
 
             return True
     
+    def _session_to_storage(self, session: SessionData) -> Dict[str, Any]:
+        """Serialize a durable record; subclasses may retain portable exports."""
+        return session.to_dict()
+
     def _save_session(self, session: SessionData) -> bool:
         """Save session to disk with atomic write."""
         filepath = self._get_session_path(session.session_id)
@@ -1252,7 +1398,7 @@ class DefaultSessionStore:
         self._enforce_window(session)
         
         with FileLock(filepath, self.lock_timeout):
-            if not self._atomic_write_json(filepath, session.to_dict()):
+            if not self._atomic_write_json(filepath, self._session_to_storage(session)):
                 logger.error(f"Failed to save session {session.session_id}")
                 return False
             return True
@@ -1319,7 +1465,7 @@ class DefaultSessionStore:
             self._enforce_window(session)
             
             # Write atomically
-            if not self._atomic_write_json(filepath, session.to_dict()):
+            if not self._atomic_write_json(filepath, self._session_to_storage(session)):
                 logger.error(f"Failed to save session {session_id}")
                 # Issue #3597: durable write failed (disk-full / corruption).
                 # Spill just this turn to a fallback file and fire the
@@ -1352,7 +1498,17 @@ class DefaultSessionStore:
             return
         records = []
         for m in messages:
-            record = m.to_dict()
+            # Normalize to the JSON shape that was persisted. Container
+            # subclasses may be JSON-serializable but carry uncopyable attrs.
+            try:
+                record = json.loads(json.dumps(m.to_dict(), ensure_ascii=False))
+            except Exception as exc:
+                logger.warning(
+                    "session mirror record preparation failed for %s; "
+                    "dropping record (local write unaffected): %s",
+                    session_id, exc,
+                )
+                continue
             record.setdefault(
                 "id", f"{session_id}:{record.get('timestamp', time.time())}"
             )
@@ -1395,7 +1551,143 @@ class DefaultSessionStore:
     ) -> bool:
         """Add an assistant message to a session."""
         return self.add_message(session_id, "assistant", content, metadata)
-    
+
+    def upsert_partial_assistant_message(
+        self,
+        session_id: str,
+        content: str,
+        *,
+        finalize: bool = False,
+    ) -> bool:
+        """Create or update the single in-progress assistant turn (Issue #5407).
+
+        Streamed output is only persisted today after a turn completes, so an
+        interrupt mid-generation (Ctrl-C / crash) loses the whole partial turn.
+        This writes the latest known partial text to a single trailing
+        assistant message tagged ``metadata={"partial": True}`` and overwrites
+        it on each flush instead of appending a new message per token, keeping
+        the write cheap.
+
+        When ``finalize`` is True the partial flag is dropped, promoting the
+        trailing message to a normal assistant turn. If there is no partial
+        message to finalize and ``content`` is non-empty, a normal assistant
+        message is appended (the fallback path when no partial was ever
+        flushed).
+
+        Args:
+            session_id: The session ID.
+            content: The full assistant text known so far.
+            finalize: When True, mark the turn complete (clear the partial flag).
+
+        Returns:
+            True if the store was updated successfully.
+        """
+        # Short-circuit: finalizing with no text and a *confirmed* absent
+        # partial is a no-op, so avoid a needless read-modify-write. An
+        # ambiguous read failure (None) falls through to the locked RMW, which
+        # re-reads under the lock rather than guessing (Issue #5407).
+        if finalize and not content and self._has_trailing_partial(session_id) is False:
+            return True
+
+        # Capture the finalized message so it can be mirrored after the write
+        # succeeds, without re-reading the session.
+        finalized_holder: Dict[str, Any] = {}
+
+        def _apply(session: SessionData) -> None:
+            trailing = session.messages[-1] if session.messages else None
+            is_partial = (
+                trailing is not None
+                and trailing.role == "assistant"
+                and bool((trailing.metadata or {}).get("partial"))
+            )
+            if is_partial:
+                if finalize and not content:
+                    # Interrupted with no text ever produced: drop the empty
+                    # placeholder rather than leaving a blank partial turn.
+                    session.messages.pop()
+                else:
+                    trailing.content = content
+                    trailing.timestamp = time.time()
+                    if finalize:
+                        trailing.metadata.pop("partial", None)
+                        if trailing.metadata is None:
+                            trailing.metadata = {}
+                        finalized_holder["message"] = trailing
+            else:
+                if finalize and not content:
+                    return
+                message = SessionMessage(
+                    role="assistant",
+                    content=content,
+                    timestamp=time.time(),
+                    metadata={} if finalize else {"partial": True},
+                )
+                session.messages.append(message)
+                if finalize:
+                    finalized_holder["message"] = message
+
+        # Route through the transactional read-modify-write seam so SQLite-
+        # backed stores write their authoritative row (not a stray JSON file),
+        # concurrent turns stay serialized, failed writes propagate (and spill
+        # for recovery), and search indexes refresh on finalize — rather than
+        # re-implementing a FileLock+JSON write that only the default store
+        # honours (Issue #5407).
+        if not self._modify_session_locked(
+            session_id, _apply, error_label="upsert partial assistant message"
+        ):
+            return False
+
+        # Only a finalized turn is a completed record the mirror should carry;
+        # per-token partials are intentionally local until finalize.
+        if finalize and finalized_holder.get("message") is not None:
+            self._mirror_append(session_id, [finalized_holder["message"]])
+        return True
+
+    def _has_trailing_partial(self, session_id: str) -> Optional[bool]:
+        """Return the trailing-partial state, or ``None`` if it can't be read.
+
+        ``True``/``False`` report a successful check; ``None`` signals the read
+        itself failed, so callers must not treat an ambiguous failure as a
+        confirmed absence (which would silently skip a needed discard).
+        """
+        try:
+            session = self._read_session_fresh(session_id)
+        except Exception:
+            return None
+        trailing = session.messages[-1] if session.messages else None
+        return (
+            trailing is not None
+            and trailing.role == "assistant"
+            and bool((trailing.metadata or {}).get("partial"))
+        )
+
+    def discard_partial_assistant_message(self, session_id: str) -> bool:
+        """Drop a trailing in-progress assistant turn, if any (Issue #5407).
+
+        Used when the authoritative assistant turn is written through another
+        path (e.g. a tool-call turn) so a stale partial record does not linger.
+        No-op when the trailing message is not a partial.
+        """
+        # Only skip the read-modify-write when we can *confirm* there is no
+        # trailing partial. An ambiguous read failure (None) must fall through
+        # to the locked RMW — which re-reads under the lock — so a stale partial
+        # is never left behind on a transient read error (Issue #5407).
+        if self._has_trailing_partial(session_id) is False:
+            return True
+
+        def _apply(session: SessionData) -> None:
+            trailing = session.messages[-1] if session.messages else None
+            if (
+                trailing is not None
+                and trailing.role == "assistant"
+                and bool((trailing.metadata or {}).get("partial"))
+            ):
+                session.messages.pop()
+
+        return self._modify_session_locked(
+            session_id, _apply, error_label="discard partial assistant message"
+        )
+
     def get_chat_history(
         self,
         session_id: str,
@@ -1445,6 +1737,28 @@ class DefaultSessionStore:
             return model
         for message in reversed(session.messages):
             recorded = (message.metadata or {}).get("model")
+            if isinstance(recorded, str) and recorded:
+                return recorded
+        return None
+
+    def get_session_reasoning_effort(self, session_id: str) -> Optional[str]:
+        """Return the reasoning effort a session was last run with (Issue #4452).
+
+        Mirrors :meth:`get_session_model`: resolves the session-level
+        ``reasoning_effort`` recorded in metadata so a resume (``--continue`` /
+        ``--session``) can restore the graded effort alongside the model. Returns
+        ``None`` when none was recorded, so a caller falls back to the default /
+        per-invocation value.
+        """
+        try:
+            session = self._read_session_fresh(session_id)
+        except Exception:
+            return None
+        effort = session.metadata.get("reasoning_effort")
+        if isinstance(effort, str) and effort:
+            return effort
+        for message in reversed(session.messages):
+            recorded = (message.metadata or {}).get("reasoning_effort")
             if isinstance(recorded, str) and recorded:
                 return recorded
         return None
@@ -1598,6 +1912,27 @@ class DefaultSessionStore:
             session_id, _apply, error_label="update session metadata"
         )
 
+    def merge_session_metadata_map(
+        self, session_id: str, key: str, updates: Dict[str, Any],
+        *, defaults: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Merge nested metadata entries using the freshest map under FileLock.
+
+        Defaults fill missing entries; persisted entries win over defaults,
+        and the supplied updates win over both.
+        """
+        def _apply(session: SessionData) -> None:
+            merged = dict(defaults or {})
+            current = session.metadata.get(key)
+            if isinstance(current, dict):
+                merged.update(current)
+            merged.update(updates)
+            session.metadata[key] = merged
+
+        return self._modify_session_locked(
+            session_id, _apply, error_label="merge session metadata map"
+        )
+
     def rename_session(self, session_id: str, title: str) -> bool:
         """Give a session a human-readable title (Issue #3737).
 
@@ -1669,7 +2004,8 @@ class DefaultSessionStore:
                             "total_tokens": data.get("total_tokens") or data.get("token_count") or (data.get("metadata") or {}).get("total_tokens"),
                             "cost": data.get("cost") or (data.get("metadata") or {}).get("cost"),
                         })
-                    except (json.JSONDecodeError, IOError):
+                    except (UnicodeDecodeError, json.JSONDecodeError, IOError) as exc:
+                        self._report_unreadable_session(filename[:-5], filepath, exc)
                         continue
         except (IOError, OSError):
             pass
@@ -1703,7 +2039,8 @@ class DefaultSessionStore:
                             data = json.load(f)
                         if data.get("agent_name") == agent_name:
                             session_ids.append(data.get("session_id", filename[:-5]))
-                    except (json.JSONDecodeError, IOError):
+                    except (UnicodeDecodeError, json.JSONDecodeError, IOError) as exc:
+                        self._report_unreadable_session(filename[:-5], filepath, exc)
                         continue
         except (IOError, OSError):
             pass
@@ -1811,7 +2148,8 @@ class DefaultSessionStore:
                             data = json.load(f)
                         if data.get("gateway_session_id") == gateway_session_id:
                             return SessionData.from_dict(data)
-                    except (json.JSONDecodeError, IOError):
+                    except (UnicodeDecodeError, json.JSONDecodeError, IOError) as exc:
+                        self._report_unreadable_session(filename[:-5], filepath, exc)
                         continue
         except (IOError, OSError):
             pass
@@ -1841,7 +2179,8 @@ class DefaultSessionStore:
                             data = json.load(f)
                         if data.get("agent_id") == agent_id:
                             session_ids.append(data.get("session_id", filename[:-5]))
-                    except (json.JSONDecodeError, IOError):
+                    except (UnicodeDecodeError, json.JSONDecodeError, IOError) as exc:
+                        self._report_unreadable_session(filename[:-5], filepath, exc)
                         continue
         except (IOError, OSError):
             pass
@@ -1946,13 +2285,20 @@ class DefaultSessionStore:
 
     @staticmethod
     def _bookends(messages: List[Any], size: int) -> Dict[str, List[Dict[str, Any]]]:
-        """Return the first and last ``size`` user/assistant messages."""
+        """Return the first and last ``size`` user/assistant messages.
+
+        ``messages`` is the shared archived-plus-active projection, so an
+        opening bookend can be a compacted turn. Entries carry the same
+        ``archived`` marker as :meth:`search`'s context and :meth:`window` so
+        the boundary stays visible in every projection (Issue #5031).
+        """
         convo = [
             {
                 "index": i,
                 "role": m.get("role", ""),
                 "content": m.get("content", ""),
                 "timestamp": m.get("timestamp"),
+                "archived": bool(m.get("archived")),
             }
             for i, m in enumerate(messages)
             if isinstance(m, dict) and m.get("role") in ("user", "assistant")
@@ -1982,6 +2328,32 @@ class DefaultSessionStore:
             snippet = snippet + "…"
         return snippet
 
+    @staticmethod
+    def _searchable_messages(data: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Project a persisted session into the list of messages to scan.
+
+        Archived turns (rolled out of the active window by ``retention=
+        "compact"``) are scanned *ahead* of the active window so a compacted
+        conversation stays fully recallable — a hit on an archived turn is
+        returned anchored in its context, exactly like an active-turn hit
+        (Issue #5031). Each archived entry is tagged ``archived=True`` so the
+        boundary is visible to callers rather than silently blended into the
+        current window. Both built-in stores use this single projection so
+        their results cannot drift.
+        """
+        archived = data.get("archived_messages")
+        active = data.get("messages")
+        merged: List[Dict[str, Any]] = []
+        if isinstance(archived, list):
+            for msg in archived:
+                if isinstance(msg, dict):
+                    merged.append({**msg, "archived": True})
+        if isinstance(active, list):
+            for msg in active:
+                if isinstance(msg, dict):
+                    merged.append(msg)
+        return merged
+
     def search(
         self,
         query: str,
@@ -1993,6 +2365,8 @@ class DefaultSessionStore:
 
         Returns the best-matching sessions, each with a short window of
         messages around the first hit so the match is returned *in context*.
+        Spans both archived and active turns so compacted history stays
+        recallable (Issue #5031).
         """
         from .protocols import SessionHit
 
@@ -2016,11 +2390,12 @@ class DefaultSessionStore:
             try:
                 with open(filepath, "r", encoding="utf-8") as f:
                     data = json.load(f)
-            except (json.JSONDecodeError, IOError):
+            except (UnicodeDecodeError, json.JSONDecodeError, IOError) as exc:
+                self._report_unreadable_session(filename[:-5], filepath, exc)
                 continue
 
-            messages = data.get("messages", [])
-            if not isinstance(messages, list):
+            messages = self._searchable_messages(data)
+            if not messages:
                 continue
             best_index = -1
             best_score = 0.0
@@ -2057,6 +2432,7 @@ class DefaultSessionStore:
                         "role": msg_i.get("role", ""),
                         "content": msg_i.get("content", ""),
                         "timestamp": msg_i.get("timestamp"),
+                        "archived": bool(msg_i.get("archived")),
                     }
                 )
 
@@ -2103,9 +2479,16 @@ class DefaultSessionStore:
         *,
         window: int = 5,
     ) -> List[Dict[str, Any]]:
-        """Return ±``window`` messages around an anchor message in a session."""
+        """Return ±``window`` messages around an anchor message in a session.
+
+        Scrolls the same archived-plus-active projection that :meth:`search`
+        anchors against, so an ``anchor_index`` handed back from a discovery
+        hit — including one that lands on an archived turn — resolves to the
+        exact same message here (Issue #5031). Each entry keeps its
+        ``archived`` marker so the compaction boundary stays visible.
+        """
         session = self._read_session_fresh(session_id)
-        messages = session.messages
+        messages = self._searchable_messages(session.to_dict())
         if not messages:
             return []
 
@@ -2122,9 +2505,10 @@ class DefaultSessionStore:
         return [
             {
                 "index": i,
-                "role": messages[i].role,
-                "content": messages[i].content,
-                "timestamp": messages[i].timestamp,
+                "role": messages[i].get("role", ""),
+                "content": messages[i].get("content", ""),
+                "timestamp": messages[i].get("timestamp"),
+                "archived": bool(messages[i].get("archived")),
             }
             for i in range(start, end)
         ]
@@ -2188,12 +2572,9 @@ class DefaultSessionStore:
         return {"version": self.PORTABLE_VERSION, "sessions": sessions}
 
     def export_all(self) -> Dict[str, Any]:
-        """Export every stored session to a portable, versioned payload."""
+        """Export every stored session; raise OSError for an incomplete backup."""
         sessions: List[Dict[str, Any]] = []
-        try:
-            filenames = os.listdir(self.session_dir)
-        except (IOError, OSError):
-            filenames = []
+        filenames = os.listdir(self.session_dir)
         for filename in filenames:
             if not filename.endswith(".json"):
                 continue
@@ -2201,8 +2582,9 @@ class DefaultSessionStore:
             try:
                 with open(filepath, "r", encoding="utf-8") as f:
                     sessions.append(json.load(f))
-            except (json.JSONDecodeError, IOError, OSError):
-                continue
+            except (UnicodeDecodeError, json.JSONDecodeError, IOError, OSError) as exc:
+                self._report_unreadable_session(filename[:-5], filepath, exc)
+                raise OSError(f"Incomplete session export: cannot read {filename}") from exc
         return {"version": self.PORTABLE_VERSION, "sessions": sessions}
 
     def _collect_lineage(
@@ -2214,15 +2596,13 @@ class DefaultSessionStore:
         (``lineage_id`` / ``root_session_id`` / ``thread_id``) so a compacted /
         rotated continuation exports alongside its logical session. Returns the
         raw session dicts (already portable). Empty when no lineage is known.
+        Raises OSError when an unreadable record makes lineage coverage unknown.
         """
         lineage = self._lineage_key(session.to_dict())
         if not lineage:
             return []
         out: List[Dict[str, Any]] = []
-        try:
-            filenames = os.listdir(self.session_dir)
-        except (IOError, OSError):
-            return []
+        filenames = os.listdir(self.session_dir)
         for filename in filenames:
             if not filename.endswith(".json"):
                 continue
@@ -2230,15 +2610,16 @@ class DefaultSessionStore:
             try:
                 with open(filepath, "r", encoding="utf-8") as f:
                     data = json.load(f)
-            except (json.JSONDecodeError, IOError, OSError):
-                continue
+            except (UnicodeDecodeError, json.JSONDecodeError, IOError, OSError) as exc:
+                self._report_unreadable_session(filename[:-5], filepath, exc)
+                raise OSError(f"Incomplete session export: cannot read {filename}") from exc
             if data.get("session_id") == exclude:
                 continue
             if self._lineage_key(data) == lineage:
                 out.append(data)
         return out
 
-    def _save_imported_session(self, session: SessionData) -> bool:
+    def _save_imported_session(self, session: SessionData, *, overwrite: bool = True) -> bool:
         """Persist a restored session verbatim (no retention/window applied).
 
         Mirrors ``_save_session`` (timestamp + atomic, file-locked write) but
@@ -2249,10 +2630,34 @@ class DefaultSessionStore:
         filepath = self._get_session_path(session.session_id)
         session.updated_at = datetime.now(timezone.utc).isoformat()
         with FileLock(filepath, self.lock_timeout):
-            if not self._atomic_write_json(filepath, session.to_dict()):
+            # The initial import check can race with a peer creating this file.
+            # Check again inside the same lock that protects the replacement.
+            if not overwrite and os.path.exists(filepath):
+                raise FileExistsError(filepath)
+            if not self._atomic_write_json(filepath, self._session_to_storage(session)):
                 logger.error(f"Failed to save imported session {session.session_id}")
                 return False
+            session._import_file_identity = self._session_file_identity(filepath)
+            # Persistence hooks own their cache value; a subclass may refresh
+            # it from a newer durable generation before returning to import.
+            with self._lock:
+                self._cache[session.session_id] = session
             return True
+
+    @staticmethod
+    def _session_file_identity(filepath):
+        """Identify an atomic file generation without depending on wall-clock ordering."""
+        try:
+            stat = os.stat(filepath)
+        except OSError:
+            # A path metadata failure need not make the atomic generation
+            # unknowable: an opened descriptor can still identify that file.
+            try:
+                with open(filepath, "rb") as current:
+                    stat = os.fstat(current.fileno())
+            except OSError:
+                return None
+        return stat.st_dev, stat.st_ino, stat.st_mtime_ns, stat.st_size
 
     def import_sessions(
         self,
@@ -2348,14 +2753,16 @@ class DefaultSessionStore:
                 # Persist the imported record verbatim: an import is a restore,
                 # so the destination's retention/active_window must not truncate
                 # or compact a valid larger export before it lands on disk.
-                if not self._save_imported_session(session):
+                if not self._save_imported_session(session, overwrite=overwrite):
                     report.skipped.append(
                         {"session_id": session_id, "reason": "write failed"}
                     )
                     continue
-                with self._lock:
-                    self._cache[session_id] = session
                 report.imported += 1
+            except FileExistsError:
+                report.skipped.append(
+                    {"session_id": session_id, "reason": "already exists (use overwrite)"}
+                )
             except Exception as e:  # pragma: no cover - defensive; one bad record
                 report.skipped.append(
                     {"session_id": session_id, "reason": f"import error: {e}"}

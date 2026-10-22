@@ -44,6 +44,11 @@ import type {
   Unsubscribe,
 } from "../../../core/src/ports/shell.ts";
 import { createTauriBridge, type TauriBridge } from "./bridge.ts";
+// The keyboard reading is identical on both platforms and already reasoned
+// through in the web shell (pinch-zoom vs a real keyboard, overscroll, the
+// offsetTop term). Importing it keeps one implementation rather than a copy
+// that drifts.
+import { readKeyboardHeight } from "../web/shell.ts";
 
 /**
  * A ShellPort plus one observable.
@@ -179,6 +184,42 @@ function coercePhase(payload: unknown): LifecyclePhase | null {
   return LIFECYCLE_PHASES.find((phase) => phase === raw) ?? null;
 }
 
+/**
+ * The global the Android side calls, once per window-insets dispatch.
+ *
+ * WHY THIS EXISTS. `env(safe-area-inset-*)` in Chromium on Android reports the
+ * DISPLAY CUTOUT and nothing else -- not the status bar, not the navigation
+ * bar, and never the keyboard. Measured on an Android 15 emulator with the app
+ * running: `--safe-area-inset-top` read 49px, which is the 128px cutout at
+ * dpr 2.625, while the status bar is 63px (24 CSS px); rotated to landscape the
+ * SAME 49px moved to `--safe-area-inset-left` and top became 0px even though
+ * the status bar is still along the top edge. And the keyboard is worse than
+ * under-reported, it is invisible: with the IME shown (`mInputShown=true`) and
+ * the textarea focused, `window.innerHeight`, `visualViewport.height` and
+ * `navigator.virtualKeyboard.boundingRect` all still read the full 915px
+ * viewport, so `readKeyboardHeight` returned 0 and the composer was painted
+ * underneath the keyboard -- the exact bug the comment on `keyboardHeightPx`
+ * below says `visualViewport` fixed. It fixes it on iOS. On Android there was
+ * no source at all.
+ *
+ * `enableEdgeToEdge()` in MainActivity is why: with `decorFitsSystemWindows`
+ * false the window is never resized by the system bars or the IME, so there is
+ * nothing for a web API to observe. The values exist only in
+ * `WindowInsetsCompat`, which is native. MainActivity reads them and calls this.
+ */
+export const NATIVE_INSETS_GLOBAL = "__praisonaiNativeInsets";
+
+/** What the Android side sends. Every field is optional and every field is run
+ *  through `toPx`, because this crosses a `evaluateJavascript` string boundary
+ *  and a malformed number here would reach a style property as NaN. */
+export interface NativeInsetsPayload {
+  readonly top?: unknown;
+  readonly right?: unknown;
+  readonly bottom?: unknown;
+  readonly left?: unknown;
+  readonly keyboard?: unknown;
+}
+
 /** Keyboard height in px. 0 is a VALUE (hidden), not an absence -- an adapter
  *  that treats it as absent never reports the hide and the composer stays
  *  pushed up over empty space for the rest of the session. */
@@ -210,6 +251,11 @@ const EVENTS = {
  *  back gesture. Answering `false` is what lets Android exit the app. */
 const BACK_RESULT_COMMAND = "back_gesture_result";
 
+/** The command that carries the app's STANDING answer -- can it go back at all
+ *  -- sent whenever that changes rather than in reply to a press. Rust reads it
+ *  when the reply above is too slow to arrive; see ShellPort.setCanGoBack. */
+const BACK_CAN_GO_BACK_COMMAND = "back_gesture_can_go_back";
+
 export interface TauriShellDeps {
   /** Defaults to the real bridge. Injected in tests so the event paths run
    *  without a device -- an adapter whose events only work on a phone has no
@@ -217,6 +263,9 @@ export interface TauriShellDeps {
   readonly bridge?: TauriBridge;
   /** Defaults to the DOM, or to nothing when there is no DOM. */
   readonly insetSource?: InsetSource;
+  /** The window whose `visualViewport` reports the keyboard. Defaults to the
+   *  real one; injected in tests so the path runs without a phone. */
+  readonly view?: Window;
 }
 
 export function createTauriShell(deps: TauriShellDeps = {}): TauriShell {
@@ -228,7 +277,24 @@ export function createTauriShell(deps: TauriShellDeps = {}): TauriShell {
 
   const insetSubs = new Set<(insets: SafeAreaInsets) => void>();
   const keyboardSubs = new Set<(heightPx: number) => void>();
-  let keyboardHeightPx = 0;
+
+  // Seeded and driven from `visualViewport`, exactly as the web shell does.
+  //
+  // This was a hard `0` whose only writer was the native `keyboard-height`
+  // event -- and nothing emits that event. The Rust shell now emits the other
+  // three (`src-tauri/src/shell/mod.rs`) but still not this one: Tauri has no
+  // keyboard observer to wire. So on a device `--keyboard-height` stayed 0
+  // forever, and because `app.css` pins `#root` to `position: fixed; inset: 0`
+  // the layout viewport does not shrink either. The composer sat underneath
+  // the keyboard the instant anyone tapped it -- the first thing anyone does.
+  //
+  // WKWebView and Android WebView both implement `visualViewport`, so the web
+  // shell's reading works here and needs no native code. The native event
+  // stays wired below and overrides this the moment it starts arriving: it is
+  // the better source, but it must not be the ONLY source while it does not
+  // exist.
+  const view = deps.view ?? (globalThis as { window?: Window }).window;
+  let keyboardHeightPx = view === undefined ? 0 : readKeyboardHeight(view);
   const lifecycleSubs = new Set<(phase: LifecyclePhase) => void>();
   // An ARRAY, not a Set: back handlers are a stack and the most recently
   // registered gets first refusal. A Set has no defined order, so a modal
@@ -296,18 +362,100 @@ export function createTauriShell(deps: TauriShellDeps = {}): TauriShell {
    * shell became per-window -- noted here rather than discovered there.
    */
   attach(EVENTS.safeArea, (payload) => {
-    // A payload we cannot read is not a reason to skip the update: the CSS
-    // variables have already been recomputed by the time this fires, so
-    // re-reading them is strictly better than keeping a stale snapshot.
-    publishInsets(coerceInsets(payload) ?? readInsets(source));
+    const explicit = coerceInsets(payload);
+    if (explicit !== null) {
+      publishInsets(explicit);
+      return;
+    }
+    // An empty payload means "re-read the CSS", and the CSS has already been
+    // recomputed by the time this fires -- so re-reading is strictly better
+    // than keeping a stale snapshot. UNLESS the Android bridge is live: there
+    // `env()` is the display cutout only, and re-reading it would silently
+    // drop the status and navigation bars back to 0 on the first rotation
+    // after the keyboard had been used.
+    if (nativeInsetsSeen) return;
+    publishInsets(readInsets(source));
   });
+
+  // The web path, live. `visualViewport` fires `resize` and `scroll` as the
+  // keyboard animates, which is what makes the composer track it rather than
+  // jump once at the end. Removed the moment a native height arrives, so the
+  // two sources never fight -- native is authoritative where it exists.
+  let viewportOff: Unsubscribe | null = null;
+
+  /** One writer for the keyboard height, so the "snapshot before notify" rule
+   *  and the no-op check are stated once for all three sources. */
+  const publishKeyboard = (height: number): void => {
+    if (height === keyboardHeightPx) return;
+    keyboardHeightPx = height;
+    for (const cb of keyboardSubs) cb(height);
+  };
+
+  if (view?.visualViewport !== undefined && view.visualViewport !== null) {
+    const viewport = view.visualViewport;
+    const onViewport = (): void => {
+      publishKeyboard(readKeyboardHeight(view));
+    };
+    viewport.addEventListener("resize", onViewport);
+    viewport.addEventListener("scroll", onViewport);
+    viewportOff = () => {
+      viewport.removeEventListener("resize", onViewport);
+      viewport.removeEventListener("scroll", onViewport);
+    };
+  }
+
+  /**
+   * The Android window-insets bridge. See NATIVE_INSETS_GLOBAL above.
+   *
+   * Both halves of the payload are authoritative once it starts arriving:
+   *
+   *  - the insets, because the CSS `env()` values it replaces are the cutout
+   *    ONLY on Android, so re-reading them would drop the status and navigation
+   *    bars back to 0 on the next resize. `nativeInsetsSeen` is what stops the
+   *    `safe-area-changed` handler below from doing exactly that.
+   *  - the keyboard, for the same reason the native `keyboard-height` event is
+   *    authoritative: two writers would race, and `visualViewport` on Android
+   *    only ever reports 0.
+   *
+   * It is installed on `view`, not on `globalThis`, so a test drives it with a
+   * fake window and no phone.
+   */
+  let nativeInsetsSeen = false;
+  if (view !== undefined) {
+    (view as unknown as Record<string, unknown>)[NATIVE_INSETS_GLOBAL] = (
+      payload: NativeInsetsPayload,
+    ): void => {
+      if (typeof payload !== "object" || payload === null) return;
+      nativeInsetsSeen = true;
+      // The viewport listener is retired for the same reason a native
+      // `keyboard-height` retires it: the native source fires through the whole
+      // IME animation and cannot be raced by a viewport that never moves.
+      viewportOff?.();
+      viewportOff = null;
+      publishInsets({
+        top: toPx(payload.top),
+        right: toPx(payload.right),
+        bottom: toPx(payload.bottom),
+        left: toPx(payload.left),
+      });
+      publishKeyboard(toPx(payload.keyboard));
+    };
+  }
 
   attach(EVENTS.keyboard, (payload) => {
     const height = coerceKeyboardHeight(payload);
+    // A native height has arrived, so stop reading the viewport: the native
+    // source fires through the transition and the viewport one only at its
+    // ends, and two writers would race on every keyboard animation.
+    viewportOff?.();
+    viewportOff = null;
     // Snapshot before notifying, per the port's ordering rule.
     keyboardHeightPx = height;
-    // Unconditional. Fires through the transition, not just at its end, and
-    // 0 is delivered like any other height.
+    // Unconditional, and NOT through `publishKeyboard`: this event's contract
+    // is that every height it carries is delivered, including a repeat. The
+    // other two sources poll (`visualViewport` on scroll, the Android bridge on
+    // every frame of the IME animation and again when it settles) and would
+    // otherwise relayout on values that have not changed.
     for (const cb of keyboardSubs) cb(height);
   });
 
@@ -316,6 +464,10 @@ export function createTauriShell(deps: TauriShellDeps = {}): TauriShell {
     if (phase === null) return;
     for (const cb of lifecycleSubs) cb(phase);
   });
+
+  // The last value handed to `setCanGoBack`, or null before the app has said
+  // anything. See the method below for why null and not false.
+  let declaredCanGoBack: boolean | null = null;
 
   attach(EVENTS.back, () => {
     let handled = false;
@@ -359,6 +511,23 @@ export function createTauriShell(deps: TauriShellDeps = {}): TauriShell {
         const at = backSubs.lastIndexOf(cb);
         if (at !== -1) backSubs.splice(at, 1);
       };
+    },
+
+    setCanGoBack(canGoBack) {
+      // Sent on CHANGE only. The router declares on every stack change, and a
+      // chat-to-chat move does not alter the answer; forwarding those anyway
+      // would put an IPC call on a navigation that needs none.
+      //
+      // `declaredCanGoBack` starts as null rather than false so the first
+      // declaration always crosses, even when it is `false`: Rust's default
+      // agrees, but a shell that stayed silent because it AGREED with a default
+      // is one that says nothing at all after a reload.
+      if (declaredCanGoBack === canGoBack) return;
+      declaredCanGoBack = canGoBack;
+      // void, like the answer above: this is fire-and-forget state. A rejected
+      // invoke leaves Rust on its previous value, which is the same failure as
+      // a lost event and is covered by the watchdog either way.
+      void bridge.invoke(BACK_CAN_GO_BACK_COMMAND, { canGoBack });
     },
 
     haptic(kind: HapticKind) {

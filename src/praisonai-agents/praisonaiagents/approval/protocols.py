@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Protocol, Tuple, runtime_checkable
+from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple, runtime_checkable
 
 
 def _new_approval_id() -> str:
@@ -38,6 +38,14 @@ class ApprovalRequest:
                      backend may bind resolution to these reviewers so that in a
                      multi-operator deployment a request addressed to one
                      operator cannot be resolved by another.
+        liveness:    Optional zero-arg predicate returning ``True`` while the
+                     originating turn is still the current one. ``None``
+                     (default) is a no-op — the request is treated as always
+                     live, preserving today's behaviour. A backend may consult
+                     this at the resolution/execution boundary to drop a
+                     resolution that arrives after the turn was superseded or
+                     stopped (fail-closed), so a stale approval never fires a
+                     tool or delivers a reply for an abandoned turn.
     """
 
     tool_name: str
@@ -48,6 +56,7 @@ class ApprovalRequest:
     context: Dict[str, Any] = field(default_factory=dict)
     approval_id: str = field(default_factory=_new_approval_id)
     authorized_reviewers: Optional[List[str]] = None
+    liveness: Optional[Callable[[], bool]] = None
 
 
 @dataclass
@@ -78,6 +87,14 @@ class ApprovalDecision:
                        course-correction for the next turn instead of a bare
                        "denied" result. ``None`` (default) keeps today's
                        terminal-deny semantics.
+        escalate:      When ``True`` the decision is a *deferral*, not a final
+                       verdict: an autonomous reviewer was uncertain and asks for
+                       a human to decide instead of failing open or blindly
+                       denying. ``approved`` is always ``False`` on an escalation
+                       (fail-closed), so a consumer that ignores this flag keeps
+                       today's safe deny-by-default behaviour; a human-in-the-loop
+                       backend may instead route the request to a person.
+                       ``False`` (default) preserves existing semantics.
     """
 
     approved: bool
@@ -88,6 +105,19 @@ class ApprovalDecision:
     scope: str = "once"
     scope_pattern: Optional[str] = None
     feedback: Optional[str] = None
+    escalate: bool = False
+
+    def __post_init__(self) -> None:
+        """Enforce the fail-closed escalation invariant.
+
+        An escalation is a *deferral to a human*, never an authorisation, so
+        ``escalate=True`` always forces ``approved=False``. This guarantees a
+        consumer that inspects only ``approved`` can never execute an escalated
+        request, upholding the deny-by-default compatibility guarantee even if a
+        backend constructs ``ApprovalDecision(approved=True, escalate=True)``.
+        """
+        if self.escalate:
+            self.approved = False
 
 
 @dataclass
@@ -158,6 +188,18 @@ class ApprovalProtocol(Protocol):
             ApprovalDecision indicating whether execution is approved.
         """
         ...
+
+    # Backends MAY also implement an optional synchronous entry point:
+    #
+    #     def request_approval_sync(self, request, timeout=None) -> ApprovalDecision
+    #
+    # It is deliberately NOT declared on this runtime-checkable Protocol so an
+    # async-only backend still satisfies ``isinstance(b, ApprovalProtocol)``.
+    # When present, the per-call ``timeout`` (seconds; ``None`` = wait forever)
+    # is passed explicitly by the caller so shared backend state is never
+    # mutated — mutating a shared backend's timeout leaks between agents.
+    # Legacy sync backends without the ``timeout`` parameter are still
+    # supported; the caller falls back to a no-argument call on ``TypeError``.
 
 
 @runtime_checkable

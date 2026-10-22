@@ -42,10 +42,15 @@ def _extract_value(item: ResultItem, key: str, default: Any = None) -> Any:
     Returns:
         Extracted value or default
     """
+    # A present-but-None value counts as absent. SearchResultItem declares
+    # `source` (and friends) with a None default, so getattr(item, key,
+    # default) always found the attribute and never returned the caller's
+    # default -- callers asking for "unknown.pdf" got None instead.
     if isinstance(item, dict):
-        return item.get(key, default)
+        value = item.get(key)
     else:
-        return getattr(item, key, default)
+        value = getattr(item, key, None)
+    return default if value is None else value
 
 
 def _extract_metadata_value(
@@ -59,8 +64,14 @@ def _extract_metadata_value(
     """
     value = metadata.get(key)
     if value is None:
-        return _extract_value(item, key, default)
-    return value
+        # getattr's default only fires when the ATTRIBUTE IS ABSENT. Result
+        # models declare these fields with a None default (SearchResultItem
+        # has `source = None`), so the attribute exists and None came back --
+        # defeating the fallback and handing callers None where they asked for
+        # "". Treat a None value as absent, which is what "with fallback to
+        # default" means.
+        value = _extract_value(item, key, None)
+    return default if value is None else value
 
 
 def _chunk_hash(text: str, source: Optional[str] = None) -> str:

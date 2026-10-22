@@ -4,6 +4,7 @@ Configuration paths for PraisonAI CLI.
 Defines standard locations for configuration files.
 """
 
+import functools
 import os
 from pathlib import Path
 from typing import List, Optional
@@ -159,6 +160,107 @@ def get_project_config_dir(project_root: Optional[Path] = None) -> Path:
 def get_project_config_path(project_root: Optional[Path] = None) -> Path:
     """Get project configuration file path (.praison/config.toml)."""
     return get_project_config_dir(project_root) / "config.toml"
+
+
+# ---------------------------------------------------------------------------
+# Project-local data directory (the one *single* source of truth)
+#
+# Nine CLI features each hard-coded their own ``".praison/<file>"`` literal
+# while the runtime reads ``.praisonai/`` (``praisonaiagents.paths``). That is
+# not a cosmetic inconsistency: ``.praison`` is the FIRST entry of
+# ``_PROJECT_MARKERS``, so the moment one of those features creates
+# ``./.praison/`` in a project whose config lives in ``./.praisonai/``, this
+# module's own ``_config_dirname_for`` flips and the project's
+# ``.praisonai/config.toml`` silently stops being read.
+#
+# Everything project-local must therefore go through these helpers rather than
+# a literal, so the tenth feature cannot drift again.
+# ---------------------------------------------------------------------------
+
+@functools.lru_cache(maxsize=1)
+def _canonical_project_dirname() -> str:
+    """The canonical project data directory name (``.praisonai``).
+
+    Taken from ``praisonaiagents.paths.DEFAULT_DIR_NAME`` so the wrapper CLI and
+    the SDK can never disagree; the literal is only a fallback for a standalone
+    ``praisonai-code`` install without the core package.
+    """
+    try:
+        from praisonaiagents.paths import DEFAULT_DIR_NAME
+
+        return DEFAULT_DIR_NAME
+    except Exception:  # noqa: BLE001 - never fail on a missing core package
+        return ".praisonai"
+
+
+def __getattr__(name: str):
+    # ``PROJECT_DATA_DIRNAME`` is the canonical project data directory name.
+    # Import it instead of writing ``".praisonai"`` (or, worse, ``".praison"``)
+    # anywhere. Resolved lazily so importing this module (on every CLI start)
+    # does not import ``praisonaiagents`` and its root-logger setup.
+    if name == "PROJECT_DATA_DIRNAME":
+        return _canonical_project_dirname()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+#: Legacy project data directory name, kept for *read-only* fallback so an
+#: existing ``./.praison/thinking.json`` is still found after the fix.
+LEGACY_PROJECT_DATA_DIRNAME = ".praison"
+
+
+def get_project_data_dir(project_root: Optional[Path] = None) -> Path:
+    """Return the canonical project data directory (``<root>/.praisonai``).
+
+    Unlike :func:`get_project_config_dir`, this never resolves to the legacy
+    ``.praison`` name: writes must always land where the runtime reads.
+    """
+    root = project_root if project_root is not None else Path.cwd()
+    return Path(root) / _canonical_project_dirname()
+
+
+def get_project_data_path(*parts: str, project_root: Optional[Path] = None) -> Path:
+    """Canonical *write* path for a project-local data file.
+
+    ``get_project_data_path("thinking.json")`` -> ``<cwd>/.praisonai/thinking.json``.
+    """
+    return get_project_data_dir(project_root).joinpath(*parts)
+
+
+def resolve_project_data_path(
+    *parts: str, project_root: Optional[Path] = None
+) -> Path:
+    """Canonical *read* path, falling back to the legacy ``.praison`` location.
+
+    Returns the canonical path when it exists, otherwise an existing legacy
+    ``<root>/.praison/<parts>`` (so data written before this fix is still
+    found), otherwise the canonical path again. Reads fall back; writes never
+    do -- use :func:`get_project_data_path` to save.
+    """
+    canonical = get_project_data_path(*parts, project_root=project_root)
+    if canonical.exists():
+        return canonical
+    root = project_root if project_root is not None else Path.cwd()
+    legacy = Path(root).joinpath(LEGACY_PROJECT_DATA_DIRNAME, *parts)
+    if legacy.exists():
+        return legacy
+    return canonical
+
+
+def get_knowledge_store_path(collection: str) -> str:
+    """Default on-disk vector-store location for a knowledge collection.
+
+    ``./.praisonai/knowledge/<collection>``, derived from the one canonical
+    constant. An existing legacy ``./.praison/knowledge/<collection>`` is still
+    used so a collection indexed before this fix is not orphaned.
+
+    Returned as a relative path string because that is what the knowledge
+    config consumers expect, and it must stay relative to whatever directory
+    the command is run from.
+    """
+    canonical = f"./{_canonical_project_dirname()}/knowledge/{collection}"
+    legacy = f"./{LEGACY_PROJECT_DATA_DIRNAME}/knowledge/{collection}"
+    if not os.path.exists(canonical) and os.path.exists(legacy):
+        return legacy
+    return canonical
 
 
 def get_state_dir() -> Path:

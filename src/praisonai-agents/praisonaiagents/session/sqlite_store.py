@@ -30,11 +30,12 @@ Usage::
 
 import os
 import threading
+from contextlib import contextmanager
 from typing import Any, Dict, List, Optional
 
 from praisonaiagents._logging import get_logger
 
-from .store import DefaultSessionStore, SessionData
+from .store import DefaultSessionStore, FileLock, SessionData
 
 logger = get_logger(__name__)
 
@@ -46,6 +47,11 @@ class SqliteSessionStore(DefaultSessionStore):
     (JSON files, file locking, retention/compaction) and layers a durable
     full-text index on top so ``search`` is a bounded index lookup.
     """
+
+    # Bumped whenever ``_flatten`` changes what content lands in the index, so
+    # a store built by an older release rebuilds its FTS rows once on upgrade.
+    # v2: archived_messages included (Issue #5031).
+    INDEX_CONTENT_VERSION = 2
 
     def __init__(
         self,
@@ -69,10 +75,13 @@ class SqliteSessionStore(DefaultSessionStore):
             db_path = os.path.expanduser(db_path)
         self.db_path = db_path
         self._db_lock = threading.RLock()
+        self._backfill_lock = threading.RLock()
+        self._backfill_running = False
         self._conn = None
         self._fts_available = False
         self._db_ready = False
         self._backfilled = False
+        self._backfill_upgraded_files = {}
 
     # ── index lifecycle ───────────────────────────────────────────────
 
@@ -93,9 +102,14 @@ class SqliteSessionStore(DefaultSessionStore):
             try:
                 if self.db_path != ":memory:":
                     os.makedirs(os.path.dirname(self.db_path) or ".", exist_ok=True)
-                conn = sqlite3.connect(
-                    self.db_path, check_same_thread=False, isolation_level=None
-                )
+                # Hardened factory: WAL where the filesystem supports it, safe
+                # DELETE fallback on NFS/SMB/FUSE/virtiofs (Issue #5264).
+                from ..storage.sqlite import connect as _sqlite_connect
+
+                # guard=True: quick_check on open + forensic backup + bounded
+                # least-destructive repair so a malformed index file recovers
+                # instead of taking the durable path down (Issue #5387).
+                conn = _sqlite_connect(self.db_path, isolation_level=None, guard=True)
                 self._fts_available = self._init_schema(conn)
                 self._conn = conn
             except Exception as exc:
@@ -116,6 +130,7 @@ class SqliteSessionStore(DefaultSessionStore):
                 "session_id TEXT PRIMARY KEY, updated_at TEXT)"
             )
             self._init_route_schema(conn)
+            self._init_index_meta_schema(conn)
             return True
         except Exception as exc:
             logger.info("FTS5 not available (%s); using LIKE fallback index.", exc)
@@ -129,6 +144,7 @@ class SqliteSessionStore(DefaultSessionStore):
                     "session_id TEXT PRIMARY KEY, updated_at TEXT)"
                 )
                 self._init_route_schema(conn)
+                self._init_index_meta_schema(conn)
                 return False
             except Exception:
                 self._conn = None
@@ -159,53 +175,123 @@ class SqliteSessionStore(DefaultSessionStore):
             "CREATE INDEX IF NOT EXISTS idx_route_agent "
             "ON session_route(agent_id)"
         )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_route_agent_session "
+            "ON session_route(agent_id, session_id)"
+        )
+
+    @staticmethod
+    def _init_index_meta_schema(conn) -> None:
+        """Create the key/value table tracking the index-content version.
+
+        Lets an upgrade detect that ``_flatten`` now indexes different content
+        (e.g. archived turns, Issue #5031) and force a one-time rebuild of the
+        FTS rows so pre-existing sessions become searchable immediately rather
+        than only after their next write.
+        """
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS session_index_meta ("
+            "  key TEXT PRIMARY KEY,"
+            "  value TEXT"
+            ")"
+        )
+
+    def _index_content_version(self, conn) -> Optional[int]:
+        """Read the persisted index-content version, or None if unset."""
+        try:
+            row = conn.execute(
+                "SELECT value FROM session_index_meta WHERE key = 'content_version'"
+            ).fetchone()
+        except Exception:
+            return None
+        if not row or row[0] is None:
+            return None
+        try:
+            return int(row[0])
+        except (TypeError, ValueError):
+            return None
+
+    def _set_index_content_version(self, conn, version: int) -> None:
+        """Persist the current index-content version."""
+        try:
+            conn.execute(
+                "INSERT OR REPLACE INTO session_index_meta (key, value) "
+                "VALUES ('content_version', ?)",
+                (str(version),),
+            )
+        except Exception as exc:
+            logger.debug("Failed to persist index content version: %s", exc)
 
     @staticmethod
     def _flatten(session: SessionData) -> str:
-        """Concatenate a session's message content for indexing."""
+        """Concatenate a session's message content for indexing.
+
+        Includes ``archived_messages`` (turns rolled out of the active window
+        by ``retention="compact"``) ahead of the active ``messages`` so a
+        compaction re-index preserves — rather than deletes — the raw turns,
+        keeping the whole conversation searchable (Issue #5031).
+        """
         parts = []
-        for msg in session.messages:
+        for msg in (*session.archived_messages, *session.messages):
             content = getattr(msg, "content", "")
             if content:
                 parts.append(str(content))
         return "\n".join(parts)
 
-    def _index_session(self, session: SessionData) -> None:
-        """Insert/replace a session's content in the index (best-effort)."""
+    def _index_session(self, session: SessionData) -> bool:
+        """Refresh the index best-effort, reporting whether it succeeded."""
         conn = self._connect()
         if conn is None:
-            return
+            return False
         content = self._flatten(session)
         sid = session.session_id
         gateway_session_id = getattr(session, "gateway_session_id", None)
         agent_id = getattr(session, "agent_id", None)
         try:
             with self._db_lock:
-                conn.execute("DELETE FROM session_fts WHERE session_id = ?", (sid,))
-                conn.execute(
-                    "INSERT INTO session_fts (session_id, content) VALUES (?, ?)",
-                    (sid, content),
-                )
-                conn.execute(
-                    "INSERT OR REPLACE INTO session_meta (session_id, updated_at) "
-                    "VALUES (?, ?)",
-                    (sid, session.updated_at),
-                )
-                # Keep the gateway/agent routing index in sync so inbound
-                # routing is an indexed lookup, not a full-directory scan.
-                if gateway_session_id or agent_id:
+                # A separate WAL reader must see the old or new index record,
+                # never the autocommitted gap between DELETE and INSERT.
+                owns_transaction = not conn.in_transaction
+                conn.execute("SAVEPOINT praisonai_index_refresh")
+                try:
+                    conn.execute("DELETE FROM session_fts WHERE session_id = ?", (sid,))
                     conn.execute(
-                        "INSERT OR REPLACE INTO session_route "
-                        "(session_id, gateway_session_id, agent_id) "
-                        "VALUES (?, ?, ?)",
-                        (sid, gateway_session_id, agent_id),
+                        "INSERT INTO session_fts (session_id, content) VALUES (?, ?)",
+                        (sid, content),
                     )
-                else:
                     conn.execute(
-                        "DELETE FROM session_route WHERE session_id = ?", (sid,)
+                        "INSERT OR REPLACE INTO session_meta (session_id, updated_at) "
+                        "VALUES (?, ?)",
+                        (sid, session.updated_at),
                     )
+                    if gateway_session_id or agent_id:
+                        conn.execute(
+                            "INSERT OR REPLACE INTO session_route "
+                            "(session_id, gateway_session_id, agent_id) "
+                            "VALUES (?, ?, ?)",
+                            (sid, gateway_session_id, agent_id),
+                        )
+                    else:
+                        conn.execute("DELETE FROM session_route WHERE session_id = ?", (sid,))
+                    conn.execute(
+                        "DELETE FROM session_index_meta WHERE key = ?",
+                        ("import_pending:" + sid,),
+                    )
+                    conn.execute("RELEASE praisonai_index_refresh")
+                except BaseException:
+                    if conn.in_transaction:
+                        if owns_transaction:
+                            # A failed outermost RELEASE leaves the transaction
+                            # active, including its uncommitted writes and locks.
+                            conn.execute("ROLLBACK")
+                        else:
+                            conn.execute("ROLLBACK TO praisonai_index_refresh")
+                            conn.execute("RELEASE praisonai_index_refresh")
+                    raise
         except Exception as exc:  # never let indexing break a write
             logger.debug("Session index update failed for %s: %s", sid, exc)
+            return False
+        return True
 
     def _deindex_session(self, session_id: str) -> None:
         conn = self._connect()
@@ -220,22 +306,60 @@ class SqliteSessionStore(DefaultSessionStore):
             logger.debug("Session de-index failed for %s: %s", session_id, exc)
 
     def _ensure_backfilled(self) -> None:
-        """Backfill the index from existing JSON transcripts exactly once.
+        """Backfill existing transcripts, retrying an incomplete pass.
 
-        Guarded by a one-time flag rather than by an empty-index check: a
+        Guarded by a successful-pass flag rather than an empty-index check: a
         single ``add_message`` on a *new* session could otherwise make the
         index non-empty and permanently skip backfilling pre-existing JSON
         transcripts, silently omitting legacy sessions from search results.
         Only sessions not already present in the index are (re)indexed, so the
         pass is cheap on a warm index.
         """
-        if self._backfilled:
-            return
-        with self._db_lock:
-            if self._backfilled:
+        # Do not hold the database lock while waiting for transcript locks:
+        # imports acquire their file lock before refreshing SQLite.
+        with self._backfill_lock:
+            if self._backfill_running:
                 return
-            self._backfilled = True
-            self._reindex_all()
+            # A corruption callback can query this store during the pass.
+            # It sees the index built so far; other threads wait for completion.
+            self._backfill_running = True
+            try:
+                self._retry_import_indexes()
+                if not self._backfilled:
+                    self._backfilled = self._reindex_all()
+            finally:
+                self._backfill_running = False
+
+    def _retry_import_indexes(self) -> None:
+        """Retry only failed restores, including after reopening the store."""
+        conn = self._connect()
+        if conn is None:
+            return
+        try:
+            with self._db_lock:
+                keys = conn.execute(
+                    "SELECT key FROM session_index_meta WHERE key GLOB 'import_pending:*'"
+                ).fetchall()
+            for (key,) in keys:
+                sid = key[len("import_pending:"):]
+                filepath = self._get_session_path(sid)
+                try:
+                    # Match the writer's file -> database order. File identity
+                    # may be unavailable; the lock still protects this read.
+                    with FileLock(filepath, self.lock_timeout):
+                        if not os.path.isfile(filepath):
+                            continue
+                        session = self._load_session_from_disk(sid, filepath)
+                        # The loader may quarantine a corrupt transcript and
+                        # return an empty placeholder. That is not recovery.
+                        if not os.path.isfile(filepath):
+                            continue
+                        self._reingest_spill(sid, session)
+                        self._index_session(session)
+                except Exception as exc:
+                    logger.debug("Import index retry failed for %s: %s", sid, exc)
+        except Exception as exc:
+            logger.debug("Cannot enumerate pending import indexes: %s", exc)
 
     def _indexed_ids(self) -> set:
         """Return the set of session_ids already fully indexed.
@@ -247,8 +371,7 @@ class SqliteSessionStore(DefaultSessionStore):
         otherwise have its already-content-indexed sessions skipped by backfill,
         leaving ``session_route`` empty and breaking gateway routing. Requiring a
         route row forces those sessions to be re-indexed so their route rows are
-        populated. Backfill runs at most once (guarded by ``_backfilled``), so
-        this stays a cheap one-time pass.
+        populated. Successful backfill runs once; incomplete passes can retry.
         """
         conn = self._connect()
         if conn is None:
@@ -267,24 +390,83 @@ class SqliteSessionStore(DefaultSessionStore):
         except Exception:
             return set()
 
-    def _reindex_all(self) -> None:
-        """Backfill the index from existing JSON transcripts (skip indexed)."""
+    def _reindex_all(self) -> bool:
+        """Backfill the index from existing JSON transcripts.
+
+        Normally cheap: sessions already fully indexed are skipped. When the
+        persisted index-content version is older than
+        ``INDEX_CONTENT_VERSION`` (e.g. a store built before archived turns were
+        indexed, Issue #5031), every session's FTS row is rebuilt once so
+        archived-only queries work immediately after upgrade rather than only
+        after each session's next write. The new version is then persisted so
+        subsequent startups fall back to the cheap skip behaviour. Completed
+        upgrades are retained in memory across failed passes; retries skip
+        those sessions only while their complete index projection and locked
+        transcript generation still match.
+        """
         try:
             filenames = os.listdir(self.session_dir)
         except (IOError, OSError):
-            return
-        already = self._indexed_ids()
+            return False
+        conn = self._connect()
+        if conn is None:
+            # No index is available; readers already use the parent JSON scan.
+            return True
+        with self._db_lock:
+            stale = self._index_content_version(conn) != self.INDEX_CONTENT_VERSION
+            try:
+                pending = {
+                    row[0][len("import_pending:"):]
+                    for row in conn.execute(
+                        "SELECT key FROM session_index_meta WHERE key GLOB 'import_pending:*'"
+                    ).fetchall()
+                }
+            except Exception as exc:
+                logger.debug("Cannot backfill pending import indexes: %s", exc)
+                return False
+        indexed = self._indexed_ids()
+        # A completed row alone cannot prove that a JSON-only peer has not
+        # replaced its transcript between upgrade attempts.
+        already = indexed if not stale else set()
+        complete = True
         for filename in filenames:
             if not filename.endswith(".json"):
                 continue
             sid = filename[:-5]
+            if sid in pending:
+                # Failed restore retries must not be bypassed by a synthetic
+                # empty transcript from the initial/upgrade backfill path.
+                complete = False
+                continue
             if sid in already:
                 continue
             try:
-                session = self._read_session_fresh(sid)
+                filepath = self._get_session_path(sid)
+                with FileLock(filepath, self.lock_timeout):
+                    identity = self._session_file_identity(filepath)
+                    if (
+                        stale and sid in indexed and identity is not None
+                        and self._backfill_upgraded_files.get(sid) == identity
+                    ):
+                        continue
+                    # Match import's file -> database order and keep a peer
+                    # replacement from making the just-read projection stale.
+                    session = self._load_session_from_disk(sid, filepath)
+                    self._reingest_spill(sid, session)
+                    with self._lock:
+                        self._cache[sid] = session
+                    if self._index_session(session):
+                        if stale:
+                            self._backfill_upgraded_files[sid] = identity
+                    else:
+                        complete = False
             except Exception:
-                continue
-            self._index_session(session)
+                complete = False
+        if complete:
+            with self._db_lock:
+                self._set_index_content_version(conn, self.INDEX_CONTENT_VERSION)
+            self._backfill_upgraded_files.clear()
+        return complete
 
     # ── write path: keep the index in sync ────────────────────────────
 
@@ -293,6 +475,106 @@ class SqliteSessionStore(DefaultSessionStore):
         if ok:
             self._index_session(session)
         return ok
+
+    def _save_imported_session(self, session: SessionData, *, overwrite: bool = True) -> bool:
+        """Refresh recall and routing after a verbatim portable restore."""
+        ok = super()._save_imported_session(session, overwrite=overwrite)
+        if ok:
+            try:
+                filepath = self._get_session_path(session.session_id)
+                with FileLock(filepath, self.lock_timeout):
+                    # Read-only cache fallback is unsafe after an overwrite:
+                    # it can restore routing fields removed by the import.
+                    fresh = self._load_session_from_disk(session.session_id, filepath)
+                    self._reingest_spill(session.session_id, fresh)
+                    # Cleanup must describe the generation actually refreshed,
+                    # including a peer write that followed the durable import.
+                    session._import_file_identity = self._session_file_identity(filepath)
+                    session._import_index_session = fresh
+                    with self._lock:
+                        self._cache[session.session_id] = fresh
+                    if not self._index_session(fresh):
+                        raise RuntimeError("post-import index update failed")
+            except Exception as exc:
+                # The JSON write succeeded, but the old index is no longer a
+                # trustworthy view. Fail closed until a later refresh/rebuild.
+                self._invalidate_import_index(session)
+                logger.debug("Post-import index refresh failed for %s: %s", session.session_id, exc)
+        return ok
+
+    def _invalidate_import_index(self, session: SessionData) -> None:
+        """Clear a failed import index unless it matches the current transcript."""
+        identity = getattr(session, "_import_file_identity", None)
+        conn = self._connect()
+        if conn is None:
+            return
+        try:
+            with self._db_lock:
+                # Persist recovery separately from cleanup: unreadable or
+                # changing generations must remain retryable after restart.
+                conn.execute(
+                    "INSERT OR REPLACE INTO session_index_meta (key, value) VALUES (?, '1')",
+                    ("import_pending:" + session.session_id,),
+                )
+                # Serialize with other SQLite writers before checking the file.
+                # A peer saving afterward must index after this transaction;
+                # a peer already indexed has a different atomic file identity.
+                owns_transaction = not conn.in_transaction
+                conn.execute("SAVEPOINT praisonai_import_cleanup")
+                try:
+                    # SAVEPOINT alone is deferred. Acquire the SQLite writer
+                    # reservation before observing the transcript generation.
+                    conn.execute(
+                        "UPDATE session_index_meta SET value = value WHERE key = ?",
+                        ("import_pending:" + session.session_id,),
+                    )
+                    filepath = self._get_session_path(session.session_id)
+                    current_identity = self._session_file_identity(filepath)
+                    expected = None
+                    if identity is not None and current_identity == identity:
+                        expected = getattr(session, "_import_index_session", session)
+                    elif current_identity is not None:
+                        # A JSON-only peer may replace the file without updating
+                        # SQLite. Read without FileLock while holding the DB
+                        # transaction; never quarantine or mutate that file.
+                        import json
+                        with open(filepath, "r", encoding="utf-8") as handle:
+                            data = json.load(handle)
+                        if self._session_file_identity(filepath) == current_identity:
+                            expected = SessionData.from_dict(data)
+                    if expected is not None:
+                        sid = session.session_id
+                        content = conn.execute("SELECT content FROM session_fts WHERE session_id = ?", (sid,)).fetchall()
+                        metadata = conn.execute("SELECT updated_at FROM session_meta WHERE session_id = ?", (sid,)).fetchall()
+                        routes = conn.execute("SELECT gateway_session_id, agent_id FROM session_route WHERE session_id = ?", (sid,)).fetchall()
+                        expected_routes = (
+                            [(expected.gateway_session_id, expected.agent_id)]
+                            if expected.gateway_session_id or expected.agent_id else []
+                        )
+                        # A peer may have successfully indexed this same file
+                        # generation after our failed update. Preserve a complete
+                        # matching projection; file identity alone cannot tell
+                        # whether those index rows are already current.
+                        current = (
+                            content == [(self._flatten(expected),)]
+                            and metadata == [(expected.updated_at,)]
+                            and routes == expected_routes
+                        )
+                        if not current:
+                            conn.execute("DELETE FROM session_fts WHERE session_id = ?", (sid,))
+                            conn.execute("DELETE FROM session_meta WHERE session_id = ?", (sid,))
+                            conn.execute("DELETE FROM session_route WHERE session_id = ?", (sid,))
+                    conn.execute("RELEASE praisonai_import_cleanup")
+                except BaseException:
+                    if conn.in_transaction:
+                        if owns_transaction:
+                            conn.execute("ROLLBACK")
+                        else:
+                            conn.execute("ROLLBACK TO praisonai_import_cleanup")
+                            conn.execute("RELEASE praisonai_import_cleanup")
+                    raise
+        except Exception as exc:
+            logger.debug("Post-import index invalidation failed for %s: %s", session.session_id, exc)
 
     def _modify_session_locked(self, session_id, mutator, **kwargs) -> bool:
         """Refresh the index after any locked read-modify-write.
@@ -335,12 +617,6 @@ class SqliteSessionStore(DefaultSessionStore):
                 logger.debug("Post-add index refresh failed for %s: %s", session_id, exc)
         return ok
 
-    def clear_session(self, session_id: str) -> bool:
-        ok = super().clear_session(session_id)
-        if ok:
-            self._deindex_session(session_id)
-        return ok
-
     def delete_session(self, session_id: str) -> bool:
         ok = super().delete_session(session_id)
         if ok:
@@ -367,14 +643,14 @@ class SqliteSessionStore(DefaultSessionStore):
                     match = self._to_fts_query(query)
                     rows = conn.execute(
                         "SELECT session_id FROM session_fts WHERE session_fts "
-                        "MATCH ? ORDER BY bm25(session_fts) LIMIT ?",
+                        "MATCH ? ORDER BY bm25(session_fts), session_id LIMIT ?",
                         (match, fetch),
                     ).fetchall()
                 else:
                     like = "%" + query.replace("%", "").replace("_", "") + "%"
                     rows = conn.execute(
                         "SELECT session_id FROM session_fts WHERE content LIKE ? "
-                        "LIMIT ?",
+                        "ORDER BY session_id LIMIT ?",
                         (like, fetch),
                     ).fetchall()
         except Exception as exc:
@@ -392,7 +668,119 @@ class SqliteSessionStore(DefaultSessionStore):
             return '""'
         return " OR ".join('"%s"' % t for t in terms)
 
+    @contextmanager
+    def _search_id_connection(self, conn):
+        """Keep WAL candidate enumeration off the writer connection."""
+        import sqlite3
+        from pathlib import Path
+
+        with self._db_lock:
+            journal = conn.execute("PRAGMA journal_mode").fetchone()[0]
+        if self.db_path != ":memory:" and journal.lower() == "wal":
+            reader = sqlite3.connect(
+                Path(self.db_path).resolve().as_uri() + "?mode=ro",
+                uri=True, isolation_level=None,
+            )
+            try:
+                yield reader
+            finally:
+                reader.close()
+        else:
+            # Non-WAL stores retain the shared lock only for ID enumeration,
+            # never for transcript reads or corruption callbacks.
+            with self._db_lock:
+                yield conn
+
+    @contextmanager
+    def _search_candidate_ids(self, conn, query: str):
+        """Spool matching IDs in fixed batches; close SQL before file I/O.
+
+        A stable candidate set requires enumerating the matches. Spooling only
+        IDs bounds Python ID memory without copying the index or keeping a
+        SQLite read snapshot across transcript reads and corruption callbacks.
+        """
+        import json
+        import tempfile
+
+        with tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as spool:
+            with self._search_id_connection(conn) as reader:
+                if self._fts_available:
+                    cursor = reader.execute(
+                        "SELECT session_id FROM session_fts WHERE session_fts "
+                        "MATCH ? ORDER BY bm25(session_fts), session_id",
+                        (self._to_fts_query(query),),
+                    )
+                else:
+                    like = "%" + query.replace("%", "").replace("_", "") + "%"
+                    cursor = reader.execute(
+                        "SELECT session_id FROM session_fts WHERE content LIKE ? "
+                        "ORDER BY session_id", (like,),
+                    )
+                try:
+                    while True:
+                        rows = cursor.fetchmany(128)
+                        if not rows:
+                            break
+                        for row in rows:
+                            spool.write(json.dumps(row[0], ensure_ascii=True) + "\n")
+                finally:
+                    cursor.close()
+            spool.seek(0)
+            yield (json.loads(line) for line in spool)
+
+    def _read_search_candidates(self, query: str, limit: int, consume=None):
+        """Read usable lineages outside the SQL lock and read snapshot.
+
+        A consumer scores each payload immediately instead of retaining every
+        continuation. Without a consumer, preserve the private list interface.
+        """
+        import json
+
+        conn = self._connect()
+        if conn is None:
+            return None
+        self._ensure_backfilled()
+        allowance = max(limit * 5, limit, 1)
+        candidates = []
+        lineages = set()
+        try:
+            with self._search_candidate_ids(conn, query) as ids:
+                for sid in ids:
+                    filepath = self._get_session_path(sid)
+                    try:
+                        with open(filepath, "r", encoding="utf-8") as handle:
+                            data = json.load(handle)
+                    except (UnicodeDecodeError, json.JSONDecodeError, OSError) as exc:
+                        self._report_unreadable_session(sid, filepath, exc)
+                        continue
+                    if consume is None:
+                        candidates.append((sid, data))
+                    else:
+                        consume(sid, data)
+                    lineage = self._lineage_key(data)
+                    lineages.add(("lineage", lineage) if lineage is not None else ("session", sid))
+                    if len(lineages) >= allowance:
+                        break
+        except Exception as exc:
+            logger.debug("Index query failed (%s); falling back to scan.", exc)
+            return None
+        return candidates
+
     # ── gateway/agent routing: indexed key → session lookup ───────────
+
+    def _read_indexed_route(self, session_id: str) -> Optional[SessionData]:
+        """Verify a route from durable JSON without a stale cache fallback."""
+        filepath = self._get_session_path(session_id)
+        try:
+            with FileLock(filepath, self.lock_timeout):
+                session = self._load_session_from_disk(session_id, filepath)
+                self._reingest_spill(session_id, session)
+            with self._lock:
+                self._cache[session_id] = session
+            return session
+        except (OSError, ValueError, TypeError) as exc:
+            logger.debug("Cannot verify indexed route for %s: %s", session_id, exc)
+            return None
 
     def get_by_gateway_session(self, gateway_session_id: str) -> Optional[SessionData]:
         """Resolve a session by ``gateway_session_id`` via the indexed route.
@@ -400,6 +788,7 @@ class SqliteSessionStore(DefaultSessionStore):
         Overrides the parent's O(N) ``os.listdir`` + JSON-parse-every-file scan
         with a single indexed ``SELECT`` on ``session_route`` so inbound routing
         latency is independent of the number of stored sessions (Issue #2956).
+        The loaded binding must still match; transient reads do not use cache.
         Falls back to the parent scan if the index is unavailable.
         """
         conn = self._connect()
@@ -418,33 +807,56 @@ class SqliteSessionStore(DefaultSessionStore):
             return super().get_by_gateway_session(gateway_session_id)
         if row is None:
             return None
-        try:
-            return self._read_session_fresh(row[0])
-        except Exception:
+        session = self._read_indexed_route(row[0])
+        if session is None or session.gateway_session_id != gateway_session_id:
             return None
+        return session
 
     def list_sessions_by_gateway_agent(self, agent_id: str, limit: int = 50) -> List[str]:
         """List session IDs for a gateway agent via the indexed route.
 
         Overrides the parent's full-directory scan with an indexed ``SELECT``
-        on ``session_route`` (Issue #2956). Falls back to the parent scan if the
-        index is unavailable.
+        on ``session_route`` (Issue #2956). Matching candidates are verified
+        against JSON outside the database lock, and only verified IDs count
+        toward the limit. Falls back to the parent scan if the index is unavailable.
         """
         conn = self._connect()
         if conn is None:
             return super().list_sessions_by_gateway_agent(agent_id, limit)
         self._ensure_backfilled()
+        if limit == 0:
+            return []
+        verified = []
+        after = None
         try:
-            with self._db_lock:
-                rows = conn.execute(
-                    "SELECT session_id FROM session_route WHERE agent_id = ? "
-                    "LIMIT ?",
-                    (agent_id, limit),
-                ).fetchall()
+            while True:
+                with self._db_lock:
+                    # A peer can remove or reassign earlier rows during file
+                    # verification. Resume by identity, not a shifting offset.
+                    condition = "" if after is None else "AND session_id > ? "
+                    params = (agent_id, limit) if after is None else (agent_id, after, limit)
+                    rows = conn.execute(
+                        "SELECT session_id FROM session_route WHERE agent_id = ? "
+                        + condition + "ORDER BY session_id LIMIT ?",
+                        params,
+                    ).fetchall()
+                if not rows:
+                    break
+                # File I/O stays outside the database lock. Unknown generations
+                # retain their index rows, but cannot supply obsolete bindings.
+                for (sid,) in rows:
+                    session = self._read_indexed_route(sid)
+                    if session is not None and session.agent_id == agent_id:
+                        verified.append(sid)
+                        if limit > 0 and len(verified) >= limit:
+                            return verified
+                if limit < 0:
+                    break
+                after = rows[-1][0]
         except Exception as exc:
             logger.debug("Route lookup failed (%s); falling back to scan.", exc)
             return super().list_sessions_by_gateway_agent(agent_id, limit)
-        return [r[0] for r in rows]
+        return verified
 
     def search(
         self,
@@ -467,29 +879,19 @@ class SqliteSessionStore(DefaultSessionStore):
         if not query:
             return []
 
-        candidate_ids = self._candidate_ids(query, limit)
-        if candidate_ids is None:
-            return super().search(query, limit=limit, window=window)
-        if not candidate_ids:
-            return []
-
         needle = query.lower()
         terms = [t for t in needle.split() if t]
-        hits: List[tuple] = []
+        hits: Dict[Any, tuple] = {}
+        position = 0
 
-        for sid in candidate_ids:
-            filepath = self._get_session_path(sid)
-            try:
-                import json
-
-                with open(filepath, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-            except (json.JSONDecodeError, IOError, OSError):
-                continue
-
-            messages = data.get("messages", [])
-            if not isinstance(messages, list):
-                continue
+        def consume(sid, data):
+            """Retain each lineage's best hit and its original tie position."""
+            nonlocal position
+            ordinal = position
+            position += 1
+            messages = self._searchable_messages(data)
+            if not messages:
+                return
 
             best_index = -1
             best_score = 0.0
@@ -511,7 +913,7 @@ class SqliteSessionStore(DefaultSessionStore):
                     best_index = idx
 
             if best_index < 0:
-                continue
+                return
 
             start = max(0, best_index - window)
             end = min(len(messages), best_index + window + 1)
@@ -521,6 +923,7 @@ class SqliteSessionStore(DefaultSessionStore):
                     "role": messages[i].get("role", ""),
                     "content": messages[i].get("content", ""),
                     "timestamp": messages[i].get("timestamp"),
+                    "archived": bool(messages[i].get("archived")),
                 }
                 for i in range(start, end)
                 if isinstance(messages[i], dict)
@@ -541,13 +944,26 @@ class SqliteSessionStore(DefaultSessionStore):
                 messages=context,
                 bookends=self._bookends(messages, self.BOOKEND_SIZE),
             )
-            hits.append((self._lineage_key(data), hit))
+            lineage = self._lineage_key(data)
+            key = ("lineage", lineage) if lineage is not None else ("session", sid)
+            previous = hits.get(key)
+            if previous is None or (hit.score, hit.when or "") > (
+                previous[1].score, previous[1].when or ""
+            ):
+                hits[key] = (lineage, hit, ordinal)
 
-        hits.sort(key=lambda item: (item[1].score, item[1].when or ""), reverse=True)
+        candidates = self._read_search_candidates(query, limit, consume=consume)
+        if candidates is None:
+            return super().search(query, limit=limit, window=window)
+        ranked = sorted(
+            hits.values(),
+            key=lambda item: (item[1].score, item[1].when or "", -item[2]),
+            reverse=True,
+        )
 
         deduped: List[Any] = []
         seen_lineage: set = set()
-        for lineage, hit in hits:
+        for lineage, hit, _ in ranked:
             if lineage is not None:
                 if lineage in seen_lineage:
                     continue

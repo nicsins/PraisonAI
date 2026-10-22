@@ -33,11 +33,13 @@ Usage:
 
 from dataclasses import dataclass, field
 import math
-from typing import Dict, List, Any, Optional, Callable, Tuple, Union, FrozenSet
+from typing import Dict, List, Any, Optional, Callable, Tuple, Union, FrozenSet, TYPE_CHECKING
 from enum import Enum
 
-# Import AutonomyConfig from canonical location (no circular dep)
-from ..agent.autonomy import AutonomyConfig
+if TYPE_CHECKING:
+    # Type-only: the eager import pulled agent.autonomy and escalation.types onto
+    # every `from praisonaiagents import Agent` path (see resolve_autonomy).
+    from ..agent.autonomy import AutonomyConfig
 
 # Default tool output limit (16000 chars ≈ 4000 tokens)
 # Single source of truth shared by OutputConfig.tool_output_limit and
@@ -293,6 +295,29 @@ class MemoryConfig:
     def __post_init__(self):
         # Reject a backend we cannot provide instead of substituting another.
         self.backend = validate_memory_backend(self.backend)
+        # Fail fast on a non-adapter ``db``. The memory bridge drives this object
+        # through the ``DbAdapter`` lifecycle hooks
+        # (``on_agent_start``/``on_user_message``/``on_agent_message``). A bare
+        # path string or other non-adapter used to flow through, where each hook
+        # raised ``'str' object has no attribute 'on_agent_start'`` and was
+        # swallowed as a warning -- memory looked enabled while every message was
+        # silently dropped (Issue #5668). A valid ``db`` is a DbAdapter or a
+        # ``db(...)`` backend instance; both implement these hooks. Require the
+        # hooks themselves (callable), not a weaker signal like ``database_url``
+        # that a half-built object could expose while still dropping messages.
+        if self.db is not None and not all(
+            callable(getattr(self.db, hook, None))
+            for hook in ("on_agent_start", "on_user_message", "on_agent_message")
+        ):
+            raise TypeError(
+                "MemoryConfig.db must be a DbAdapter instance (e.g. db(...) / "
+                "db.SQLiteDB(path=...)) implementing the on_agent_start/"
+                "on_user_message/on_agent_message hooks, not "
+                f"{type(self.db).__name__}. For a SQLite file use "
+                'db(database_url="sqlite:///path/to.db") or '
+                'MemoryConfig(backend="sqlite", config={"short_db": "short.db", '
+                '"long_db": "long.db"}).'
+            )
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
@@ -898,7 +923,7 @@ class ExecutionConfig:
     
     # Code execution (consolidated from allow_code_execution + code_execution_mode)
     code_execution: bool = False
-    code_mode: str = "safe"  # "safe" or "unsafe"
+    code_mode: str = "safe"  # "safe", "unsafe" or "isolated"
     
     # Code-execution-with-tools (code mode): when True, model-generated code may
     # call the agent's registered tools directly via injected proxies, enabling
@@ -947,6 +972,11 @@ class ExecutionConfig:
     # and reject a conflicting ToolConfig(parallel=True) instead of silently winning.
     parallel_tool_calls: Optional[bool] = None
 
+    # Auto-continue a final answer cut off by the output-token limit
+    # (finish_reason="length"): True = up to 3 continuations (default),
+    # False/0 = disabled (surface ``length_truncated`` immediately), int = cap.
+    output_continuation: Union[bool, int] = True
+
     # Durable tool-loop replay. Default-off keeps the execution hot path free
     # of journal construction and SQLite writes.
     durable: bool = False
@@ -963,6 +993,15 @@ class ExecutionConfig:
         # Validate the unified step budget early (before any early returns below).
         if self.max_steps is not None and self.max_steps < 1:
             raise ValueError("ExecutionConfig.max_steps must be >= 1 when set.")
+        # code_mode is a security-shaped switch: "safe" (subprocess, no tools),
+        # "unsafe" (same-process + tools, timeout not enforced), or "isolated"
+        # (subprocess + tools bridged back to the parent under the approval
+        # gate). Reject typos loudly rather than silently degrading isolation.
+        if self.code_mode not in ("safe", "unsafe", "isolated"):
+            raise ValueError(
+                "ExecutionConfig.code_mode must be 'safe', 'unsafe' or "
+                f"'isolated'; got {self.code_mode!r}."
+            )
         # Handle context_compaction serialization round-trip
         if isinstance(self.context_compaction, dict):
             from ..context.policy import ContextCompactionPolicy
@@ -1067,6 +1106,7 @@ class ExecutionConfig:
             "compaction_strategy": self.compaction_strategy.value if self.compaction_strategy and hasattr(self.compaction_strategy, 'value') else (str(self.compaction_strategy) if self.compaction_strategy else None),
             "max_budget": self.max_budget,
             "parallel_tool_calls": self.parallel_tool_calls,
+            "output_continuation": self.output_continuation,
             "durable": self.durable,
             "journal_path": self.journal_path,
             "resume_run_id": self.resume_run_id,
@@ -1112,6 +1152,7 @@ class ExecutionConfig:
             compaction_strategy=compaction_strategy,
             max_budget=data.get("max_budget", None),
             parallel_tool_calls=data.get("parallel_tool_calls", None),
+            output_continuation=data.get("output_continuation", True),
             durable=data.get("durable", False),
             journal_path=data.get("journal_path", None),
             resume_run_id=data.get("resume_run_id", None),
@@ -1372,21 +1413,33 @@ class HooksConfig:
             middleware=[my_middleware],
         ))
     """
-    # Step callback
+    # Step callback: invoked once per agent step (one model call) with the
+    # ``ModelResponse`` for that step. Routed onto the ``after_model``
+    # middleware slot; the return value is ignored.
     on_step: Optional[Callable] = None
     
-    # Tool call callback
+    # Tool call callback: invoked before every tool the agent executes with the
+    # ``ToolRequest`` (``.tool_name`` / ``.arguments``). Routed onto the
+    # ``before_tool`` middleware slot; the return value is ignored.
     on_tool_call: Optional[Callable] = None
     
     # Middleware list
     middleware: List[Any] = field(default_factory=list)
-    
+
+    # Optional per-agent HookRegistry for event-based hooks (BEFORE_TOOL,
+    # AFTER_AGENT, ...). When None the agent uses the process-wide default
+    # registry (so plugins bridged into it still fire). Set this to a private
+    # ``HookRegistry()`` to keep event hooks registered for THIS agent from
+    # firing on unrelated agents that share the default registry.
+    registry: Optional[Any] = None
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
         return {
             "on_step": str(self.on_step) if self.on_step else None,
             "on_tool_call": str(self.on_tool_call) if self.on_tool_call else None,
             "middleware": [str(m) for m in self.middleware],
+            "registry": type(self.registry).__name__ if self.registry is not None else None,
         }
 
 
@@ -1781,39 +1834,18 @@ def resolve_caching(value: CachingParam) -> Optional[CachingConfig]:
     return _resolve(value, CachingConfig)
 
 
-def resolve_autonomy(value: AutonomyParam) -> Optional[AutonomyConfig]:
+def resolve_autonomy(value: AutonomyParam) -> Optional["AutonomyConfig"]:
     """
     Resolve autonomy= parameter following precedence ladder.
     
     Delegates to the canonical resolver in param_resolver.py.
     Kept for backward compatibility with tests.
     """
+    # Lazy: agent.autonomy (and, through it, escalation.types) is only needed
+    # when a caller actually resolves an autonomy= value.
+    from ..agent.autonomy import AutonomyConfig
     from .param_resolver import resolve_autonomy as _resolve
     return _resolve(value, AutonomyConfig)
-
-
-def resolve_tool_search(value: ToolSearchParam) -> Optional["ToolSearchConfig"]:
-    """
-    Resolve tool_search= parameter following precedence ladder.
-    
-    NOTE: This resolver has zero references in the codebase but is kept
-    for backward compatibility. Consider removing in a future version.
-    """
-    # Simple implementation since it's unused
-    if value is None or value is False:
-        return None
-    # Lazy-load ToolSearchConfig only when tool search is actually configured,
-    # so the tools subsystem is not imported on the `import Agent` path.
-    ToolSearchConfig = _resolve_tool_search_config()
-    if value is True:
-        return ToolSearchConfig()
-    if isinstance(value, str):
-        return ToolSearchConfig(enabled=value)
-    if isinstance(value, dict):
-        return ToolSearchConfig(**value)
-    if isinstance(value, ToolSearchConfig):
-        return value
-    return value
 
 
 def resolve_tools(value: ToolParam) -> Optional[ToolConfig]:
@@ -2036,7 +2068,6 @@ __all__ = [
     "resolve_web",
     "resolve_caching",
     "resolve_autonomy",
-    "resolve_tool_search",
     "resolve_tools",
     "resolve_runtime",
     "canonical_runtime_name",
@@ -2048,10 +2079,18 @@ def __getattr__(name):
 
     ``ToolSearchConfig`` is resolved (and the tools subsystem imported) only on
     first access, so ``from praisonaiagents import Agent`` does not eagerly load
-    the entire tools package (issue #3191).
+    the entire tools package (issue #3191). ``AutonomyConfig`` follows the same
+    pattern (issue #5056).
     """
     if name == "ToolSearchConfig":
         cfg = _resolve_tool_search_config()
         globals()["ToolSearchConfig"] = cfg  # cache for subsequent access
         return cfg
+    if name == "AutonomyConfig":
+        # Same idea for AutonomyConfig: keep the historical import path
+        # (``from ...feature_configs import AutonomyConfig``) working without
+        # loading agent.autonomy / escalation.types at module import (#5056).
+        from ..agent.autonomy import AutonomyConfig
+        globals()["AutonomyConfig"] = AutonomyConfig
+        return AutonomyConfig
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

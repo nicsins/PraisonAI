@@ -68,7 +68,25 @@ class JobExecutor:
         # dashboard tabs streaming the same run), so keep a list of callbacks
         # per job and fan-out to all of them.
         self._progress_callbacks: Dict[str, list] = {}
+        # Shared webhook client: reused across every completed job so webhook
+        # POSTs share a keep-alive connection pool instead of doing a fresh TLS
+        # handshake per notification. Constructed lazily and closed on stop().
+        self._webhook_client = None
+        # Guards the lazy construction of ``_webhook_client`` so two concurrent
+        # first-time webhook sends can't each build a client and leak one that
+        # ``stop()`` never closes. Created lazily inside the running loop.
+        self._webhook_client_lock: Optional[asyncio.Lock] = None
     
+    async def _get_webhook_client(self):
+        """Return the shared webhook client, building it once under a lock."""
+        import httpx
+        if self._webhook_client_lock is None:
+            self._webhook_client_lock = asyncio.Lock()
+        async with self._webhook_client_lock:
+            if self._webhook_client is None:
+                self._webhook_client = httpx.AsyncClient(timeout=30.0)
+            return self._webhook_client
+
     def _get_semaphore(self) -> asyncio.Semaphore:
         """Lazily create semaphore to avoid event loop issues."""
         if self._semaphore is None:
@@ -102,6 +120,20 @@ class JobExecutor:
                 pass
         
         self._running_tasks.clear()
+        
+        # Release the shared webhook connection pool. Take the same lock a send
+        # uses so we never close the client out from under an in-flight POST.
+        if self._webhook_client_lock is not None:
+            async with self._webhook_client_lock:
+                client, self._webhook_client = self._webhook_client, None
+        else:
+            client, self._webhook_client = self._webhook_client, None
+        if client is not None:
+            try:
+                await client.aclose()
+            except Exception as e:
+                logger.warning(f"Error closing webhook client: {e}")
+        
         logger.info("JobExecutor stopped")
     
     async def _cleanup_loop(self):
@@ -288,7 +320,16 @@ class JobExecutor:
         
         # Determine agent configuration
         agent_file = job.agent_file or "agents.yaml"
-        framework = job.framework or "praisonai"
+        # Resolve the default framework off the event loop: first-time registry
+        # construction scans entry-point metadata and probes adapters (blocking
+        # import machinery), which must not stall other jobs on a busy worker.
+        import asyncio
+
+        def _resolve_framework() -> str:
+            from ..framework_adapters.registry import get_default_registry
+            return get_default_registry().resolve_or_default(job.framework)
+
+        framework = await asyncio.to_thread(_resolve_framework)
         
         # Check if we should use inline YAML
         if job.agent_yaml:
@@ -415,9 +456,10 @@ class JobExecutor:
         if job.config:
             cli_config.update(job.config)
 
+        from ..framework_adapters.registry import get_default_registry
         result = await arun(
             agent_file=agent_file,
-            framework=job.framework or "praisonai",
+            framework=get_default_registry().resolve_or_default(job.framework),
             cli_config=cli_config or None,
         )
         
@@ -483,8 +525,19 @@ class JobExecutor:
             return
         
         try:
-            import httpx
-            
+            # Re-validate immediately before delivery. Submit-time validation
+            # can be stale (jobs run for minutes/hours); an attacker-controlled
+            # DNS record could flip a public answer to an internal one in the
+            # meantime (DNS rebinding / TOCTOU) and exfiltrate ``job.result``.
+            from .models import resolve_validated_webhook_targets
+            try:
+                safe_ips = await asyncio.to_thread(
+                    resolve_validated_webhook_targets, job.webhook_url
+                )
+            except ValueError as exc:
+                logger.warning(f"Webhook target rejected for {job.id}: {exc}")
+                return
+
             payload = {
                 "job_id": job.id,
                 "status": job.status.value,
@@ -493,18 +546,41 @@ class JobExecutor:
                 "completed_at": job.completed_at.isoformat() if job.completed_at else None,
                 "duration_seconds": job.duration_seconds
             }
-            
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                response = await client.post(
-                    job.webhook_url,
-                    json=payload,
-                    headers={"Content-Type": "application/json"}
+
+            # Pin the connection to an address we just screened so the kernel
+            # never re-resolves the hostname (which could return a freshly
+            # rebound internal address between this check and the connect).
+            # We build the request against the original URL (so the Host header
+            # and TLS SNI stay correct), then rewrite only the connect host to
+            # the validated IP and preserve SNI via the ``sni_hostname``
+            # extension.
+            client = await self._get_webhook_client()
+            request = client.build_request(
+                "POST",
+                job.webhook_url,
+                json=payload,
+                headers={"Content-Type": "application/json"},
+            )
+            original_host = request.url.host
+            request.headers.setdefault("Host", request.url.netloc.decode("ascii"))
+            request.extensions["sni_hostname"] = original_host
+            request.url = request.url.copy_with(host=safe_ips[0])
+            # Never follow redirects: a 3xx to an internal URL must not be
+            # silently chased past the validated target.
+            response = await client.send(request, follow_redirects=False)
+
+            if response.status_code >= 400:
+                logger.warning(f"Webhook failed for {job.id}: {response.status_code}")
+            elif response.is_redirect:
+                # Redirects are deliberately not followed (SSRF guard). Surface
+                # this so an undelivered notification is not silently logged as
+                # a success.
+                logger.warning(
+                    f"Webhook for {job.id} returned redirect "
+                    f"{response.status_code}; not followed, result not delivered"
                 )
-                
-                if response.status_code >= 400:
-                    logger.warning(f"Webhook failed for {job.id}: {response.status_code}")
-                else:
-                    logger.info(f"Webhook sent for {job.id}")
+            else:
+                logger.info(f"Webhook sent for {job.id}")
                     
         except Exception as e:
             logger.error(f"Webhook error for {job.id}: {e}")

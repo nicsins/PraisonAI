@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "praisonaiagents"
-version = "1.7.2"
+version = "1.7.14"
 description = "Praison AI agents for completing complex tasks with Self Reflection Agents"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -17,7 +17,12 @@ dependencies = [
     "openai>=1.68.2",
     "posthog>=3.0.0",
     "PyYAML>=6.0",
-    "aiohttp>=3.8.0"
+    "aiohttp>=3.8.0",
+    # The scheduler converts every natural-language recurring schedule
+    # ("every day at 9am", "weekdays at 9am") to cron; without this engine
+    # those jobs are accepted and silently never fire. Pure Python; pulls
+    # only python-dateutil.
+    "croniter>=6.0"
 ]
 
 [project.optional-dependencies]
@@ -34,11 +39,15 @@ sandbox = [
 ]
 
 mcp = [
-    "mcp>=1.20.0",
+    "mcp>=1.20.0,<2",
     "fastapi>=0.115.0",
     "uvicorn>=0.34.0",
     "websockets>=12.0"
 ]
+parallel-search = [
+    "mcp>=1.30.0,<2",
+]
+
 
 memory = [
     "chromadb>=1.0.0",
@@ -62,6 +71,11 @@ graph = [
 llm = [
     "litellm>=1.83.14",
     "pydantic>=2.10.0"
+]
+
+# System One / Jev decision models (optional; HTTP client works without this)
+decisions = [
+    "typesafe-sdk>=0.7.0",
 ]
 
 # Add API dependencies
@@ -131,6 +145,7 @@ all = [
     "praisonaiagents[knowledge]",
     "praisonaiagents[graph]",
     "praisonaiagents[llm]",
+    "praisonaiagents[decisions]",
     "praisonaiagents[mcp]",
     "praisonaiagents[api]",
     "praisonaiagents[telemetry]",

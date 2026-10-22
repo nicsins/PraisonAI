@@ -85,6 +85,32 @@ _global_option_names_lock = threading.Lock()
 _LEGACY_COLLIDING_SHORT_OPTS = frozenset({"-s", "-f"})
 
 
+def _introspect_option_names(command):
+    """Derive ``(all_opts, value_opts)`` from a Click command's parameters.
+
+    Single owner for the parse loop shared by :func:`_get_run_option_names` and
+    :func:`_get_global_option_names`; ``all_opts`` is every long/short option
+    string and ``value_opts`` is the non-flag subset that consumes a value.
+    """
+    all_opts = set()
+    value_opts = set()
+    for param in command.params:
+        is_flag = getattr(param, "is_flag", False) or getattr(
+            param, "is_bool_flag", False
+        )
+        for opt in getattr(param, "opts", []):
+            if opt.startswith("-"):
+                all_opts.add(opt)
+                if not is_flag:
+                    value_opts.add(opt)
+        # Secondary opts are the negated forms of bool flags
+        # (e.g. ``--no-stream``); never value-consuming.
+        for opt in getattr(param, "secondary_opts", []):
+            if opt.startswith("-"):
+                all_opts.add(opt)
+    return all_opts, value_opts
+
+
 def _get_run_option_names():
     """Return the option names accepted by the Typer ``run`` command.
 
@@ -110,22 +136,7 @@ def _get_run_option_names():
             from typer.main import get_command as _get_command
 
             command = _get_command(run_app)
-            all_opts = set()
-            value_opts = set()
-            for param in command.params:
-                is_flag = getattr(param, "is_flag", False) or getattr(
-                    param, "is_bool_flag", False
-                )
-                for opt in getattr(param, "opts", []):
-                    if opt.startswith("-"):
-                        all_opts.add(opt)
-                        if not is_flag:
-                            value_opts.add(opt)
-                # Secondary opts are the negated forms of bool flags
-                # (e.g. ``--no-stream``); never value-consuming.
-                for opt in getattr(param, "secondary_opts", []):
-                    if opt.startswith("-"):
-                        all_opts.add(opt)
+            all_opts, value_opts = _introspect_option_names(command)
         except Exception:
             # Introspection depends only on the static command definition, so a
             # failure here is structural — cache it (as ``False``) to avoid
@@ -157,20 +168,7 @@ def _get_global_option_names():
             from typer.main import get_command as _get_command
 
             command = _get_command(root_app)
-            all_opts = set()
-            value_opts = set()
-            for param in command.params:
-                is_flag = getattr(param, "is_flag", False) or getattr(
-                    param, "is_bool_flag", False
-                )
-                for opt in getattr(param, "opts", []):
-                    if opt.startswith("-"):
-                        all_opts.add(opt)
-                        if not is_flag:
-                            value_opts.add(opt)
-                for opt in getattr(param, "secondary_opts", []):
-                    if opt.startswith("-"):
-                        all_opts.add(opt)
+            all_opts, value_opts = _introspect_option_names(command)
         except Exception:
             _global_option_names_cache = False
             return None
@@ -577,6 +575,26 @@ def _split_global_flags(argv, value_opts):
     return global_flags, rest
 
 
+def _ensure_utf8_stdio():
+    """Reconfigure non-UTF-8 stdout/stderr (e.g. Windows cp1252) to UTF-8.
+
+    Setting ``PYTHONIOENCODING`` only affects child processes; the current
+    process's streams must be reconfigured so Rich icons/box drawing used by
+    commands like ``praisonai browser doctor`` do not raise
+    ``UnicodeEncodeError``.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        encoding = (getattr(stream, "encoding", None) or "").lower().replace("-", "")
+        if encoding in ("utf8", "cp65001"):
+            continue
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except (ValueError, OSError):
+                pass
+
+
 def _run_typer(argv):
     """Dispatch to the Typer CLI app."""
     import os
@@ -588,6 +606,7 @@ def _run_typer(argv):
             # Force UTF-8 mode for subprocess safety
             if 'PYTHONIOENCODING' not in os.environ:
                 os.environ['PYTHONIOENCODING'] = 'utf-8'
+        _ensure_utf8_stdio()
     
     # Serialize Typer registration through the discovery lock so this path
     # cannot race with ``_get_typer_commands`` mid-registration on another

@@ -6,6 +6,7 @@ Provides configuration dataclasses for gateway and session settings.
 
 from dataclasses import dataclass, field
 from typing import (
+    TYPE_CHECKING,
     Any,
     Callable,
     Dict,
@@ -17,6 +18,9 @@ from typing import (
     Tuple,
     runtime_checkable,
 )
+
+if TYPE_CHECKING:  # pragma: no cover - typing only, no runtime import cost
+    from .protocols import TurnExecutorProtocol
 
 
 # ---------------------------------------------------------------------------
@@ -44,6 +48,122 @@ class ConfigVersionError(ValueError):
         (``true``, ``"1"``, ``1.0``) is a mistake, not "current", so it is
         rejected instead of being treated as version 1 via ``True == 1``.
     """
+
+
+class ConfigValidationError(ValueError):
+    """Raised when gateway config contains an unknown/misspelled key.
+
+    Carries the dotted ``path`` to the offending section plus the offending
+    ``keys`` and (when a near match exists) a ``suggestion`` so the error is
+    actionable — e.g. ``channels.telegram.tokenn: unknown key (did you mean
+    'token'?)`` — rather than the silent no-op a typo produces today (#5723).
+    """
+
+    def __init__(
+        self,
+        path: str,
+        keys: List[str],
+        suggestion: Optional[str] = None,
+    ) -> None:
+        self.path = path
+        self.keys = list(keys)
+        self.suggestion = suggestion
+        # Keys may be non-string YAML scalars; render by string form so the
+        # error message never raises while formatting itself.
+        shown = ", ".join(sorted(str(k) for k in self.keys))
+        msg = f"{path}: unknown key(s): {shown}"
+        if suggestion:
+            msg += f" (did you mean '{suggestion}'?)"
+        super().__init__(msg)
+
+
+def _closest_known_key(unknown: str, known: Set[str]) -> Optional[str]:
+    """Return the closest known key to ``unknown`` for a "did you mean" hint.
+
+    ``unknown`` may be any YAML scalar (e.g. a numeric/boolean mapping key), so
+    only string keys are matched — difflib expects strings and a non-string key
+    cannot be a typo of a reserved string key.
+    """
+    if not isinstance(unknown, str):
+        return None
+    import difflib
+
+    matches = difflib.get_close_matches(unknown, sorted(known), n=1, cutoff=0.6)
+    return matches[0] if matches else None
+
+
+def _check_unknown_keys(
+    data: Mapping[str, Any],
+    known: Set[str],
+    path: str,
+    strict: bool,
+) -> None:
+    """Reject (strict) or warn about keys in ``data`` not present in ``known``.
+
+    When ``strict`` is False (the default, preserving today's fail-open
+    behaviour) a prominent warning is logged for each unknown key so the
+    misconfiguration surfaces before a future release makes it a hard failure.
+    """
+    # Keys may be any YAML scalar (numeric/boolean mapping keys), so compare as
+    # strings and sort by string form to avoid a TypeError on mixed types —
+    # preserving today's tolerance (those extras were silently dropped) rather
+    # than crashing config loading.
+    unknown = sorted(
+        (k for k in data if k not in known), key=lambda k: str(k)
+    )
+    if not unknown:
+        return
+    suggestion = _closest_known_key(unknown[0], known)
+    if strict:
+        raise ConfigValidationError(path, unknown, suggestion)
+    import logging
+
+    hint = f" (did you mean '{suggestion}'?)" if suggestion else ""
+    logging.getLogger(__name__).warning(
+        "Ignoring unknown %s key(s) %s%s; valid keys are %s",
+        path,
+        unknown,
+        hint,
+        sorted(known),
+    )
+
+
+def _check_typo_keys(
+    data: Mapping[str, Any],
+    reserved: Set[str],
+    path: str,
+    strict: bool,
+) -> None:
+    """Flag keys that look like typos of ``reserved`` keys.
+
+    Unlike :func:`_check_unknown_keys` this does *not* reject every extra key —
+    it only fires on a close misspelling of a reserved key (e.g. ``tokenn`` for
+    ``token``), so sections that legitimately accept pass-through keys (channel
+    metadata) keep working while the #5723 footgun still surfaces.
+    """
+    import difflib
+
+    for key in data:
+        if key in reserved:
+            continue
+        # Only a string key can be a typo of a reserved string key; a
+        # non-string key (numeric/boolean YAML scalar) passes through to
+        # metadata untouched, as before.
+        if not isinstance(key, str):
+            continue
+        match = difflib.get_close_matches(key, sorted(reserved), n=1, cutoff=0.8)
+        if match:
+            if strict:
+                raise ConfigValidationError(path, [key], match[0])
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "Ignoring %s key %r which looks like a typo of %r; "
+                "if intentional this is passed through as metadata",
+                path,
+                key,
+                match[0],
+            )
 
 
 @dataclass
@@ -290,6 +410,74 @@ class SupportsHotReload(Protocol):
     def apply_hot_reload(
         self, paths: Set[str], new_config: Mapping[str, Any]
     ) -> None:
+        ...
+
+
+# ---------------------------------------------------------------------------
+# Candidate reload validation + rollback contract (Issue #5144)
+# ---------------------------------------------------------------------------
+#
+# ``classify_reload``/``ReloadScope`` decide *what* a config change touches; a
+# structural (``FULL``) change makes the runtime tear the live channels down
+# and bring the new config up. A config that passes the schema but fails at
+# *runtime* (unreachable model, an adapter that throws on load, bad wiring) is
+# not caught before that cutover, and there is no rollback — a single bad edit
+# can take a healthy always-on gateway offline.
+#
+# This is the small, canonical contract that makes a reload an *atomic,
+# validated cutover*: build/boot the candidate runtime in isolation and run the
+# existing readiness/turn pre-flight *before* the live one is withdrawn; only
+# swap when the candidate is proven healthy, otherwise keep the old config
+# serving. Core owns only the *shape* (a report + a protocol, no heavy
+# imports); the wrapper/bot gateway performs the concrete build+pre-flight.
+
+
+@dataclass
+class CandidateReport:
+    """Outcome of validating a candidate config *before* cutover.
+
+    Produced by :meth:`ReloadValidationProtocol.validate_candidate`: the
+    gateway builds/boots the candidate runtime in isolation (or a pre-flight)
+    and reports whether it is healthy enough to swap in. When ``ok`` is False
+    the live config keeps serving and the failures feed
+    :class:`~praisonaiagents.gateway.protocols.ReloadStatus.error` / ``health()``.
+
+    Attributes:
+        ok: Whether the candidate built and passed pre-flight — only then may
+            the live runtime be drained and the candidate swapped in.
+        failures: Human-readable reasons the candidate was rejected (empty when
+            ``ok``); joined into the reload ``error`` an operator sees.
+        candidate: Optional opaque handle to the already-built candidate runtime
+            the wrapper activates on success. Left untyped so core carries no
+            heavy runtime import; ``None`` when the runtime validates in place.
+    """
+
+    ok: bool
+    failures: "List[str]" = field(default_factory=list)
+    candidate: Optional[Any] = None
+
+
+@runtime_checkable
+class ReloadValidationProtocol(Protocol):
+    """Protocol a gateway implements for atomic, validated config cutover.
+
+    The invariant: **never drain the live runtime until**
+    :meth:`validate_candidate` **returns a report with** ``ok=True``. Owning
+    this contract in core keeps the "never cut over to an unvalidated
+    candidate" guarantee canonical so every gateway build honours it, rather
+    than being re-implemented per entry point (SIGHUP, ``gateway reload``,
+    ``gateway restart``).
+    """
+
+    async def validate_candidate(
+        self, new_config: Mapping[str, Any]
+    ) -> CandidateReport:
+        """Build/boot the candidate from ``new_config`` and pre-flight it.
+
+        Must not stop or mutate the live runtime; on any failure return a
+        report with ``ok=False`` and the reason(s) so the caller keeps the
+        previous config serving.
+        """
         ...
 
 
@@ -681,10 +869,17 @@ class ApiConfig:
             backed by the gateway's live agents and sessions.
         mcp: Serve an MCP JSON-RPC endpoint (``/mcp``) exposing the gateway's
             registered agents as callable tools.
+        stream: Emit true token-level deltas on the OpenAI-compatible
+            ``/v1/chat/completions`` SSE surface (``stream:true``) by wiring the
+            agent's existing ``stream_emitter`` through the gateway hot path.
+            Off by default: streaming responses stay byte-for-byte the buffered
+            single-chunk path, so enabling it never regresses non-streaming
+            latency or correctness.
     """
 
     openai: bool = False
     mcp: bool = False
+    stream: bool = False
 
     @property
     def enabled(self) -> bool:
@@ -693,7 +888,7 @@ class ApiConfig:
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
-        return {"openai": self.openai, "mcp": self.mcp}
+        return {"openai": self.openai, "mcp": self.mcp, "stream": self.stream}
 
     @classmethod
     def from_dict(cls, data: Optional[Dict[str, Any]]) -> "ApiConfig":
@@ -703,6 +898,7 @@ class ApiConfig:
         return cls(
             openai=bool(data.get("openai", False)),
             mcp=bool(data.get("mcp", False)),
+            stream=bool(data.get("stream", False)),
         )
 
 
@@ -772,6 +968,163 @@ class EmergencyStopConfig:
 
 
 @dataclass
+class AttachmentConfig:
+    """Attachment/media ceilings for the gateway wire protocol (Issue #5207).
+
+    The gateway is the control plane custom ``/ws`` clients build on, but the
+    ``message`` frame had no attachment contract and no per-attachment size/type
+    policy — only the whole-frame ``max_payload``. These ceilings are advertised
+    to clients in the ``hello`` handshake (folded into ``HelloResult.policy``) so
+    a well-behaved client self-limits — inlining small files, chunking larger
+    ones at ``chunk_bytes`` — instead of discovering the limit by being
+    disconnected. All fields are advisory limits; enforcement lives wherever the
+    gateway materialises attachments (a wrapper/bot concern).
+
+    Backward-compatible: attachments are opt-in per turn, and a client that
+    never sends one is unaffected by these values.
+
+    Attributes:
+        max_attachment_bytes: Largest single attachment (inline or stored) the
+            gateway accepts, in bytes. Default 10 MiB.
+        max_attachments: Maximum number of attachments on one ``message`` turn.
+        chunk_bytes: Advertised chunk size a client should use when streaming a
+            large file into the attachment store (reserve → put chunk → close).
+        allowed_types: Optional allow-list of MIME types / prefixes (e.g.
+            ``image/`` or ``application/pdf``). Empty (default) means no type
+            restriction is advertised.
+    """
+
+    max_attachment_bytes: int = 10 * 1024 * 1024  # 10 MiB
+    max_attachments: int = 10
+    chunk_bytes: int = 256 * 1024  # 256 KiB
+    allowed_types: List[str] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if self.max_attachment_bytes < 0:
+            raise ValueError(
+                "max_attachment_bytes must be >= 0 (use 0 to disable attachments)"
+            )
+        if self.max_attachments < 0:
+            raise ValueError("max_attachments must be >= 0")
+        if self.chunk_bytes <= 0:
+            raise ValueError("chunk_bytes must be > 0")
+
+    @property
+    def enabled(self) -> bool:
+        """Whether the gateway advertises any attachment capacity."""
+        return self.max_attachment_bytes > 0 and self.max_attachments > 0
+
+    def to_policy(self) -> Dict[str, Any]:
+        """Build the policy fragment advertised in ``HelloResult.policy``.
+
+        Only advertises the attachment ceilings when enabled, so a gateway with
+        attachments disabled advertises exactly today's policy shape. The type
+        allow-list is included only when configured.
+        """
+        if not self.enabled:
+            return {}
+        policy: Dict[str, Any] = {
+            "max_attachment_bytes": self.max_attachment_bytes,
+            "max_attachments": self.max_attachments,
+            "chunk_bytes": self.chunk_bytes,
+        }
+        if self.allowed_types:
+            policy["allowed_attachment_types"] = list(self.allowed_types)
+        return policy
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary."""
+        return {
+            "max_attachment_bytes": self.max_attachment_bytes,
+            "max_attachments": self.max_attachments,
+            "chunk_bytes": self.chunk_bytes,
+            "allowed_types": list(self.allowed_types),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Optional[Dict[str, Any]]) -> "AttachmentConfig":
+        """Create from a parsed ``gateway.attachments`` mapping (tolerant of None)."""
+        if not isinstance(data, dict):
+            return cls()
+        allowed = data.get("allowed_types")
+        return cls(
+            max_attachment_bytes=int(
+                data.get("max_attachment_bytes", 10 * 1024 * 1024)
+            ),
+            max_attachments=int(data.get("max_attachments", 10)),
+            chunk_bytes=int(data.get("chunk_bytes", 256 * 1024)),
+            allowed_types=[str(t) for t in allowed] if isinstance(allowed, (list, tuple)) else [],
+        )
+
+
+def _parse_drain_timeout(value: Any) -> Optional[float]:
+    """Coerce a ``gateway.drain_timeout`` YAML value to a float (or None).
+
+    Tolerant of env-substituted strings (e.g. ``"20"``); an unparseable /
+    negative value falls back to None (no drain) rather than raising, matching
+    the wrapper's fail-open handling of a malformed drain window (#5362).
+    """
+    if value is None:
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 0 else None
+
+
+def _parse_watchdog_enabled(value: Any) -> bool:
+    """Whether a ``gateway.watchdog`` YAML value enables the loop watchdog.
+
+    Accepts both a bare truthy scalar and the documented block form
+    (``watchdog: { enabled: true, ... }``), mirroring the wrapper's watchdog
+    wiring so the public config reflects the same on/off decision (#5362).
+    """
+    if isinstance(value, dict):
+        flag = value.get("enabled", False)
+    else:
+        flag = value
+    if isinstance(flag, str):
+        return flag.strip().lower() in ("1", "true", "yes", "on")
+    return bool(flag)
+
+
+def _parse_watchdog_timeout(value: Any) -> Optional[float]:
+    """Derive the loop-stall budget (seconds) from a ``gateway.watchdog`` block.
+
+    Reads ``liveness_interval * liveness_strikes`` from the block form when
+    present so the public config exposes the effective wedge budget the CLI
+    ``--watchdog-timeout`` flag sets; returns None when unset/unparseable.
+    """
+    if not isinstance(value, dict):
+        return None
+    try:
+        interval = float(value.get("liveness_interval", 5.0))
+        strikes = int(value.get("liveness_strikes", 3)) or 3
+    except (TypeError, ValueError):
+        return None
+    budget = interval * strikes
+    return budget if budget > 0 else None
+
+
+def _parse_watchdog_timeout_scalar(value: Any) -> Optional[float]:
+    """Coerce an explicit ``gateway.watchdog_timeout`` scalar to a float.
+
+    Mirrors the ``watchdog_timeout > 0`` invariant (see ``GatewayConfig``):
+    tolerant of env-substituted strings (e.g. ``"15"``); an unparseable or
+    non-positive value falls back to None so a malformed timeout disables the
+    budget rather than raising (#5362).
+    """
+    if value is None:
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+@dataclass
 class GatewayConfig:
     """Configuration for the gateway server.
     
@@ -803,6 +1156,13 @@ class GatewayConfig:
     host: str = "127.0.0.1"
     port: int = 8765
     bind_host: Optional[str] = None
+    # Issue #5312: CIDRs/IPs of upstream proxies/tunnels the operator declares
+    # trusted. Empty (default) means the gateway is directly exposed: forwarded
+    # headers are never believed and per-IP policy keys on the socket peer.
+    # When set, the real client IP is resolved by walking the forwarded chain
+    # across trusted hops (see ``resolve_ingress_attribution``); anything
+    # proxy-shaped but unattributable fails closed to the socket peer.
+    trusted_proxies: List[str] = field(default_factory=list)
     cors_origins: List[str] = field(default_factory=lambda: [])
     allowed_origins: List[str] = field(default_factory=lambda: [])
     auth_token: Optional[str] = None
@@ -826,6 +1186,18 @@ class GatewayConfig:
     max_concurrent_runs: int = 0  # Aggregate concurrency ceiling (0 = unlimited)
     queue_depth: int = 0  # Bounded wait queue when at the ceiling
     overflow_policy: str = "reject"  # reject | queue | shed_oldest
+    # Issue #5362: complete the back-pressure/lifecycle posture on the public
+    # config so a Python embedder / gateway.yaml can pin it declaratively —
+    # parity with the CLI ``--drain-timeout`` / ``--watchdog`` /
+    # ``--watchdog-timeout`` flags. ``None``/False keep today's behaviour
+    # (no drain, watchdog off); a CLI flag still overrides these at start.
+    drain_timeout: Optional[float] = None  # graceful-drain window on shutdown (s)
+    watchdog: bool = False  # event-loop liveness watchdog (opt-in)
+    watchdog_timeout: Optional[float] = None  # loop-stall budget before restart (s)
+    # Issue #5168: per-tenant/per-scope concurrency sub-limit within the global
+    # ceiling so one tenant cannot occupy every run slot. 0 disables the
+    # sub-limit (today's global-only behaviour).
+    max_concurrent_runs_per_scope: int = 0
     # Issue #2620: pre-auth edge protections for internet-exposed deployments.
     # Cap concurrent *unauthenticated* WebSocket connections per source IP so a
     # hostile client cannot park many half-open sockets up to max_connections
@@ -854,6 +1226,20 @@ class GatewayConfig:
     control: "EmergencyStopConfig" = field(
         default_factory=lambda: EmergencyStopConfig()
     )
+    # Issue #5207: first-class attachment ceilings for the gateway wire
+    # protocol, advertised to clients via HelloResult.policy so a custom /ws
+    # client can self-limit/chunk before sending a file. Defaults keep a
+    # sensible 10 MiB / 10-file / 256 KiB-chunk policy; attachments remain
+    # opt-in per turn so a client that never sends one is unaffected.
+    attachments: "AttachmentConfig" = field(default_factory=lambda: AttachmentConfig())
+    # Issue #4766: per-session turn-execution seam. Selects *where* a session's
+    # agent turn runs (see ``TurnExecutorProtocol``). ``None`` (the default)
+    # resolves to ``InProcessTurnExecutor`` at runtime — today's on-loop
+    # behaviour, byte-for-byte, with no dependency introduced. Supplying an
+    # isolated executor (subprocess / container / remote, in the wrapper)
+    # contains a wedged/runaway turn to its own worker instead of forcing the
+    # whole-process ``os._exit`` remedy.
+    executor: "Optional[TurnExecutorProtocol]" = None
 
     def __post_init__(self) -> None:
         """Post-initialization to set bind_host from host if not specified and validate values."""
@@ -886,6 +1272,19 @@ class GatewayConfig:
         if self.overflow_policy not in ("reject", "queue", "shed_oldest"):
             raise ValueError(
                 "overflow_policy must be one of 'reject', 'queue', 'shed_oldest'"
+            )
+        if self.drain_timeout is not None and self.drain_timeout < 0:
+            raise ValueError(
+                "drain_timeout must be >= 0 (use 0/None to disable the drain window)"
+            )
+        if self.watchdog_timeout is not None and self.watchdog_timeout <= 0:
+            raise ValueError(
+                "watchdog_timeout must be > 0 (leave unset to use the default budget)"
+            )
+        if self.max_concurrent_runs_per_scope < 0:
+            raise ValueError(
+                "max_concurrent_runs_per_scope must be >= 0 "
+                "(use 0 to disable the per-scope sub-limit)"
             )
         if self.preauth_max_connections_per_ip < 0:
             raise ValueError(
@@ -954,6 +1353,7 @@ class GatewayConfig:
         return {
             "host": self.host,
             "port": self.port,
+            "trusted_proxies": list(self.trusted_proxies),
             "cors_origins": self.cors_origins,
             "allowed_origins": self.allowed_origins,
             "auth_token": "***" if self.auth_token else None,
@@ -969,6 +1369,10 @@ class GatewayConfig:
             "max_concurrent_runs": self.max_concurrent_runs,
             "queue_depth": self.queue_depth,
             "overflow_policy": self.overflow_policy,
+            "drain_timeout": self.drain_timeout,
+            "watchdog": self.watchdog,
+            "watchdog_timeout": self.watchdog_timeout,
+            "max_concurrent_runs_per_scope": self.max_concurrent_runs_per_scope,
             "preauth_max_connections_per_ip": self.preauth_max_connections_per_ip,
             "max_unauthorized_frames": self.max_unauthorized_frames,
             "push": self.push.to_dict(),
@@ -977,6 +1381,14 @@ class GatewayConfig:
             "liveness": self.liveness.to_dict(),
             "turn_lock": self.turn_lock.to_dict(),
             "control": self.control.to_dict(),
+            "attachments": self.attachments.to_dict(),
+            # Report the active executor type so ``gateway doctor`` can surface
+            # it; ``None`` means the in-process default (today's behaviour).
+            "executor": (
+                type(self.executor).__name__
+                if self.executor is not None
+                else "inprocess"
+            ),
         }
     
     @property
@@ -1071,8 +1483,33 @@ class MultiChannelGatewayConfig:
     channels: Dict[str, ChannelRouteConfig] = field(default_factory=dict)
     hooks: List[Any] = field(default_factory=list)
     
+    # Known top-level and nested keys for strict unknown-key validation
+    # (#5723). Kept here as the single source of truth consumed by all three
+    # surfaces (YAML, CLI, Python) — ``gateway doctor`` reuses the same sets.
+    _KNOWN_TOP_KEYS = frozenset({"gateway", "agents", "channels", "hooks", "config_version"})
+    _KNOWN_GATEWAY_KEYS = frozenset({
+        "host", "port", "trusted_proxies", "cors_origins", "allowed_origins",
+        "auth_token", "auth", "auth_scopes", "max_connections",
+        "max_sessions_per_agent", "session_config", "heartbeat_interval",
+        "reconnect_timeout", "per_turn_timeout", "ssl_cert", "ssl_key",
+        "max_buffered_bytes", "max_queued_frames", "max_concurrent_runs",
+        "queue_depth", "overflow_policy", "drain_timeout", "watchdog",
+        "watchdog_timeout", "max_concurrent_runs_per_scope",
+        "preauth_max_connections_per_ip", "max_unauthorized_frames",
+        "api", "liveness", "turn_lock", "control", "attachments",
+        "push", "preflight", "strict_tools", "hooks",
+        # Derived/read-only keys emitted by ``GatewayConfig.to_dict`` so a
+        # round-tripped config stays strict-clean.
+        "ssl_enabled", "scope_policy_enabled", "executor",
+    })
+    _KNOWN_CHANNEL_KEYS = frozenset({
+        "token", "app_token", "routes", "enabled",
+    })
+
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "MultiChannelGatewayConfig":
+    def from_dict(
+        cls, data: Dict[str, Any], *, strict: bool = False
+    ) -> "MultiChannelGatewayConfig":
         """Create from parsed YAML dictionary.
         
         Expected format::
@@ -1093,12 +1530,27 @@ class MultiChannelGatewayConfig:
         
         Args:
             data: Parsed YAML dictionary
+            strict: When True, unknown/misspelled keys raise
+                :class:`ConfigValidationError` with a path-scoped, actionable
+                message. When False (default, backward-compatible) unknown keys
+                are tolerated but logged as a prominent warning so a typo such
+                as ``channels.telegram.tokenn`` surfaces instead of silently
+                no-op'ing (#5723).
             
         Returns:
             Configured MultiChannelGatewayConfig instance
         """
+        # Validate top-level keys first so a misplaced section is caught early.
+        # Use a distinct "<root>" path so a top-level typo (e.g. ``channelz``)
+        # is not misreported under the ``gateway`` section it does not live in.
+        _check_unknown_keys(data, set(cls._KNOWN_TOP_KEYS), "<root>", strict)
+
         # Parse gateway section
         gw_data = data.get("gateway", {})
+        if isinstance(gw_data, dict):
+            _check_unknown_keys(
+                gw_data, set(cls._KNOWN_GATEWAY_KEYS), "gateway", strict
+            )
         
         # Parse session config if provided
         session_config = SessionConfig()
@@ -1139,9 +1591,17 @@ class MultiChannelGatewayConfig:
                 for tok, scopes in gw_data["auth_scopes"].items()
             }
 
+        raw_trusted = gw_data.get("trusted_proxies", [])
+        trusted_proxies = (
+            [str(p).strip() for p in raw_trusted if str(p).strip()]
+            if isinstance(raw_trusted, (list, tuple))
+            else []
+        )
+
         gateway_config = GatewayConfig(
             host=gw_data.get("host", "127.0.0.1"),
             port=gw_data.get("port", 8765),
+            trusted_proxies=trusted_proxies,
             cors_origins=gw_data.get("cors_origins", []),
             allowed_origins=gw_data.get("allowed_origins", []),
             auth_token=gw_data.get("auth_token"),
@@ -1158,6 +1618,20 @@ class MultiChannelGatewayConfig:
             max_concurrent_runs=int(gw_data.get("max_concurrent_runs", 0) or 0),
             queue_depth=int(gw_data.get("queue_depth", 0) or 0),
             overflow_policy=str(gw_data.get("overflow_policy", "reject") or "reject"),
+            drain_timeout=_parse_drain_timeout(gw_data.get("drain_timeout")),
+            watchdog=_parse_watchdog_enabled(gw_data.get("watchdog")),
+            # Prefer an explicit ``gateway.watchdog_timeout`` scalar (as emitted
+            # by ``to_dict`` and settable directly, matching the CLI
+            # ``--watchdog-timeout`` flag); otherwise derive the budget from the
+            # ``watchdog`` block so both round-trip and block forms work (#5362).
+            watchdog_timeout=(
+                _parse_watchdog_timeout_scalar(gw_data.get("watchdog_timeout"))
+                if gw_data.get("watchdog_timeout") is not None
+                else _parse_watchdog_timeout(gw_data.get("watchdog"))
+            ),
+            max_concurrent_runs_per_scope=int(
+                gw_data.get("max_concurrent_runs_per_scope", 0) or 0
+            ),
             preauth_max_connections_per_ip=int(
                 gw_data.get("preauth_max_connections_per_ip", 32)
             ),
@@ -1169,6 +1643,7 @@ class MultiChannelGatewayConfig:
             liveness=LivenessConfig.from_dict(gw_data.get("liveness")),
             turn_lock=TurnLockConfig.from_dict(gw_data.get("turn_lock")),
             control=EmergencyStopConfig.from_dict(gw_data.get("control")),
+            attachments=AttachmentConfig.from_dict(gw_data.get("attachments")),
         )
         
         # Parse agents section (pass through as dicts)
@@ -1178,6 +1653,17 @@ class MultiChannelGatewayConfig:
         channels: Dict[str, ChannelRouteConfig] = {}
         for name, ch_data in data.get("channels", {}).items():
             if isinstance(ch_data, dict):
+                # Channels deliberately pass unrecognised keys through to
+                # ``metadata`` for channel-specific config, so we can't reject
+                # *every* extra key. Instead flag only near-miss typos of the
+                # reserved keys (e.g. ``tokenn`` → ``token``) — the motivating
+                # footgun in #5723 — leaving genuine metadata untouched.
+                _check_typo_keys(
+                    ch_data,
+                    set(cls._KNOWN_CHANNEL_KEYS),
+                    f"channels.{name}",
+                    strict,
+                )
                 channels[name] = ChannelRouteConfig(
                     channel_type=name,
                     token_env=ch_data.get("token", ""),

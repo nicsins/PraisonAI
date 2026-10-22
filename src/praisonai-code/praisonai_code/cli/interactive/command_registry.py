@@ -148,13 +148,56 @@ class CustomCommandSource:
         return commands
 
 
+def _make_skill_handler(skill: Any) -> Callable[[str], Optional[str]]:
+    """Build a handler that turns a discovered skill into a runnable prompt.
+
+    The interactive surfaces dispatch any registry command by calling its
+    ``handler`` and feeding the returned text to the agent. A skill therefore
+    needs a handler that renders its ``SKILL.md`` body (plus the user's ``args``)
+    into a prompt, matching how :class:`CustomCommandSource` renders custom
+    commands. Without this, ``/my-skill`` would appear in the menu but fall
+    through to "Unknown command" because both dispatchers require a handler.
+    """
+
+    def handler(args: str) -> Optional[str]:
+        name = str(getattr(skill, "name", "") or "")
+        description = getattr(skill, "description", "") or ""
+        body = ""
+        path = getattr(skill, "path", None)
+        if path is not None:
+            try:
+                from praisonaiagents.skills.parser import (
+                    find_skill_md,
+                    parse_frontmatter,
+                )
+
+                skill_md = find_skill_md(path)
+                if skill_md is not None:
+                    _, body = parse_frontmatter(skill_md.read_text(encoding="utf-8"))
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.debug("Skill body unavailable for %s: %s", name, exc)
+
+        sections = [f"Use the '{name}' skill."]
+        if description:
+            sections.append(description)
+        if body:
+            sections.append(body)
+        if args:
+            sections.append(args)
+        return "\n\n".join(section for section in sections if section)
+
+    return handler
+
+
 class SkillCommandSource:
     """Optional source exposing discovered skills as invocable commands.
 
     Skills live in the core SDK (``praisonaiagents.skills``); this source only
     *consumes* them. It fails silently (returns ``[]``) when the skills module
     or any project skills are unavailable, so it never adds import cost or
-    breaks surfaces that do not use skills.
+    breaks surfaces that do not use skills. Each skill carries a handler that
+    renders its ``SKILL.md`` body into a prompt so ``/name`` invocation works in
+    every interactive surface, not just the completion menu.
     """
 
     def discover(self) -> List[Command]:
@@ -174,12 +217,20 @@ class SkillCommandSource:
             name = getattr(skill, "name", None)
             if not name:
                 continue
+            # ``user-invocable: false`` marks a skill as model-only: it must
+            # not be offered in the ``/`` menu nor dispatch as ``/name``.
+            # ``SkillManager.get_user_invocable_skills`` / ``invoke`` apply
+            # the same rule, so the menu and the agent agree on what a user
+            # may run. Missing attribute (older SDK) defaults to invocable.
+            if not getattr(skill, "user_invocable", True):
+                continue
             commands.append(
                 Command(
                     name=str(name),
                     description=getattr(skill, "description", "") or "Skill",
                     kind=CommandKind.SKILL,
                     source="skill",
+                    handler=_make_skill_handler(skill),
                 )
             )
         return commands
@@ -262,6 +313,16 @@ def _discover_entry_point_sources() -> List[Any]:
     return sources
 
 
+def _definitions_fingerprint() -> Any:
+    """Fingerprint of the definition roots, or ``None`` when unavailable."""
+    try:
+        from ..features.custom_definitions import definitions_fingerprint
+
+        return definitions_fingerprint()
+    except Exception:  # pragma: no cover - defensive
+        return None
+
+
 class CommandRegistry:
     """Aggregates command sources into a single ``/name`` namespace.
 
@@ -280,6 +341,7 @@ class CommandRegistry:
         self._commands: Dict[str, Command] = {}
         self._aliases: Dict[str, str] = {}
         self._discovered = False
+        self._fingerprint: Any = None
 
     def add_source(self, source: Any) -> None:
         """Append a command source (invalidates the discovery cache)."""
@@ -287,9 +349,16 @@ class CommandRegistry:
         self._discovered = False
 
     def discover(self, force: bool = False) -> Dict[str, Command]:
-        """Resolve all sources into ``{name: Command}`` (cached)."""
-        if self._discovered and not force:
+        """Resolve all sources into ``{name: Command}`` (cached).
+
+        The cache is invalidated when the file-based definition roots change
+        (a command or skill was added, removed or edited), so long-lived
+        interactive sessions pick up edits on the next lookup without restart.
+        """
+        fingerprint = _definitions_fingerprint()
+        if self._discovered and not force and fingerprint == self._fingerprint:
             return self._commands
+        self._fingerprint = fingerprint
 
         self._commands.clear()
         self._aliases.clear()

@@ -20,7 +20,7 @@ import tempfile
 import threading
 import unittest
 import urllib.request
-from http.server import ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -44,6 +44,9 @@ class StubAgent:
         self.started = 0
         self.chat_history = []
         self.seen_history = None
+        self.seen_kwargs = None
+        self.seen_prompt = None
+        self.seen_attachments = None
 
     def _append_to_chat_history(self, message):
         self.chat_history.append(message)
@@ -51,6 +54,9 @@ class StubAgent:
     def start(self, prompt, stream=True, **kwargs):
         self.started += 1
         self.seen_history = list(self.chat_history)
+        self.seen_kwargs = dict(kwargs)
+        self.seen_prompt = prompt
+        self.seen_attachments = kwargs.get("attachments")
         # Tools "run" before the model's answer would arrive, exactly as the
         # display callback records them during a real turn.
         for tool in self.tools:
@@ -129,6 +135,34 @@ class ChatStream(unittest.TestCase):
         self.assertIn("tool_result", kinds, f"the tool result was never shown: {kinds}")
         results = [d for k, d in frames if k == "tool_result"]
         self.assertEqual(results[0]["output"], "2026-08-27 00:13:35")
+
+    def test_a_stream_that_yielded_something_first_still_counts_its_tools(self):
+        # Every tool-then-die test above uses chunks=(), which is the one path
+        # where the loop body never runs -- so the drain inside the loop was
+        # never exercised and its discarded return value went unnoticed. One
+        # frame of anything is enough to take the other path.
+        self._install(chunks=[{"type": "reasoning", "text": "thinking"}], tools=[_tool()])
+        frames = self._chat()
+        errors = [d for k, d in frames if k == "error"]
+        self.assertTrue(errors, "no error was reported")
+        self.assertEqual(
+            errors[0].get("kind"), "no_answer",
+            "a stream that yielded a non-text frame lost its tool count")
+        self.assertIn("1 tool call(s)", errors[0]["message"])
+
+    def test_an_empty_text_chunk_does_not_lose_the_tool_count(self):
+        self._install(chunks=[""], tools=[_tool()])
+        errors = [d for k, d in self._chat() if k == "error"]
+        self.assertTrue(errors, "no error was reported")
+        self.assertEqual(errors[0].get("kind"), "no_answer")
+
+    def test_tools_are_counted_once_not_twice(self):
+        # The queue is drained in two places now. Counting the same event in
+        # both would inflate the number the user is shown.
+        self._install(chunks=[{"type": "reasoning", "text": "x"}],
+                      tools=[_tool("a"), _tool("b")])
+        errors = [d for k, d in self._chat() if k == "error"]
+        self.assertIn("2 tool call(s)", errors[0]["message"])
 
     def test_the_message_says_how_many_tools_ran(self):
         self._install(chunks=(), tools=[_tool("a"), _tool("b")])
@@ -282,6 +316,224 @@ class HistoryAcrossSessions(unittest.TestCase):
         agent = self._say("second", ["two"])
         self.assertTrue(all(t.strip() for _, t in self._roles_and_text(agent)),
                         f"a blank turn was replayed: {agent.seen_history}")
+
+
+class ReasoningEffortReachesTheModel(unittest.TestCase):
+    """The GUI setting must actually arrive at the turn.
+
+    reasoning_effort is a first-class Agent kwarg -- the engine forwards it
+    through start() alongside temperature/top_p, and only when the user chose a
+    real level. "off" is the default no-op and must not be sent, or it would
+    override a provider default the user never touched.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.server = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+        cls.port = cls.server.server_address[1]
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+
+    def setUp(self):
+        server._agents.clear()
+        server._tool_queue().clear()
+        self._orig = server.load_settings
+
+    def tearDown(self):
+        server.load_settings = self._orig
+
+    def _install(self):
+        agent = StubAgent(chunks=["ok"])
+        server._agents["t"] = agent
+        server._agents["t\x00notools"] = agent
+        return agent
+
+    def _chat(self):
+        body = json.dumps({"prompt": "hi", "chat_id": "t", "session": "t"}).encode()
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}/chat", data=body, method="POST",
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as response:
+            response.read()
+
+    def test_a_chosen_level_is_forwarded_to_start(self):
+        server.load_settings = lambda: dict(self._orig(), reasoning_effort="high")
+        agent = self._install()
+        self._chat()
+        self.assertEqual(agent.seen_kwargs.get("reasoning_effort"), "high",
+                         "the GUI reasoning_effort never reached the turn")
+
+    def test_off_is_the_default_and_is_not_sent(self):
+        # Forwarding "off" unasked would override a provider default the user
+        # never touched, exactly as sending temperature=0.7 unasked would.
+        agent = self._install()
+        self._chat()
+        self.assertNotIn("reasoning_effort", agent.seen_kwargs,
+                         "the no-op default was forwarded and overrode the provider")
+
+    def test_the_setting_round_trips_through_save(self):
+        # It is a real storage key, not a value dropped by load_settings.
+        server.save_settings({"reasoning_effort": "low"})
+        self.assertEqual(server.load_settings()["reasoning_effort"], "low")
+        server.save_settings({"reasoning_effort": "off"})
+
+
+class FetchUrlDoesNotFollowRedirects(unittest.TestCase):
+    """The approval card names one URL; the fetch must not reach another.
+
+    urllib.request.urlopen follows 3xx by default, so a page the user approved
+    could 302 the fetch to any host or port -- including this engine on
+    loopback -- and its body would land back in the model's context under an
+    approval that never named it. This stands up two servers: A returns a 302
+    to B, B returns a secret. The gate is set to allow, and A's URL is
+    fetched. The secret from B must not come back.
+    """
+
+    def _fetch_url(self):
+        """The fetch_url closure out of _builtin_tools()."""
+        for tool in server._builtin_tools():
+            if getattr(tool, "__name__", "") == "fetch_url":
+                return tool
+        self.fail("fetch_url is no longer a builtin tool")
+
+    def setUp(self):
+        server._tool_queue().clear()
+        # approval_mode "never" makes the gate allow without a stream to ask on.
+        self._orig = server.load_settings
+        server.load_settings = lambda: dict(self._orig(), approval_mode="never")
+
+        secret = "SECRET-BODY-9c1f"
+        # A request reaching B is a breach on its own -- the fetch is a side
+        # effect (it can trigger actions, log the caller, exhaust rate limits)
+        # regardless of whether its body ever comes back. So the test records
+        # that B was contacted, not just that its body leaked.
+        b_hits = []
+
+        class _Secret(BaseHTTPRequestHandler):
+            def log_message(self, *a):  # noqa: A003 - quiet
+                pass
+
+            def do_GET(inner):  # noqa: N805
+                b_hits.append(inner.path)
+                inner.send_response(200)
+                inner.send_header("Content-Length", str(len(secret)))
+                inner.end_headers()
+                inner.wfile.write(secret.encode())
+
+        self.secret = secret
+        self.b_hits = b_hits
+        self.b = ThreadingHTTPServer(("127.0.0.1", 0), _Secret)
+        b_url = f"http://127.0.0.1:{self.b.server_address[1]}/leak"
+
+        class _Redirect(BaseHTTPRequestHandler):
+            def log_message(self, *a):  # noqa: A003 - quiet
+                pass
+
+            def do_GET(inner):  # noqa: N805
+                inner.send_response(302)
+                inner.send_header("Location", b_url)
+                inner.send_header("Content-Length", "0")
+                inner.end_headers()
+
+        self.a = ThreadingHTTPServer(("127.0.0.1", 0), _Redirect)
+        self.a_url = f"http://127.0.0.1:{self.a.server_address[1]}/blog"
+        for srv in (self.a, self.b):
+            threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+    def tearDown(self):
+        server.load_settings = self._orig
+        for srv in (self.a, self.b):
+            srv.shutdown()
+            srv.server_close()
+
+    def test_a_redirect_does_not_reach_the_unapproved_target(self):
+        result = self._fetch_url()(self.a_url)
+        self.assertNotIn(self.secret, result,
+                         "the approved URL redirected to an unapproved host "
+                         "and its body was returned anyway")
+        self.assertEqual(self.b_hits, [],
+                         "the unapproved redirect target was contacted at all")
+
+    def test_the_body_of_the_approved_url_still_comes_back(self):
+        # A page that does not redirect must still be fetched normally.
+        result = self._fetch_url()(f"http://127.0.0.1:{self.b.server_address[1]}/leak")
+        self.assertIn(self.secret, result,
+                      "a direct, approved fetch stopped working")
+
+
+class ImageAttachmentsReachTheModel(unittest.TestCase):
+    """A dropped image must reach a vision model as bytes, not stringified text.
+
+    The desktop read every file with ``f.text()`` and folded the result into the
+    prompt string, so an image arrived as a wall of mojibake and never touched
+    the multimodal path. Here the UI's data: URL for a 1x1 PNG is posted as an
+    attachment; the engine must forward it as ``attachments=`` and keep it out of
+    the prompt the model is shown.
+    """
+
+    # A real 1x1 transparent PNG as the UI's FileReader would produce it.
+    PNG_DATA_URL = (
+        "data:image/png;base64,"
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk"
+        "+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+    )
+
+    @classmethod
+    def setUpClass(cls):
+        cls.server = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+        cls.port = cls.server.server_address[1]
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+
+    def setUp(self):
+        server._agents.clear()
+        server._tool_queue().clear()
+
+    def _install(self, chunks=("ok",)):
+        agent = StubAgent(chunks)
+        server._agents["img"] = agent
+        return agent
+
+    def _post(self, attachments, prompt="what is in this image"):
+        body = json.dumps({"prompt": prompt, "chat_id": "img", "session": "img",
+                           "attachments": attachments}).encode()
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}/chat", data=body, method="POST",
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as response:
+            response.read()
+
+    def test_the_image_is_forwarded_as_an_attachment(self):
+        agent = self._install()
+        self._post([{"name": "bug.png", "url": self.PNG_DATA_URL}])
+        self.assertEqual(agent.seen_attachments, [self.PNG_DATA_URL],
+                         "the image never reached the agent as an attachment")
+
+    def test_the_image_bytes_are_not_pasted_into_the_prompt(self):
+        agent = self._install()
+        self._post([{"name": "bug.png", "url": self.PNG_DATA_URL}])
+        self.assertNotIn("base64", agent.seen_prompt,
+                         "the image was stringified into the prompt")
+        self.assertNotIn("bug.png", agent.seen_prompt,
+                         "the image was folded into the prompt as text")
+
+    def test_text_files_still_go_into_the_prompt(self):
+        agent = self._install()
+        self._post([{"name": "notes.txt", "text": "hello world"}])
+        self.assertIn("hello world", agent.seen_prompt,
+                      "a text attachment stopped reaching the prompt")
+        self.assertIsNone(agent.seen_attachments,
+                          "a text file was mis-routed to the multimodal path")
 
 
 if __name__ == "__main__":

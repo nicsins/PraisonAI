@@ -1613,18 +1613,20 @@ def _handle_tasks_command(self, console, args, session_state, runner=None):
     handler = BackgroundHandler(runner=runner)
     args = args.strip() if args else ""
 
+    from praisonai._async_bridge import run_cli_coro
+
     try:
         if not args:
-            asyncio.run(handler.list_tasks())
+            run_cli_coro(handler.list_tasks())
         elif args.lower().startswith("cancel"):
             parts = args.split(maxsplit=1)
             task_id = parts[1].strip() if len(parts) > 1 else ""
             if not task_id:
                 console.print("[yellow]Usage: /tasks cancel <id>[/yellow]")
                 return
-            asyncio.run(handler.cancel_task(task_id))
+            run_cli_coro(handler.cancel_task(task_id))
         else:
-            asyncio.run(handler.get_status(args))
+            run_cli_coro(handler.get_status(args))
     except Exception as e:
         console.print(f"[yellow]Error handling /tasks: {e}[/yellow]")
 
@@ -1799,6 +1801,18 @@ def _start_execution_worker(self, tools_list, console, session_state):
                         )
                         if _agent_approval is not None:
                             agent_extra_kwargs['approval'] = _agent_approval
+                        # Thread the coding-sized step budget (`praisonai code
+                        # --max-steps`, built into args.execution by the code
+                        # command) onto the wrapper-dispatched REPL agent, so the
+                        # common `pip install praisonai` path does not silently
+                        # keep the general-purpose core defaults (20 steps / 10
+                        # tool calls per turn) and truncate a coding task.
+                        _agent_execution = (
+                            getattr(self.args, 'execution', None)
+                            if hasattr(self, 'args') else None
+                        )
+                        if _agent_execution is not None:
+                            agent_extra_kwargs['execution'] = _agent_execution
 
                         def _build_agent():
                             # Build the agent from the CURRENT conversation history
@@ -2020,6 +2034,13 @@ def _process_interactive_prompt(self, prompt, tools_list, console, show_profilin
         agent_approval = getattr(self.args, 'agent_approval', None) if hasattr(self, 'args') else None
         if agent_approval is not None:
             agent_kwargs['approval'] = agent_approval
+        # Thread the coding-sized step budget (`praisonai code --max-steps`,
+        # built into args.execution by the code command) onto the
+        # wrapper-dispatched single-prompt agent so it does not silently keep
+        # the general-purpose core defaults (20 steps / 10 tool calls per turn).
+        agent_execution = getattr(self.args, 'execution', None) if hasattr(self, 'args') else None
+        if agent_execution is not None:
+            agent_kwargs['execution'] = agent_execution
         thinking_budget = getattr(self.args, 'thinking_budget', None) if hasattr(self, 'args') else None
 
         # Show thinking indicator and create agent

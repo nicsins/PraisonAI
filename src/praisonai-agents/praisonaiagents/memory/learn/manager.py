@@ -19,6 +19,7 @@ from .stores import (
     ImprovementStore,
     LearnEntry,
 )
+from ...llm.model_providers import default_auxiliary_model
 
 
 class LearnManager:
@@ -555,7 +556,7 @@ Return empty arrays if nothing is found for a category."""
             from ...llm import LLM
             import json
             
-            model = llm or "gpt-4o-mini"
+            model = default_auxiliary_model(llm)
             llm_instance = LLM(model=model)
             response = llm_instance.get_response(
                 prompt=extraction_prompt,
@@ -591,7 +592,7 @@ Return empty arrays if nothing is found for a category."""
                 
                 for improvement in extracted.get("improvements", []):
                     if improvement and "improvements" in self._stores:
-                        self.capture_improvement(improvement, source="auto_extraction")
+                        self.capture_improvement(improvement, area="auto_extraction")
                         stored["improvements"] += 1
             
             return {
@@ -623,7 +624,7 @@ Return empty arrays if nothing is found for a category."""
             Dictionary with extracted learnings
         """
         if not messages:
-            return {"persona": [], "insights": [], "patterns": [], "stored": {}}
+            return {"persona": [], "insights": [], "patterns": [], "improvements": [], "stored": {}}
         
         # Build conversation text
         conversation_text = "\n".join([
@@ -640,12 +641,14 @@ Extract the following (if present):
 1. USER PREFERENCES: Things the user likes, dislikes, prefers, or their style
 2. INSIGHTS: Observations about the user's domain, work, or context
 3. PATTERNS: Recurring behaviors or request patterns
+4. IMPROVEMENTS: Concrete proposals to improve future responses
 
 Return JSON:
 {{
     "persona": ["preference 1", "preference 2"],
     "insights": ["insight 1", "insight 2"],
-    "patterns": ["pattern 1", "pattern 2"]
+    "patterns": ["pattern 1", "pattern 2"],
+    "improvements": ["improvement 1", "improvement 2"]
 }}
 
 Only include items that are clearly evident from the conversation.
@@ -657,7 +660,7 @@ Return empty arrays if nothing is found for a category."""
             import json
             import asyncio
             
-            model = llm or "gpt-4o-mini"
+            model = default_auxiliary_model(llm)
             llm_instance = LLM(model=model)
             
             # Run sync LLM call in executor for async compatibility
@@ -676,9 +679,9 @@ Return empty arrays if nothing is found for a category."""
             elif isinstance(response, dict):
                 extracted = response
             else:
-                extracted = {"persona": [], "insights": [], "patterns": []}
+                extracted = {"persona": [], "insights": [], "patterns": [], "improvements": []}
             
-            stored = {"persona": 0, "insights": 0, "patterns": 0}
+            stored = {"persona": 0, "insights": 0, "patterns": 0, "improvements": 0}
             
             for preference in extracted.get("persona", []):
                 if preference and "persona" in self._stores:
@@ -695,10 +698,16 @@ Return empty arrays if nothing is found for a category."""
                     self.capture_pattern(pattern, pattern_type="auto_extracted")
                     stored["patterns"] += 1
             
+            for improvement in extracted.get("improvements", []):
+                if improvement and "improvements" in self._stores:
+                    self.capture_improvement(improvement, area="auto_extraction")
+                    stored["improvements"] += 1
+            
             return {
                 "persona": extracted.get("persona", []),
                 "insights": extracted.get("insights", []),
                 "patterns": extracted.get("patterns", []),
+                "improvements": extracted.get("improvements", []),
                 "stored": stored,
             }
             

@@ -163,7 +163,9 @@ function claudeFinalAlreadyTriggered(comments) {
 }
 
 function claudeFinalReady(comments, reviews = [], options = {}) {
-  if (claudeFinalAlreadyTriggered(comments)) {
+  // staleRecovery: the caller already confirmed (shouldSkipStaleFinalRecovery)
+  // that the existing FINAL is stale on HEAD, so a re-post is intended.
+  if (!options.staleRecovery && claudeFinalAlreadyTriggered(comments)) {
     return { ready: false, reason: 'claude FINAL already triggered', already: true };
   }
   const prior = priorReviewersReady(comments, reviews, options);
@@ -207,6 +209,8 @@ async function advanceReviewChain(github, owner, repo, prNumber, finalBody, core
 
 async function maybeTriggerClaudeFinal(github, owner, repo, prNumber, finalBody, core, options = {}) {
   const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
+  // Fork PRs get the FINAL too: claude.yml never checks out fork code, runs
+  // fork reviews with GitHub read tools only, and adds a security review.
   const { comments, reviews } = await listCommentsAndReviews(github, owner, repo, prNumber);
   const gate = claudeFinalReady(comments, reviews, {
     ...options,

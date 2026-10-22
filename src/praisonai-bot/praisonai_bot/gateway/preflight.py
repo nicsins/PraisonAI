@@ -273,10 +273,18 @@ async def run_turn_test(
     # the SAME provider the live gateway will use — otherwise a valid custom
     # base_url/api_key config tests the default provider and gives a misleading
     # verdict (false abort, or invalid runtime creds passing).
+    # An unset or ``"auto"`` model resolves to the detected provider's default
+    # (Issue #5609) so the preflight tests the provider the operator actually
+    # has instead of assuming OpenAI.
+    model = acfg.get("model") or acfg.get("llm")
+    if not model or str(model).strip().lower() == "auto":
+        from praisonai_bot.bots._config_schema import resolve_model_by_provider
+
+        model = resolve_model_by_provider()
     agent_kwargs: Dict[str, Any] = {
         "name": acfg.get("name", agent_id),
         "instructions": acfg.get("instructions", ""),
-        "llm": acfg.get("model") or acfg.get("llm", "gpt-4o-mini"),
+        "llm": model,
     }
     base_url = acfg.get("base_url") or acfg.get("api_base")
     if base_url:
@@ -329,6 +337,51 @@ def resolve_verify_turn(config_path: str) -> Tuple[bool, str]:
     enabled = pre.get("verify_turn", True)
     prompt = str(pre.get("verify_turn_prompt") or "ping")
     return bool(enabled), prompt
+
+
+def resolve_strict_preflight(config_path: str) -> bool:
+    """Resolve the ``gateway.preflight.strict`` toggle.
+
+    Returns ``True`` when the operator opted into strict startup preflight —
+    any bad channel credential hard-aborts the whole gateway. Defaults to
+    ``False`` so a single rotated/expired token degrades ONLY that channel
+    (parked in ``ChannelState.CREDENTIAL_UNAVAILABLE`` by the runtime) while
+    every healthy channel keeps serving (#4862).
+    """
+    import yaml
+
+    try:
+        with open(config_path) as f:
+            cfg = yaml.safe_load(f) or {}
+    except OSError:
+        return False
+    pre = ((cfg.get("gateway") or {}).get("preflight") or {})
+    return bool(pre.get("strict", False))
+
+
+def classify_preflight_action(
+    healthy: "list[str]",
+    cred_failures: "list[str]",
+    strict: bool,
+) -> str:
+    """Decide what ``gateway start`` does when a credential probe fails (#4862).
+
+    Pure decision function so the availability-critical isolate-vs-fail-closed
+    branch is independently testable without ``typer``. Callers pass the already
+    partitioned channel names (SSL-only failures are handled separately and must
+    NOT appear in ``cred_failures``). Returns one of:
+
+    - ``"ssl_only"`` — no real credential failures: warn-and-continue.
+    - ``"abort"`` — fail closed: the operator set ``strict`` (with healthy
+      channels remaining) OR no channel is serviceable (nothing left to serve).
+    - ``"isolate"`` — park the failed channel(s) as credential-unavailable and
+      serve every healthy channel (the runtime's degradation contract).
+    """
+    if not cred_failures:
+        return "ssl_only"
+    if strict or not healthy:
+        return "abort"
+    return "isolate"
 
 
 VERIFY_TURN_TIMEOUT_DEFAULT = 60.0
@@ -879,7 +932,8 @@ def _read_env_file_tokens(path: str) -> Dict[str, str]:
 def _scan_launch_agent(label: str) -> DuplicateService:
     """Inspect a macOS LaunchAgent plist by label."""
     import plistlib
-    import subprocess
+
+    from .._guarded_subprocess import run_guarded
 
     plist_path = os.path.expanduser(f"~/Library/LaunchAgents/{label}.plist")
     service = DuplicateService(label=label, plist_path=plist_path)
@@ -899,11 +953,9 @@ def _scan_launch_agent(label: str) -> DuplicateService:
             pass
 
     try:
-        result = subprocess.run(
-            ["launchctl", "list", label],
-            capture_output=True,
-            text=True,
-        )
+        # Bounded: preflight runs on the gateway's startup path, and a
+        # launchctl that stalls would hold up service discovery indefinitely.
+        result = run_guarded(["launchctl", "list", label], timeout=15)
         service.running = result.returncode == 0
         if service.running and result.stdout:
             parts = result.stdout.strip().split("\t")

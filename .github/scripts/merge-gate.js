@@ -3,6 +3,8 @@
  * @see .github/workflows/claude-merge-gate.yml
  */
 
+const outsider = require('./outsider-review.js');
+
 const CLAUDE_TRIGGER_LOGINS = ['MervinPraison', 'github-actions[bot]'];
 const AUTO_ACTORS = CLAUDE_TRIGGER_LOGINS;
 const CONFLICT_COOLDOWN_MS = 12 * 60 * 60 * 1000;
@@ -10,23 +12,49 @@ const CLAUDE_ACTIVE_MS = 35 * 60 * 1000;
 const STALE_FINAL_RECOVERY_WINDOW_MS = 60 * 60 * 1000;
 const STALE_FINAL_MAX_PER_WINDOW = 2;
 const PUSH_AFTER_FINAL_DEBOUNCE_MS = 15 * 60 * 1000;
+// How long after a push the "pushed soon after FINAL" debounce keeps holding
+// stale-FINAL recovery back (long enough for CI / a batch of fixes). After that
+// the debounce expires, so a missed completion can no longer block a PR forever.
+const PUSH_SETTLE_MS = 30 * 60 * 1000;
 const ALLOWED_MERGE_STATES = new Set(['CLEAN', 'UNSTABLE']);
 const AGENT_PY_MAX_AUTO_LINES = 100;
 const PR_MAX_AUTO_ADDITIONS = 800;
 const PR_MAX_AUTO_FILES = 30;
 const MANUAL_ONLY_LABELS = new Set(['security', 'breaking-change', 'needs-manual-review', 'release']);
 const WORKFLOW_ONLY_LABEL = 'merge-gate-ci-only';
-const CI_ONLY_PATH_PREFIXES = ['.github/workflows/', '.github/actions/', '.github/scripts/merge-gate'];
-const SDK_PATH_PREFIXES = ['src/praisonai-agents/', 'src/praisonai/'];
+const EXTERNAL_EXAMPLE_PATH_PREFIX = 'examples/tools/external/';
+const EXTERNAL_EXAMPLE_LABEL = 'pipeline/external-example';
+const MAINTAINER_ACCEPT_EXAMPLE_LABEL = 'maintainer-accept-example';
+const CORE_TOOLS_DIR_PREFIX = 'src/praisonai-agents/praisonaiagents/tools/';
+const MAINTAINER_ACCEPT_CORE_TOOLS_LABEL = 'maintainer-accept-core-tools';
+const CORE_VENDOR_TOOL_LABEL = 'pipeline/core-vendor-tool';
+const CI_ONLY_PATH_PREFIXES = ['.github/workflows/', '.github/actions/', '.github/scripts/', '.github/prompts/'];
+const SDK_PATH_PREFIXES = ['src/praisonai-agents/', 'src/praisonai/', 'src/praisonai-ts/'];
+const TS_SDK_SOURCE_PREFIX = 'src/praisonai-ts/src/';
 const SENSITIVE_PATH_PATTERNS = [
-  /^\.github\/workflows\//,
+  // Actions and scripts run with the workflow's tokens, like workflows do.
+  /^\.github\/(workflows|actions|scripts|prompts)\//,
+  /^\.trusted/, // where workflows keep main's actions and scripts during a PR run
+  /(^|\/)(\.claude\/|\.mcp\.json$|CLAUDE(\.local)?\.md$)/, // Claude Code config: hooks, MCP servers, instructions
+  /(^|\/)(sitecustomize|usercustomize|noxfile)\.py$/, // run at interpreter start / by test runners
+  /(^|\/)(pytest\.ini|tox\.ini|\.gitmodules|\.gitattributes)$/,
   /praisonaiagents\/(auth|approval|policy|sandbox)\//,
   /^src\/praisonai-agents\/pyproject\.toml$/,
   /^src\/praisonai\/pyproject\.toml$/,
   /\.env(\.|$)/,
   /credentials\.json$/i,
 ];
-const REQUIRED_SDK_CHECK_PATTERNS = [/test/i, /smoke/i, /core/i, /python package/i, /comprehensive/i, /optimized/i];
+const REQUIRED_SDK_CHECK_PATTERNS = [
+  /test/i,
+  /smoke/i,
+  /core/i,
+  /python package/i,
+  /comprehensive/i,
+  /optimized/i,
+  /praisonai-ts/i,
+  /npm/i,
+  /webview/i,
+];
 const SECRET_PATTERNS = [
   /sk-[a-zA-Z0-9]{20,}/,
   /AKIA[0-9A-Z]{16}/,
@@ -46,6 +74,34 @@ const MERGE_READY_LABEL = 'pipeline/merge-ready';
 const OPTIONAL_CANCELLED_CHECKS = new Set(['detect-and-trigger']);
 /** Cancelled smoke/windows after timeout are non-blocking when core shards passed on HEAD. */
 const OPTIONAL_CANCELLED_WHEN_CORE_GREEN = new Set(['smoke', 'test-windows']);
+/** Auto PR Comment jobs — queued/pending must not block merge when test-core is green on HEAD. */
+const OPTIONAL_PENDING_WHEN_CORE_GREEN = new Set([
+  'claude-review-recovery',
+  'claude-after-prior-reviewers',
+  'claude-fallback-timeout',
+  'post-missing-claude-final',
+  'bot-pr-trigger-reviews',
+  // Optimized suite jobs often outlive the test-core aggregator on busy fleet days.
+  'smoke',
+  'main (3.11)',
+  'openai-live',
+  'test-summary',
+  'GitGuardian Security Checks',
+]);
+/** PR authors eligible for claude merge-gate auto-merge (triage fleet only). */
+const AUTO_MERGE_AUTHOR_LOGINS = new Set([
+  'MervinPraison',
+  'praisonai-triage-agent',
+  'praisonai-triage-agent[bot]',
+  'app/praisonai-triage-agent',
+  'github-actions[bot]',
+]);
+/** GitHub author_association values that always require maintainer merge. */
+const MAINTAINER_ONLY_ASSOCIATIONS = new Set([
+  'FIRST_TIME_CONTRIBUTOR',
+  'CONTRIBUTOR',
+  'NONE',
+]);
 const BOT_REVIEWER_PATTERNS = [
   'coderabbit',
   'qodo',
@@ -55,6 +111,32 @@ const BOT_REVIEWER_PATTERNS = [
 ];
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function isAutoMergeAuthor(user) {
+  const login = (user?.login || '').trim();
+  if (!login) return false;
+  if (AUTO_MERGE_AUTHOR_LOGINS.has(login)) return true;
+  if (login.startsWith('app/') && login.includes('praisonai-triage')) return true;
+  return login.endsWith('[bot]') && login.toLowerCase().includes('praisonai-triage');
+}
+
+function isFirstTimeContributor(pr) {
+  return pr?.author_association === 'FIRST_TIME_CONTRIBUTOR';
+}
+
+/** Human / external authors not on the triage auto-merge allowlist. */
+function maintainerOnlyAuthorReason(pr) {
+  if (!pr?.user?.login) return 'maintainer-only author (missing login)';
+  // Trusted automation first — GitHub often marks bots as CONTRIBUTOR.
+  if (isAutoMergeAuthor(pr.user)) return null;
+  if (isFirstTimeContributor(pr)) {
+    return `auto-merge disabled: first-time contributor (@${pr.user.login})`;
+  }
+  if (MAINTAINER_ONLY_ASSOCIATIONS.has(pr.author_association)) {
+    return `maintainer-only author (@${pr.user.login}, ${pr.author_association})`;
+  }
+  return `maintainer-only author (@${pr.user.login})`;
+}
 
 function isFinalClaudeTriggerComment(c) {
   const body = (c.body || '').toLowerCase();
@@ -72,14 +154,33 @@ function isClaudeTriggerNoise(c) {
   return false;
 }
 
+// Markers of a completed FINAL review. anthropics/claude-code-action posted a
+// "Claude finished" tracking comment; the local action used since 2026-10-09
+// posts the review itself, which always carries the mandatory Phase 1 table
+// (see FINAL_CLAUDE_REVIEW_BODY) and usually a "Final architecture review" title.
+const FINAL_REPLY_MARKERS = [
+  /Claude finished/,
+  /^#{1,4}\s*Final architecture review\b/im,
+  /^#{1,4}\s*Phase 1 — AGENTS\.md review/m,
+];
+
+// Exact logins: a substring match would trust any account whose name merely
+// contains one of these (e.g. "github-actions-x").
+const CLAUDE_AUTOMATION_LOGINS = new Set([
+  'praisonai-triage-agent[bot]',
+  'praisonai-triage-agent',
+  'app/praisonai-triage-agent',
+  'github-actions[bot]',
+]);
+
 function isClaudeFinalReplyComment(c) {
-  const login = (c.user?.login || '').toLowerCase();
-  const fromAutomation =
-    login.includes('praisonai-triage') ||
-    login.includes('github-actions') ||
-    AUTO_ACTORS.some((a) => a.toLowerCase() === login);
+  const login = c.user?.login || '';
+  const fromAutomation = CLAUDE_AUTOMATION_LOGINS.has(login) || AUTO_ACTORS.includes(login);
   if (!fromAutomation) return false;
-  return (c.body || '').includes('Claude finished');
+  const body = c.body || '';
+  // The FINAL trigger embeds the Phase 1 heading; an @claude request is never a reply.
+  if (/^\s*@claude\b/i.test(body)) return false;
+  return FINAL_REPLY_MARKERS.some((re) => re.test(body));
 }
 
 function hasRecentClaudeTrigger(comments, minutes = 35) {
@@ -222,11 +323,16 @@ function isStaleFinalAfterPush(comments, headPushedAt) {
   );
   const finalTime = new Date(latestFinal.created_at).getTime();
   if (headTime <= finalTime + 60000) return false;
-  const claudeRepliedAfterFinal = comments.some((c) => {
+
+  // The finished reply must follow BOTH the latest FINAL trigger and HEAD, so
+  // a reply predating HEAD (stale completion) cannot suppress recovery.
+  const finishedFloor = Math.max(finalTime, headTime - 60000);
+  const claudeFinishedOnHead = comments.some((c) => {
     if (!isClaudeFinalReplyComment(c)) return false;
-    return new Date(c.created_at).getTime() >= finalTime - 60000;
+    return new Date(c.created_at).getTime() >= finishedFloor;
   });
-  if (claudeRepliedAfterFinal) return false;
+  if (claudeFinishedOnHead) return false;
+
   const claudeSinceHead = comments.some((c) => {
     if (!CLAUDE_TRIGGER_LOGINS.includes(c.user.login)) return false;
     if (isClaudeTriggerNoise(c)) return false;
@@ -256,8 +362,7 @@ function countFinalTriggersSince(comments, sinceMs) {
 }
 
 function isClaudeAutomationLogin(login) {
-  const lower = (login || '').toLowerCase();
-  return lower.includes('praisonai-triage') || lower === 'github-actions[bot]';
+  return CLAUDE_AUTOMATION_LOGINS.has(login || '');
 }
 
 function isPushSoonAfterLatestFinal(comments, headPushedAt) {
@@ -278,13 +383,20 @@ function shouldSkipStaleFinalRecovery(comments, headPushedAt, headPusherLogin = 
   if (!isStaleFinalAfterPush(comments, headPushedAt)) {
     return { skip: true, reason: 'not stale' };
   }
-  if (headPusherLogin && isClaudeAutomationLogin(headPusherLogin)) {
-    return { skip: true, reason: 'head pushed by Claude automation' };
+  // The debounces below compare the push to the FINAL trigger, a relation that
+  // never changes; only hold recovery back while the push is still settling.
+  const pushSettling =
+    !!headPushedAt && Date.now() - new Date(headPushedAt).getTime() < PUSH_SETTLE_MS;
+  if (pushSettling && headPusherLogin && isClaudeAutomationLogin(headPusherLogin) && isPushSoonAfterLatestFinal(comments, headPushedAt)) {
+    return {
+      skip: true,
+      reason: 'head pushed by Claude automation soon after FINAL (wait for CI)',
+    };
   }
   if (needsFinalReReviewAfterConflictRebase(comments, headPushedAt)) {
     return { skip: false, reason: '' };
   }
-  if (isPushSoonAfterLatestFinal(comments, headPushedAt)) {
+  if (pushSettling && isPushSoonAfterLatestFinal(comments, headPushedAt)) {
     return {
       skip: true,
       reason: 'head pushed soon after FINAL (wait for CI / batched fixes)',
@@ -301,14 +413,96 @@ function shouldSkipStaleFinalRecovery(comments, headPushedAt, headPusherLogin = 
   return { skip: false, reason: '' };
 }
 
-function finalClaudeCompletedOnSha(comments, headPushedAt) {
-  if (!hasFinalClaudeReviewTrigger(comments)) return false;
-  if (isStaleFinalAfterPush(comments, headPushedAt)) return false;
+function latestClaudeFinishedAtMs(comments) {
+  let latest = 0;
+  for (const c of comments) {
+    if (!isClaudeFinalReplyComment(c)) continue;
+    latest = Math.max(latest, new Date(c.created_at).getTime());
+  }
+  return latest || null;
+}
+
+/**
+ * HEAD moved after the latest "Claude finished" — need another FINAL/CI cycle.
+ * No slack window here: a push even seconds after the finished reply means the
+ * reviewed SHA is stale, so the cooldown must NOT be bypassed.
+ */
+function hasHeadPushAfterLatestClaudeFinish(comments, headPushedAt) {
+  const finishMs = latestClaudeFinishedAtMs(comments);
+  if (!finishMs || !headPushedAt) return false;
+  const headMs = new Date(headPushedAt).getTime();
+  return headMs > finishMs;
+}
+
+/** Latest non-noise @claude trigger timestamp (any flavour), or null. */
+function latestClaudeTriggerAtMs(comments) {
+  let latest = 0;
+  for (const c of comments || []) {
+    if (!CLAUDE_TRIGGER_LOGINS.includes(c.user?.login)) continue;
+    if (isClaudeTriggerNoise(c)) continue;
+    if (!(c.body || '').includes('@claude')) continue;
+    latest = Math.max(latest, new Date(c.created_at).getTime());
+  }
+  return latest || null;
+}
+
+/**
+ * A newer @claude request (e.g. a maintainer follow-up) was posted after the
+ * completion we would rely on to bypass. That request may still be queued, so
+ * the cooldown must stay until it also completes.
+ */
+function hasClaudeTriggerAfterLatestFinish(comments) {
+  const finishMs = latestClaudeFinishedAtMs(comments);
+  if (!finishMs) return false;
+  const triggerMs = latestClaudeTriggerAtMs(comments);
+  if (!triggerMs) return false;
+  return triggerMs > finishMs;
+}
+
+/**
+ * FINAL @claude cooldown is for in-flight bot work, not an extra 35m wait after
+ * FINAL completed on HEAD with green CI prerequisites. Bypass only when the
+ * completion is on the current SHA AND no newer @claude request is still
+ * awaiting its own completion.
+ */
+function canBypassRecentClaudeCooldown(comments, headPushedAt) {
+  if (!finalClaudeCompletedOnSha(comments, headPushedAt)) return false;
+  if (hasHeadPushAfterLatestClaudeFinish(comments, headPushedAt)) return false;
+  if (hasClaudeTriggerAfterLatestFinish(comments)) return false;
   return true;
 }
 
+function finalClaudeCompletedOnSha(comments, headPushedAt) {
+  if (!hasFinalClaudeReviewTrigger(comments)) return false;
+  if (isStaleFinalAfterPush(comments, headPushedAt)) return false;
+  const finals = comments.filter(isFinalClaudeTriggerComment);
+  if (finals.length === 0) return false;
+  const latestFinal = finals.reduce((a, b) =>
+    new Date(a.created_at) > new Date(b.created_at) ? a : b
+  );
+  const finalTime = new Date(latestFinal.created_at).getTime();
+  if (!headPushedAt) {
+    return comments.some((c) => {
+      if (!isClaudeFinalReplyComment(c)) return false;
+      return new Date(c.created_at).getTime() >= finalTime - 60000;
+    });
+  }
+  const headTime = new Date(headPushedAt).getTime();
+  // The Claude "finished" reply must follow BOTH the latest FINAL trigger and
+  // HEAD. We do NOT reject solely because the FINAL trigger predates HEAD:
+  // Claude may start a FINAL review, push a fix commit (new HEAD), then reply.
+  // The reply timestamp is the real completion signal. Requiring the reply to
+  // follow the latest FINAL also prevents an older reply from satisfying a
+  // newer FINAL trigger.
+  const replyFloor = Math.max(finalTime, headTime - 60000);
+  return comments.some((c) => {
+    if (!isClaudeFinalReplyComment(c)) return false;
+    return new Date(c.created_at).getTime() >= replyFloor;
+  });
+}
+
 const FINAL_CLAUDE_REVIEW_BODY =
-  '@claude You are the FINAL architecture reviewer. If the branch is under MervinPraison/PraisonAI (not a fork), you are able to make modifications to this branch and push directly. SCOPE: Review changes in this PR. Python SDK: praisonaiagents, praisonai. TypeScript SDK: src/praisonai-ts/. Do NOT modify src/praisonai-rust. Read ALL comments above from Gemini, Qodo, CodeRabbit, and Copilot carefully before responding.\n\n**Phase 1: Review per AGENTS.md**\n1. Protocol-driven: check heavy implementations vs core SDK\n2. Backward compatible: ensure zero feature regressions\n3. Performance: no hot-path regressions\n4. SDK value: review in depth whether the change genuinely adds value to the SDK — never add features for the sake of adding them. It must strengthen the SDK (simpler, more user-friendly, robust, world-class, secure). If it does not clearly add value, request changes or recommend rejecting/closing rather than merging scope creep\n5. Do not bloat the Agent class with additional params — only if absolutely required; we already support many params.\n6. Repo routing: agent-callable tools → PraisonAI-Tools; lifecycle plugins → PraisonAI-Plugins; optional sandbox backends → PraisonAI-Plugins (`praisonai.sandbox` entry point) — request changes if wrongly added to praisonaiagents/\n\n**Phase 2: FIX Valid Issues**\n7. For any VALID bugs or architectural flaws found by Gemini, CodeRabbit, Qodo, Copilot, or any other reviewer: implement the fix\n8. Also independently identify and fix any gaps or issues you find in the changed code — do not rely only on prior reviewer feedback\n9. Push all code fixes directly to THIS branch (do NOT create a new PR)\n10. Comment a summary of exact files modified and what you skipped\n\n**Phase 3: Final Verdict**\n11. If all issues are resolved, approve the PR / close the Issue\n12. If blocking issues remain, request changes / leave clear action items';
+  '@claude You are the FINAL architecture reviewer. If the branch is under MervinPraison/PraisonAI (not a fork), you are able to make modifications to this branch and push directly. SCOPE: Review changes in this PR. Python SDK: praisonaiagents, praisonai. TypeScript SDK: src/praisonai-ts/. Do NOT modify src/praisonai-rust. Read ALL comments above from Gemini, Qodo, CodeRabbit, and Copilot carefully before responding.\n\n**MANDATORY READ (before reviewing):**\n- Always read src/praisonai-agents/AGENTS.md\n- If this PR touches src/praisonai-ts/, also read src/praisonai-ts/AGENTS.md §2.1.2 (TS triage + PR review checklist)\n\n**Phase 1: Review per AGENTS.md**\n1. Protocol-driven: check heavy implementations vs core SDK\n2. Backward compatible: ensure zero feature regressions\n3. Performance: no hot-path regressions\n4. SDK value: review in depth whether the change genuinely adds value to the SDK — never add features for the sake of adding them. It must strengthen the SDK (simpler, more user-friendly, robust, world-class, secure). If it does not clearly add value, request changes or recommend rejecting/closing rather than merging scope creep\n5. Do not bloat the Agent class with additional params — only if absolutely required; we already support many params.\n6. Repo routing: agent-callable tools → PraisonAI-Tools; lifecycle plugins → PraisonAI-Plugins; optional sandbox backends → PraisonAI-Plugins (`praisonai.sandbox` entry point) — request changes if wrongly added to praisonaiagents/\n6b. **External tool examples (`examples/tools/external/**`):** If the diff is confined to that path, mark **SDK value** ❌ for monorepo merge — redirect the contributor to PraisonAI-Tools; do **not** Approve for merge unless the PR has the `maintainer-accept-example` label.\n6c. **New vendor `*_tools.py` in core (`src/praisonai-agents/praisonaiagents/tools/`):** If the PR **adds** a new `*_tools.py` for a third-party API/SaaS/dataset (e.g. FXMacroData), mark **Repo routing** ❌ and **SDK value** ❌ — redirect to MervinPraison/PraisonAI-Tools. Do **not** Approve because legacy bundled tools (Tavily/Exa/You.com/etc.) already in core are **not** precedent for new vendor modules. Request changes or recommend closing unless the PR has `maintainer-accept-core-tools`.\n\n**MANDATORY COMMENT FORMAT — include this Phase 1 table in your review comment:**\n#### Phase 1 — AGENTS.md review\n| Check | Result |\n|---|---|\n| Protocol-driven / no heavy impl in core | ✅ or ❌ + one-line rationale |\n| Backward compatible | ✅ or ❌ + one-line rationale |\n| Performance (hot path) | ✅ or ❌ + one-line rationale |\n| **SDK value** | ✅ or ❌ + one-line rationale (explicitly judge whether the change strengthens the SDK) |\n| No Agent param bloat | ✅ or ❌ + one-line rationale |\n| Repo routing | ✅ or ❌ + one-line rationale |\n\nFor TypeScript PRs (src/praisonai-ts/), also add:\n| TS types / parity / tests | ✅ or ❌ + one-line rationale (npm run build && npm test) |\n\n**Phase 2: FIX Valid Issues**\n7. For any VALID bugs or architectural flaws found by Gemini, CodeRabbit, Qodo, Copilot, or any other reviewer: implement the fix\n8. Also independently identify and fix any gaps or issues you find in the changed code — do not rely only on prior reviewer feedback\n9. Push all code fixes directly to THIS branch (do NOT create a new PR)\n10. Comment a summary of exact files modified and what you skipped\n\n**Phase 3: Final Verdict**\n11. **Never** Approve or write “Approve for merge” if any Phase 1 row is ❌, if rule 6b/6c applies, or if the change belongs in PraisonAI-Tools/PraisonAI-Plugins. Use **Request changes**, redirect to the external repo, and recommend closing the monorepo PR when routing is wrong.\n12. Approve only when every Phase 1 row is ✅ (including **Repo routing** and **SDK value**) and blocking issues are resolved; otherwise request changes with clear action items';
 
 async function getMergeState(github, owner, repo, prNumber) {
   const query = `
@@ -428,6 +622,12 @@ function isAcceptableCheckConclusion(run, runs) {
   return false;
 }
 
+function isIgnorablePendingCheck(run, runs) {
+  if (!isPendingRun(run)) return false;
+  if (!OPTIONAL_PENDING_WHEN_CORE_GREEN.has(run.name)) return false;
+  return coreTestsGreenOnRuns(runs);
+}
+
 async function allChecksGreenOnSha(github, owner, repo, sha, core) {
   const runs = bestRunsByName(await listChecksOnSha(github, owner, repo, sha));
   if (runs.length === 0) {
@@ -436,6 +636,10 @@ async function allChecksGreenOnSha(github, owner, repo, sha, core) {
   }
   for (const run of runs) {
     if (run.status !== 'completed') {
+      if (isIgnorablePendingCheck(run, runs)) {
+        core?.info?.(`Ignoring pending optional check ${run.name} — test-core green on HEAD`);
+        continue;
+      }
       core?.info?.(`Check pending: ${run.name} (${run.status})`);
       return false;
     }
@@ -464,6 +668,94 @@ function hasBlockingClaudeRunForPr(runs, headRef) {
   return (runs || []).some((r) => claudeRunBlocksPr(r, headRef));
 }
 
+const MERGE_GATE_WORKFLOW_FILE = 'claude-merge-gate.yml';
+const MERGE_GATE_ACTIVE_LABEL = 'claude-merge-gate-active';
+const MAX_PENDING_MERGE_GATE_RUNS = 3;
+const MIN_CORE_RATE_LIMIT_REMAINING = 200;
+
+function mergeGateDispatchBlockedReason({ labels, pendingRuns, maxPending = MAX_PENDING_MERGE_GATE_RUNS }) {
+  if ((labels || []).includes(MERGE_GATE_ACTIVE_LABEL)) {
+    return 'merge gate already active on PR';
+  }
+  if (pendingRuns >= maxPending) {
+    return `${pendingRuns} merge gate run(s) already queued or in progress (max ${maxPending})`;
+  }
+  return null;
+}
+
+// workflow_run probes (auto-dispatch) share concurrency and must not count
+// toward backpressure — they blocked dispatches for merge-ready PRs.
+function countSubstantiveMergeGateRuns(runs) {
+  return (runs || []).filter((r) => r && r.event !== 'workflow_run').length;
+}
+
+async function countPendingMergeGateRuns(github, owner, repo) {
+  let pending = 0;
+  for (const status of ['queued', 'in_progress']) {
+    try {
+      const { data } = await github.rest.actions.listWorkflowRuns({
+        owner,
+        repo,
+        workflow_id: MERGE_GATE_WORKFLOW_FILE,
+        status,
+        per_page: 30,
+      });
+      pending += countSubstantiveMergeGateRuns(data.workflow_runs);
+    } catch {
+      // Best-effort backpressure only.
+    }
+  }
+  return pending;
+}
+
+async function getCoreRateLimitRemaining(github) {
+  try {
+    const { data } = await github.rest.rateLimit.get();
+    return data?.resources?.core?.remaining ?? null;
+  } catch {
+    return null;
+  }
+}
+
+async function shouldSkipMergeGateScan(github, core, options = {}) {
+  const minCoreRemaining = options.minCoreRemaining ?? MIN_CORE_RATE_LIMIT_REMAINING;
+  const remaining = await getCoreRateLimitRemaining(github);
+  if (remaining !== null && remaining < minCoreRemaining) {
+    core?.info?.(`Skip merge gate scan: rate limit low (${remaining} core remaining)`);
+    return true;
+  }
+  return false;
+}
+
+async function shouldSkipMergeGateDispatch(github, owner, repo, prNumber, core, options = {}) {
+  const maxPending = options.maxPending ?? MAX_PENDING_MERGE_GATE_RUNS;
+  const minCoreRemaining = options.minCoreRemaining ?? MIN_CORE_RATE_LIMIT_REMAINING;
+  const remaining = await getCoreRateLimitRemaining(github);
+  if (remaining !== null && remaining < minCoreRemaining) {
+    core?.info?.(
+      `Skip merge gate dispatch for PR #${prNumber}: rate limit low (${remaining} core remaining)`
+    );
+    return true;
+  }
+  const ctx = await loadPrContext(github, owner, repo, prNumber);
+  const authorBlock = maintainerOnlyAuthorReason(ctx.pr);
+  if (authorBlock) {
+    core?.info?.(`Skip merge gate dispatch for PR #${prNumber}: ${authorBlock}`);
+    return true;
+  }
+  const pendingRuns = await countPendingMergeGateRuns(github, owner, repo);
+  const reason = mergeGateDispatchBlockedReason({
+    labels: ctx.labels,
+    pendingRuns,
+    maxPending,
+  });
+  if (reason) {
+    core?.info?.(`Skip merge gate dispatch for PR #${prNumber}: ${reason}`);
+    return true;
+  }
+  return false;
+}
+
 async function hasInProgressClaudeAssistant(github, owner, repo, prNumber = null) {
   try {
     const { data } = await github.rest.actions.listWorkflowRuns({
@@ -488,6 +780,68 @@ async function hasInProgressClaudeAssistant(github, owner, repo, prNumber = null
 function isCiOnlyChange(files) {
   if (!files.length) return false;
   return files.every((f) => CI_ONLY_PATH_PREFIXES.some((p) => f.filename.startsWith(p)));
+}
+
+function isExternalExampleOnlyChange(files) {
+  if (!files.length) return false;
+  return files.every((f) => f.filename.startsWith(EXTERNAL_EXAMPLE_PATH_PREFIX));
+}
+
+/** New third-party vendor modules must land in PraisonAI-Tools, not core (legacy bundled *_tools.py excepted). */
+function listAddedCoreVendorToolModules(files) {
+  return (files || [])
+    .filter((f) => f.status === 'added' && f.filename.startsWith(CORE_TOOLS_DIR_PREFIX))
+    .filter((f) => /\/[^/]+_tools\.py$/.test(f.filename))
+    .map((f) => f.filename);
+}
+
+function shouldTagCoreVendorToolMisroute(files, labels = []) {
+  return (
+    listAddedCoreVendorToolModules(files).length > 0 &&
+    !labels.includes(MAINTAINER_ACCEPT_CORE_TOOLS_LABEL)
+  );
+}
+
+function newVendorToolModuleInCoreReason(files, labels = []) {
+  if (!shouldTagCoreVendorToolMisroute(files, labels)) return null;
+  const added = listAddedCoreVendorToolModules(files);
+  return `new vendor tool module in core (${added.join(', ')}) — belongs in PraisonAI-Tools (add ${MAINTAINER_ACCEPT_CORE_TOOLS_LABEL} to opt in)`;
+}
+
+function latestClaudeFinishedCommentOnHead(comments, headPushedAt) {
+  if (!headPushedAt) return null;
+  const headTime = new Date(headPushedAt).getTime();
+  let latest = null;
+  let latestTime = 0;
+  for (const c of comments || []) {
+    if (!isClaudeFinalReplyComment(c)) continue;
+    const t = new Date(c.created_at).getTime();
+    if (t < headTime - 60000) continue;
+    if (t > latestTime) {
+      latestTime = t;
+      latest = c;
+    }
+  }
+  return latest;
+}
+
+function looksLikeFinalApproveForMerge(body) {
+  const b = (body || '').toLowerCase();
+  if (b.includes('request changes')) return false;
+  if (b.includes('repo routing | ❌') || b.includes('repo routing| ❌')) return false;
+  return (
+    b.includes('approve for merge') ||
+    b.includes('verdict: ✅ approve') ||
+    b.includes('verdict: approve')
+  );
+}
+
+/** Catches cases like #5661 where FINAL approved despite new vendor *_tools.py in core. */
+function wrongFinalApprovalForVendorToolInCoreReason(comments, headPushedAt, files, labels = []) {
+  if (!newVendorToolModuleInCoreReason(files, labels)) return null;
+  const finished = latestClaudeFinishedCommentOnHead(comments, headPushedAt);
+  if (!finished || !looksLikeFinalApproveForMerge(finished.body)) return null;
+  return 'FINAL approved vendor tool in core (wrong verdict) — re-trigger FINAL after routing rules';
 }
 
 function isInternalPullRequestLink(link, owner, repo) {
@@ -627,18 +981,35 @@ function prSizeReasons(files) {
 }
 
 function missingTestsReason(files) {
-  const sdkAdds = files.filter(
+  const pySdkAdds = files.filter(
     (f) =>
       f.filename.startsWith('src/praisonai-agents/') &&
       f.filename.endsWith('.py') &&
       !f.filename.endsWith('__init__.py') &&
       (f.additions || 0) > 0
   );
-  if (sdkAdds.length === 0) return null;
-  const hasTestChange = files.some(
+  const tsSdkAdds = files.filter(
+    (f) =>
+      f.filename.startsWith(TS_SDK_SOURCE_PREFIX) &&
+      f.filename.endsWith('.ts') &&
+      !f.filename.endsWith('.d.ts') &&
+      (f.additions || 0) > 0
+  );
+  if (pySdkAdds.length === 0 && tsSdkAdds.length === 0) return null;
+  const hasPyTestChange = files.some(
     (f) => /\/tests?\//.test(f.filename) || /test_.*\.py$/.test(f.filename) || /_test\.py$/.test(f.filename)
   );
-  if (!hasTestChange) return 'SDK code added without test file changes — requires manual review';
+  const hasTsTestChange = files.some(
+    (f) =>
+      f.filename.startsWith('src/praisonai-ts/tests/') ||
+      /\.(test|spec)\.ts$/.test(f.filename)
+  );
+  if (pySdkAdds.length > 0 && !hasPyTestChange) {
+    return 'Python SDK code added without test file changes — requires manual review';
+  }
+  if (tsSdkAdds.length > 0 && !hasTsTestChange) {
+    return 'TS SDK code added without test file changes — requires manual review';
+  }
   return null;
 }
 
@@ -687,22 +1058,67 @@ function manualReviewReasonForAgentPy(agentChange) {
   return null;
 }
 
-async function listAllComments(github, owner, repo, issueNumber) {
-  if (typeof github.paginate === 'function') {
-    return github.paginate(github.rest.issues.listComments, {
-      owner,
-      repo,
-      issue_number: issueNumber,
-      per_page: 100,
-    });
-  }
-  const { data } = await github.rest.issues.listComments({
+async function listAllComments(github, owner, repo, issueNumber, options = {}) {
+  const { since } = options;
+  const params = {
     owner,
     repo,
     issue_number: issueNumber,
     per_page: 100,
-  });
-  return data;
+  };
+  if (since) params.since = since;
+
+  // Always page explicitly — github-script's paginate helper can return only the
+  // first page on busy PRs, so fresh MERGE_GATE_VERDICT comments on page 2+ are missed.
+  const all = [];
+  for (let page = 1; page <= 50; page++) {
+    const { data } = await github.rest.issues.listComments({ ...params, page });
+    all.push(...data);
+    if (data.length < 100) break;
+  }
+  return all;
+}
+
+/** Poll until Opus posts MERGE_GATE_VERDICT on HEAD (merge-only runs right after assess). */
+async function waitForMergeGateVerdict(github, owner, repo, prNumber, options = {}) {
+  const {
+    headPushedAt = null,
+    excludeAutomatedFallback = true,
+    maxAttempts = 18,
+    intervalMs = 10000,
+    since = null,
+    core: log = null,
+  } = options;
+
+  let resolvedHeadPushedAt = headPushedAt;
+  const commentSince =
+    since ||
+    (resolvedHeadPushedAt
+      ? new Date(new Date(resolvedHeadPushedAt).getTime() - 5 * 60 * 1000).toISOString()
+      : null);
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    if (!resolvedHeadPushedAt) {
+      const ctx = await loadPrContext(github, owner, repo, prNumber);
+      resolvedHeadPushedAt = ctx.headPushedAt;
+    }
+    const comments = await listAllComments(github, owner, repo, prNumber, {
+      since: commentSince || undefined,
+    });
+    const verdict = findMergeGateVerdict(comments, null, resolvedHeadPushedAt, {
+      excludeAutomatedFallback,
+    });
+    if (verdict) {
+      return { verdict, headPushedAt: resolvedHeadPushedAt };
+    }
+    if (attempt < maxAttempts) {
+      log?.info?.(
+        `Verdict not visible yet (attempt ${attempt}/${maxAttempts}), waiting ${intervalMs / 1000}s...`
+      );
+      await new Promise((r) => setTimeout(r, intervalMs));
+    }
+  }
+  return { verdict: null, headPushedAt: resolvedHeadPushedAt };
 }
 
 async function getHeadCommitDate(github, owner, repo, prNumber) {
@@ -746,6 +1162,10 @@ async function loadPrContext(github, owner, repo, prNumber) {
   const headCommitDate = await getHeadCommitDate(github, owner, repo, prNumber);
   const headPushedAt = headCommitDate || pr.updated_at;
 
+  if (issue.author_association && !pr.author_association) {
+    pr.author_association = issue.author_association;
+  }
+
   return {
     pr,
     issue,
@@ -784,12 +1204,16 @@ async function evaluatePipelineQuiescent(github, owner, repo, prNumber, core, op
     reasons.push('fork PR');
   }
 
+  const maintainerAuthorReason = maintainerOnlyAuthorReason(ctx.pr);
+  if (maintainerAuthorReason) reasons.push(maintainerAuthorReason);
+
   if (hasRecentConflictComment(ctx.comments, ctx.headPushedAt)) {
     reasons.push('recent merge-conflict @claude');
   }
   if (!skipRecentClaudeCooldown && hasRecentClaudeTrigger(ctx.comments, 35)) {
     const verdictOnHead = findMergeGateVerdict(ctx.comments, null, ctx.headPushedAt) !== null;
-    if (!verdictOnHead) reasons.push('recent @claude within 35min');
+    const bypassCooldown = canBypassRecentClaudeCooldown(ctx.comments, ctx.headPushedAt);
+    if (!verdictOnHead && !bypassCooldown) reasons.push('recent @claude within 35min');
   }
 
   if (!skipGlobalClaudeRunCheck && (await hasInProgressClaudeAssistant(github, owner, repo, prNumber))) {
@@ -818,11 +1242,54 @@ async function evaluatePipelineQuiescent(github, owner, repo, prNumber, core, op
 
   const pullFiles = await listPullFiles(github, owner, repo, prNumber);
 
+  if (
+    isExternalExampleOnlyChange(pullFiles) &&
+    !ctx.labels.includes(MAINTAINER_ACCEPT_EXAMPLE_LABEL)
+  ) {
+    reasons.push(
+      'external example only — belongs in PraisonAI-Tools (add maintainer-accept-example to opt in)'
+    );
+  }
+
+  const vendorToolReason = newVendorToolModuleInCoreReason(pullFiles, ctx.labels);
+  if (vendorToolReason) reasons.push(vendorToolReason);
+
+  const wrongFinalVendor = wrongFinalApprovalForVendorToolInCoreReason(
+    ctx.comments,
+    ctx.headPushedAt,
+    pullFiles,
+    ctx.labels
+  );
+  if (wrongFinalVendor) reasons.push(wrongFinalVendor);
+
   const agentChange = getAgentPyChangeFromFiles(pullFiles);
   const agentManual = manualReviewReasonForAgentPy(agentChange);
   if (agentManual) reasons.push(agentManual);
 
   reasons.push(...sensitivePathReasons(pullFiles, ctx.labels));
+
+  // Outsider-origin PRs (see outsider-review.js). Provenance costs API calls,
+  // so it is skipped on scans that are already blocked for other reasons.
+  let outsiderOrigin = [];
+  if (forMergeStep || reasons.length === 0) {
+    outsiderOrigin = await outsider.outsiderOriginReasons(github, owner, repo, ctx.pr, ctx.comments);
+    let securityStatus = null;
+    if (forMergeStep && outsiderOrigin.length) {
+      const statuses = await github.paginate(github.rest.repos.listCommitStatusesForRef, {
+        owner, repo, ref: ctx.headSha, per_page: 100,
+      });
+      securityStatus = outsider.findSecurityReviewStatus(statuses);
+    }
+    const maintainerReviewed = outsiderOrigin.length > 0
+      && (await outsider.maintainerApprovedHead(github, owner, repo, prNumber, ctx.headSha));
+    reasons.push(...outsider.outsiderGateReasons({
+      origin: outsiderOrigin,
+      files: pullFiles,
+      securityStatus,
+      maintainerReviewed,
+      forMergeStep,
+    }));
+  }
   reasons.push(...prSizeReasons(pullFiles));
   reasons.push(...secretScanReasons(pullFiles));
 
@@ -834,40 +1301,136 @@ async function evaluatePipelineQuiescent(github, owner, repo, prNumber, core, op
 
   if (ctx.pr.mergeable === false) reasons.push('not mergeable');
 
+  // Starvation guard (see BLOCKED_ON_HEAD_REASON). Not applied on the merge
+  // step itself, which only runs right after a fresh verdict.
+  let blockedOnHead = false;
+  if (!forMergeStep && latestMergeGateVerdictComment(ctx.comments, ctx.headPushedAt)) {
+    const runs = await listChecksOnSha(github, owner, repo, ctx.headSha);
+    if (blockedOnUnchangedHead(ctx.comments, ctx.headPushedAt, runs)) {
+      blockedOnHead = true;
+      reasons.push(BLOCKED_ON_HEAD_REASON);
+    }
+  }
+
   const ready = reasons.length === 0;
   return {
     ready,
     reasons,
     headSha: ctx.headSha,
     prNumber,
+    blockedOnHead,
+    blockFixDue: blockedOnHead && blockFixRequestDue(ctx.comments, ctx.headSha),
+    outsiderOrigin,
   };
 }
 
-async function listPrNumbersForMergeGateScan(github, owner, repo, core) {
-  let mergeReadyIssues;
-  if (typeof github.paginate === 'function') {
-    mergeReadyIssues = await github.paginate(github.rest.issues.listForRepo, {
-      owner,
-      repo,
-      state: 'open',
-      labels: MERGE_READY_LABEL,
-      per_page: 100,
-    });
-  } else {
-    ({ data: mergeReadyIssues } = await github.rest.issues.listForRepo({
-      owner,
-      repo,
-      state: 'open',
-      labels: MERGE_READY_LABEL,
-      per_page: 100,
-    }));
+// ---------------------------------------------------------------------------
+// Starvation guard. Candidates are scanned oldest-first and capped at
+// MAX_CANDIDATES, so PRs the gate keeps BLOCKing on an unchanged HEAD used to
+// take every slot on every scan (170 identical Opus BLOCKs on three PRs) while
+// newer ready PRs were never looked at. A BLOCK on the current HEAD now holds
+// the PR out until a commit lands, a check completes after the verdict (e.g. a
+// pending job the verdict cited has since passed), or BLOCK_RECHECK_AFTER_MS.
+// While held out, Claude is asked (once per HEAD, capped) to fix the findings.
+// ---------------------------------------------------------------------------
+const BLOCK_RECHECK_AFTER_MS = 24 * 60 * 60 * 1000;
+const BLOCK_FIX_MARKER = 'merge-gate-fix-request:';
+const MAX_BLOCK_FIX_REQUESTS = 3;
+const BLOCKED_ON_HEAD_REASON = 'merge gate blocked this HEAD (waiting for a fix commit)';
+const BLOCKED_MERGE_GATE_LABEL = 'pipeline/blocked:merge-gate';
+
+// Only verdicts posted by the gate's own automation may hold a PR out; anyone
+// can comment "MERGE_GATE_VERDICT: BLOCK". Exact logins: a substring match would
+// trust any account whose name merely contains the bot's name.
+const GATE_VERDICT_AUTHORS = new Set(['praisonai-triage-agent[bot]', 'github-actions[bot]']);
+
+function latestMergeGateVerdictComment(comments, headPushedAt) {
+  const headTime = headPushedAt ? new Date(headPushedAt).getTime() - 60000 : 0;
+  let latest = null;
+  for (const c of comments || []) {
+    if (!GATE_VERDICT_AUTHORS.has(c.user?.login)) continue;
+    if (!isMergeGateVerdictComment(c.body)) continue;
+    if (isAutomatedFallbackVerdict(c.body)) continue;
+    const t = new Date(c.created_at).getTime();
+    if (headTime && t < headTime) continue;
+    if (!latest || t > new Date(latest.created_at).getTime()) latest = c;
   }
-  const mergeReady = mergeReadyIssues
+  return latest;
+}
+
+/** True when the newest verdict on HEAD is BLOCK and nothing has changed since. */
+function blockedOnUnchangedHead(comments, headPushedAt, checkRuns, nowMs = Date.now()) {
+  const verdict = latestMergeGateVerdictComment(comments, headPushedAt);
+  if (!verdict || !/MERGE_GATE_VERDICT:\s*BLOCK\b/.test(verdict.body || '')) return false;
+  const verdictMs = new Date(verdict.created_at).getTime();
+  if (nowMs - verdictMs >= BLOCK_RECHECK_AFTER_MS) return false;
+  const checkCompletedSince = (checkRuns || []).some(
+    (r) => r.completed_at && new Date(r.completed_at).getTime() > verdictMs
+  );
+  return !checkCompletedSince;
+}
+
+function buildBlockFixRequestBody(headSha) {
+  // Must start with @claude and must NOT contain the verdict marker or the
+  // FINAL-review phrases: claude.yml ignores comments with the marker, and the
+  // merge gate would mistake the others for a FINAL trigger.
+  return [
+    '@claude The merge gate blocked this PR on HEAD `' + headSha.slice(0, 12) + '`.',
+    '',
+    'Read the latest merge gate BLOCK verdict comment on this PR and the review threads it cites.',
+    'Fix every blocking finding on this branch, add or update tests for each fix, and push.',
+    'Do not post an approval or a verdict yourself; the review chain re-runs after your push.',
+    'If a finding is wrong, explain why in a reply instead of changing code.',
+    '',
+    `<!-- ${BLOCK_FIX_MARKER}${headSha.slice(0, 12)} -->`,
+  ].join('\n');
+}
+
+/** One fix request per HEAD, at most MAX_BLOCK_FIX_REQUESTS per PR (trusted posters only). */
+function blockFixRequestDue(comments, headSha) {
+  const requests = (comments || []).filter(
+    (c) => CLAUDE_TRIGGER_LOGINS.includes(c.user?.login) && (c.body || '').includes(`<!-- ${BLOCK_FIX_MARKER}`)
+  );
+  if (requests.length >= MAX_BLOCK_FIX_REQUESTS) return false;
+  const marker = `<!-- ${BLOCK_FIX_MARKER}${headSha.slice(0, 12)} -->`;
+  return !requests.some((c) => (c.body || '').includes(marker));
+}
+
+async function listOpenIssuesWithLabel(github, owner, repo, label) {
+  const params = { owner, repo, state: 'open', labels: label, per_page: 100 };
+  if (typeof github.paginate === 'function') {
+    return github.paginate(github.rest.issues.listForRepo, params);
+  }
+  return (await github.rest.issues.listForRepo(params)).data;
+}
+
+async function listPrNumbersForMergeGateScan(github, owner, repo, core) {
+  const mergeReadyIssues = await listOpenIssuesWithLabel(github, owner, repo, MERGE_READY_LABEL);
+  // Label sync swaps merge-ready for the merge-gate blocker on held-out PRs;
+  // keep scanning them (they never take a slot while held) so the fix request
+  // is still posted and they re-enter once a fix lands.
+  const heldOut = await listOpenIssuesWithLabel(github, owner, repo, BLOCKED_MERGE_GATE_LABEL);
+  const eligible = (issues) => issues
     .filter((issue) => issue.pull_request)
-    .map((issue) => issue.number)
+    .filter((issue) => {
+      const labels = (issue.labels || []).map((l) => (typeof l === 'string' ? l : l.name));
+      if (labels.includes(EXTERNAL_EXAMPLE_LABEL) && !labels.includes(MAINTAINER_ACCEPT_EXAMPLE_LABEL)) {
+        return false;
+      }
+      if (labels.includes(CORE_VENDOR_TOOL_LABEL) && !labels.includes(MAINTAINER_ACCEPT_CORE_TOOLS_LABEL)) {
+        return false;
+      }
+      return true;
+    })
+    .map((issue) => issue.number);
+  // Only a real merge-ready PR may short-circuit the scan; held-out PRs alone
+  // must not hide unlabelled ready PRs from the oldest-open fallback below.
+  const labelledReady = eligible(mergeReadyIssues);
+  const mergeReady = [...labelledReady, ...eligible(heldOut)]
+    .filter((n, i, all) => all.indexOf(n) === i)
     .sort((a, b) => a - b);
 
-  if (mergeReady.length > 0) {
+  if (labelledReady.length > 0) {
     core?.info?.(
       `Merge gate scan: ${mergeReady.length} ${MERGE_READY_LABEL} PR(s) (skipping unlabelled open PRs)`
     );
@@ -908,7 +1471,12 @@ async function selectMergeGateCandidates(github, owner, repo, prNumbers, maxCand
     if (result.ready) {
       readyList.push({ pr_number: num, head_sha: result.headSha });
     } else {
-      skipped.push({ pr: num, reasons: result.reasons });
+      skipped.push({
+        pr: num,
+        reasons: result.reasons,
+        head_sha: result.headSha,
+        block_fix_due: !!result.blockFixDue,
+      });
     }
   }
   readyList.sort((a, b) => a.pr_number - b.pr_number);
@@ -919,9 +1487,24 @@ async function selectMergeGateCandidates(github, owner, repo, prNumbers, maxCand
 }
 
 const AUTOMATED_FALLBACK_MARKER = 'Automated fallback —';
+const MERGE_GATE_SCAN_MARKER = 'Merge gate scan';
 
 function isAutomatedFallbackVerdict(body) {
   return (body || '').includes(AUTOMATED_FALLBACK_MARKER);
+}
+
+function isMergeGateVerdictComment(body) {
+  const text = body || '';
+  if (text.includes(MERGE_GATE_SCAN_MARKER)) return false;
+  return /(?:^|\n)\s*MERGE_GATE_VERDICT:\s*(APPROVE|BLOCK)\b/m.test(text);
+}
+
+function hasRecentMergeGateScanComment(comments, withinMinutes = 30) {
+  const cutoff = Date.now() - withinMinutes * 60 * 1000;
+  return (comments || []).some((c) => {
+    if (!(c.body || '').includes(MERGE_GATE_SCAN_MARKER)) return false;
+    return new Date(c.created_at).getTime() > cutoff;
+  });
 }
 
 function findMergeGateVerdict(comments, minCreatedAt = null, headPushedAt = null, options = {}) {
@@ -930,7 +1513,9 @@ function findMergeGateVerdict(comments, minCreatedAt = null, headPushedAt = null
   const headTime = headPushedAt ? new Date(headPushedAt).getTime() - 60000 : 0;
   const gateComments = comments
     .filter((c) => {
-      if (!(c.body || '').includes('MERGE_GATE_VERDICT:')) return false;
+      // Anyone can type the marker; only the gate's own automation counts.
+      if (!GATE_VERDICT_AUTHORS.has(c.user?.login)) return false;
+      if (!isMergeGateVerdictComment(c.body)) return false;
       if (excludeAutomatedFallback && isAutomatedFallbackVerdict(c.body)) return false;
       const created = new Date(c.created_at).getTime();
       if (minTime && created < minTime) return false;
@@ -940,12 +1525,21 @@ function findMergeGateVerdict(comments, minCreatedAt = null, headPushedAt = null
     .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
   if (gateComments.length === 0) return null;
   const body = gateComments[0].body || '';
-  if (body.includes('MERGE_GATE_VERDICT: APPROVE')) return 'APPROVE';
-  if (body.includes('MERGE_GATE_VERDICT: BLOCK')) return 'BLOCK';
+  // A comment carrying both is a BLOCK.
+  if (/MERGE_GATE_VERDICT:\s*BLOCK\b/.test(body)) return 'BLOCK';
+  if (/MERGE_GATE_VERDICT:\s*APPROVE\b/.test(body)) return 'APPROVE';
   return null;
 }
 
 module.exports = {
+  GATE_VERDICT_AUTHORS,
+  listPrNumbersForMergeGateScan,
+  BLOCKED_ON_HEAD_REASON,
+  BLOCK_FIX_MARKER,
+  blockedOnUnchangedHead,
+  blockFixRequestDue,
+  buildBlockFixRequestBody,
+  latestMergeGateVerdictComment,
   CLAUDE_TRIGGER_LOGINS,
   AUTO_ACTORS,
   isFinalClaudeTriggerComment,
@@ -964,6 +1558,12 @@ module.exports = {
   getMergeState,
   OPTIONAL_CANCELLED_CHECKS,
   OPTIONAL_CANCELLED_WHEN_CORE_GREEN,
+  OPTIONAL_PENDING_WHEN_CORE_GREEN,
+  AUTO_MERGE_AUTHOR_LOGINS,
+  MAINTAINER_ONLY_ASSOCIATIONS,
+  isAutoMergeAuthor,
+  maintainerOnlyAuthorReason,
+  isIgnorablePendingCheck,
   isCoreTestRun,
   coreTestsGreenOnRuns,
   isPendingRun,
@@ -976,6 +1576,18 @@ module.exports = {
   claudeRunBlocksPr,
   hasBlockingClaudeRunForPr,
   isCiOnlyChange,
+  isExternalExampleOnlyChange,
+  EXTERNAL_EXAMPLE_PATH_PREFIX,
+  EXTERNAL_EXAMPLE_LABEL,
+  MAINTAINER_ACCEPT_EXAMPLE_LABEL,
+  listAddedCoreVendorToolModules,
+  shouldTagCoreVendorToolMisroute,
+  newVendorToolModuleInCoreReason,
+  wrongFinalApprovalForVendorToolInCoreReason,
+  looksLikeFinalApproveForMerge,
+  CORE_TOOLS_DIR_PREFIX,
+  MAINTAINER_ACCEPT_CORE_TOOLS_LABEL,
+  CORE_VENDOR_TOOL_LABEL,
   isInternalPullRequestLink,
   resolvePrNumberFromLinkedPullRequests,
   resolvePrNumberFromHeadBranch,
@@ -994,12 +1606,18 @@ module.exports = {
   secretScanReasons,
   sdkTestChecksReason,
   listAllComments,
+  waitForMergeGateVerdict,
   getHeadCommitDate,
   isStaleFinalAfterPush,
   needsStaleFinalRecovery,
   shouldSkipFinalRecovery,
   shouldSkipStaleFinalRecovery,
   isClaudeAutomationLogin,
+  canBypassRecentClaudeCooldown,
+  hasHeadPushAfterLatestClaudeFinish,
+  hasClaudeTriggerAfterLatestFinish,
+  latestClaudeFinishedAtMs,
+  latestClaudeTriggerAtMs,
   isPushSoonAfterLatestFinal,
   countFinalTriggersSince,
   STALE_FINAL_RECOVERY_WINDOW_MS,
@@ -1012,5 +1630,17 @@ module.exports = {
   selectMergeGateCandidates,
   isAutomatedFallbackVerdict,
   AUTOMATED_FALLBACK_MARKER,
+  isMergeGateVerdictComment,
+  hasRecentMergeGateScanComment,
   findMergeGateVerdict,
+  MERGE_GATE_WORKFLOW_FILE,
+  MERGE_GATE_ACTIVE_LABEL,
+  MAX_PENDING_MERGE_GATE_RUNS,
+  MIN_CORE_RATE_LIMIT_REMAINING,
+  getCoreRateLimitRemaining,
+  mergeGateDispatchBlockedReason,
+  countSubstantiveMergeGateRuns,
+  countPendingMergeGateRuns,
+  shouldSkipMergeGateDispatch,
+  shouldSkipMergeGateScan,
 };

@@ -16,7 +16,10 @@ on:
   pull_request_target:
     types: [opened, synchronize]
   schedule:
-    - cron: '30 3,9,15,21 * * *'
+    # Hourly stale/missing-FINAL sweep. A push is the only other recovery
+    # trigger, and at push time the "wait for CI" debounce correctly holds back;
+    # this sweep is what re-posts the FINAL once the push has settled.
+    - cron: '30 * * * *'
   workflow_dispatch:
 
 env:
@@ -36,11 +39,11 @@ jobs:
        (
          github.event.comment.user.login == 'coderabbitai[bot]' ||
          github.event.comment.user.login == 'greptile-apps[bot]' ||
-         contains(github.event.comment.user.login, 'gemini-code-assist') ||
-         contains(github.event.comment.user.login, 'qodo-code-review')
+         github.event.comment.user.login == 'gemini-code-assist[bot]' ||
+         github.event.comment.user.login == 'qodo-code-review[bot]'
        )) ||
       (github.event_name == 'pull_request_review' &&
-       contains(github.event.review.user.login, 'qodo-code-review'))
+       github.event.review.user.login == 'qodo-code-review[bot]')
     runs-on: ubuntu-latest
     permissions:
       issues: write
@@ -53,7 +56,7 @@ jobs:
       - name: Post Claude FINAL after prior reviewers
         uses: actions/github-script@v7
         with:
-          github-token: ${{ secrets.GH_TOKEN }}
+          github-token: ${{ secrets.GH_TOKEN != '' && secrets.GH_TOKEN || github.token }}
           script: |
             const path = require('path');
             const chain = require(path.join(process.env.GITHUB_WORKSPACE, '.github/scripts/pr-review-chain.js'));
@@ -97,7 +100,7 @@ jobs:
       - name: Post Claude FINAL (skip Copilot)
         uses: actions/github-script@v7
         with:
-          github-token: ${{ secrets.GH_TOKEN }}
+          github-token: ${{ secrets.GH_TOKEN != '' && secrets.GH_TOKEN || github.token }}
           script: |
             const path = require('path');
             const chain = require(path.join(process.env.GITHUB_WORKSPACE, '.github/scripts/pr-review-chain.js'));
@@ -126,7 +129,7 @@ jobs:
       - name: Re-post FINAL Claude review when stale or missing
         uses: actions/github-script@v7
         with:
-          github-token: ${{ secrets.GH_TOKEN }}
+          github-token: ${{ secrets.GH_TOKEN != '' && secrets.GH_TOKEN || github.token }}
           script: |
             const path = require('path');
             const mergeGate = require(path.join(process.env.GITHUB_WORKSPACE, '.github/scripts/merge-gate.js'));
@@ -163,7 +166,7 @@ jobs:
                 return;
               }
               const result = await chain.maybeTriggerClaudeFinal(
-                github, owner, repo, pr, finalBody, core, opts
+                github, owner, repo, pr, finalBody, core, { ...opts, staleRecovery: true }
               );
               if (result.posted) core.info(`Posted stale-FINAL recovery @claude on PR #${pr}`);
               return;
@@ -182,7 +185,7 @@ jobs:
       - name: Sync pipeline status labels
         uses: actions/github-script@v7
         with:
-          github-token: ${{ secrets.GH_TOKEN }}
+          github-token: ${{ secrets.GH_TOKEN != '' && secrets.GH_TOKEN || github.token }}
           script: |
             const path = require('path');
             const ps = require(path.join(process.env.GITHUB_WORKSPACE, '.github/scripts/pipeline-status.js'));
@@ -190,7 +193,7 @@ jobs:
             await ps.ensurePipelineLabels(github, context.repo.owner, context.repo.repo, core);
             await ps.syncPipelineLabels(github, context.repo.owner, context.repo.repo, pr, core);
 
-  # Scheduled + manual: post missing or stale FINAL @claude on all open PRs (incl. forks)
+  # Scheduled + manual: post missing or stale FINAL @claude on all open PRs (fork reviews are read-only)
   post-missing-claude-final:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
@@ -203,7 +206,7 @@ jobs:
       - name: Post missing/stale FINAL @claude on open PRs
         uses: actions/github-script@v7
         with:
-          github-token: ${{ secrets.GH_TOKEN }}
+          github-token: ${{ secrets.GH_TOKEN != '' && secrets.GH_TOKEN || github.token }}
           script: |
             const path = require('path');
             const mergeGate = require(path.join(process.env.GITHUB_WORKSPACE, '.github/scripts/merge-gate.js'));
@@ -241,7 +244,7 @@ jobs:
               const result = await chain.maybeTriggerClaudeFinal(
                 github, owner, repo, pr.number,
                 mergeGate.FINAL_CLAUDE_REVIEW_BODY, core,
-                { skipCopilot: true, optionalWaitMs: 0 }
+                { skipCopilot: true, optionalWaitMs: 0, staleRecovery: hasFinal && isStale }
               );
               if (result.posted) {
                 posted++;
@@ -275,7 +278,7 @@ jobs:
       - name: Trigger CodeRabbit and Qodo reviews
         uses: actions/github-script@v7
         with:
-          github-token: ${{ secrets.GH_TOKEN }}
+          github-token: ${{ secrets.GH_TOKEN != '' && secrets.GH_TOKEN || github.token }}
           script: |
             const path = require('path');
             const chain = require(path.join(process.env.GITHUB_WORKSPACE, '.github/scripts/bot-pr-review-chain.js'));
@@ -285,7 +288,7 @@ jobs:
       - name: Sync pipeline status labels
         uses: actions/github-script@v7
         with:
-          github-token: ${{ secrets.GH_TOKEN }}
+          github-token: ${{ secrets.GH_TOKEN != '' && secrets.GH_TOKEN || github.token }}
           script: |
             const path = require('path');
             const ps = require(path.join(process.env.GITHUB_WORKSPACE, '.github/scripts/pipeline-status.js'));

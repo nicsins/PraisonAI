@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import math
 import os
 import re
 import secrets
@@ -17,7 +18,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple, TYPE_CHECKING
+from typing import Any, Callable, Dict, List, Mapping, Optional, Set, Tuple, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from praisonaiagents import Agent
@@ -47,6 +48,80 @@ from praisonaiagents.gateway.protocols import (
     HealthPressure,
     evaluate_pressure,
 )
+
+try:  # Trusted-proxy ingress attribution (Issue #5312); optional at import time.
+    from praisonaiagents.gateway.protocols import (
+        resolve_ingress_attribution,
+        parse_forwarded_for,
+    )
+except ImportError:  # pragma: no cover - core predates ingress attribution
+    resolve_ingress_attribution = None  # type: ignore[assignment]
+    parse_forwarded_for = None  # type: ignore[assignment]
+
+try:  # Server→client interactive request/reply over the transport (Issue #5351).
+    from praisonaiagents.gateway.protocols import (
+        GatewayServerRequest,
+        GatewayServerReply,
+    )
+except ImportError:  # pragma: no cover - core predates the request channel
+    GatewayServerRequest = None  # type: ignore[assignment]
+    GatewayServerReply = None  # type: ignore[assignment]
+
+try:  # Central registry-driven authorization guard (Issue #5166).
+    from praisonaiagents.gateway.protocols import (
+        authorize_method,
+        GatewayUnauthorized,
+    )
+except ImportError:  # pragma: no cover - core predates the central guard
+    authorize_method = None  # type: ignore[assignment]
+
+    class GatewayUnauthorized(PermissionError):  # type: ignore[no-redef]
+        def __init__(self, method=None, required=None):
+            self.method = method
+            self.required = required
+            super().__init__("insufficient scope")
+
+try:  # Scoped-stop primitive (Issue #5129); optional at import time.
+    from praisonaiagents.gateway.protocols import StopScope, StopResult
+except Exception:  # pragma: no cover - only when core predates scoped stop
+    # Core installs older than the scoped-stop vocabulary (the dependency floor
+    # ``praisonaiagents>=1.6.152`` admits them) lack these symbols. Fall back to
+    # a dependency-free local mirror so ``/stop all`` / ``/cancel`` still drain
+    # the backlog instead of failing the gateway import outright.
+    from enum import Enum as _Enum
+    from dataclasses import dataclass as _dataclass
+
+    class StopScope(str, _Enum):  # type: ignore[no-redef]
+        TURN = "turn"
+        SESSION = "session"
+
+        @classmethod
+        def coerce(cls, value, default=None):
+            fallback = cls.TURN if default is None else default
+            if isinstance(value, cls):
+                return value
+            if isinstance(value, bool):
+                return cls.SESSION if value else cls.TURN
+            if value is None:
+                return fallback
+            try:
+                return cls(str(value).strip().lower())
+            except ValueError:
+                return fallback
+
+    @_dataclass(frozen=True)
+    class StopResult:  # type: ignore[no-redef]
+        scope: "StopScope"
+        turn_aborted: bool
+        pending_cancelled: int = 0
+
+        def to_dict(self):
+            return {
+                "scope": self.scope.value,
+                "turn_aborted": self.turn_aborted,
+                "pending_cancelled": self.pending_cancelled,
+            }
+
 from praisonaiagents.session.protocols import SessionStoreProtocol
 from praisonaiagents.session.store import DefaultSessionStore
 
@@ -54,6 +129,29 @@ logger = logging.getLogger(__name__)
 
 from .unicode_utils import safe_error_message, safe_log_message, extract_root_cause_from_error
 from .supervisor import ChannelState, ChannelSupervisor
+
+
+def _installed_gateway_version() -> str:
+    """Return the installed ``praisonai-bot`` version, not a hardcoded literal.
+
+    Automated version/upgrade checks read this off ``/info`` and the MCP
+    ``serverInfo``; a hardcoded constant (#5363) actively misled them. Prefer
+    the packaged ``_version.py`` and fall back to installed metadata.
+    """
+    try:
+        from praisonai_bot._version import __version__ as _v
+        if _v:
+            return str(_v)
+    except Exception:
+        pass
+    try:
+        from importlib.metadata import version as _pkg_version
+    except ImportError:  # pragma: no cover - py<3.8
+        from importlib_metadata import version as _pkg_version  # type: ignore
+    try:
+        return _pkg_version("praisonai-bot")
+    except Exception:
+        return "0.0.0"
 
 
 # Per-platform token env-var fallbacks used by the generic channel-launch path
@@ -131,6 +229,78 @@ def _delivery_text_digest(text: str) -> str:
     import hashlib
 
     return hashlib.sha1(text.encode("utf-8", "replace")).hexdigest()[:16]
+
+
+# Issue #5802: safe, user-facing text per wire error code (never raw ``str(e)``).
+_TURN_ERROR_MESSAGES = {
+    "rate_limit": "Rate limited by the model provider. Please retry shortly.",
+    "overloaded": "The model provider is overloaded. Please retry shortly.",
+    "transient": "A temporary error occurred. Please retry.",
+    "idle_timeout": "The model provider stopped responding. Please retry.",
+    "context_overflow": "The conversation is too long for the model. Start a new chat.",
+    "billing": "The model provider account is out of credit.",
+    "auth": "The model provider rejected the credentials.",
+    "auth_permanent": "The model provider rejected the credentials.",
+    "model_not_found": "The configured model is not available.",
+}
+_RETRYABLE_TURN_ERRORS = frozenset({"rate_limit", "overloaded", "transient", "idle_timeout"})
+
+
+def _turn_error_payload(exc: BaseException) -> Dict[str, Any]:
+    """Project a failed turn's exception onto a stable wire error envelope.
+
+    Issue #5802: reuses the core classifiers so clients get a machine-readable
+    ``code``, ``retryable`` and provider ``retry_after_seconds`` instead of a
+    bare ``"Error: <str>"``. Unknown failures map to ``"internal"``.
+    """
+    from praisonaiagents.errors import PraisonAIError
+    from praisonaiagents.llm.error_classifier import (
+        ErrorCategory, classify_error, extract_retry_after,
+    )
+
+    kind = getattr(exc, "error_category", None) if isinstance(exc, PraisonAIError) else None
+    if kind and kind != "unknown":
+        code = kind
+        retryable = bool(exc.is_retryable)
+    else:
+        code = {
+            ErrorCategory.RATE_LIMIT: "rate_limit",
+            ErrorCategory.CONTEXT_LIMIT: "context_overflow",
+            ErrorCategory.AUTH: "auth",
+            ErrorCategory.INVALID_REQUEST: "invalid_request",
+            ErrorCategory.TRANSIENT: "transient",
+        }.get(classify_error(exc), "internal")
+        retryable = code in _RETRYABLE_TURN_ERRORS
+    # Export the provider's full wait: the default 300s backoff cap would make
+    # clients retry before the provider allows it.
+    retry_after = extract_retry_after(exc, cap_seconds=math.inf) if retryable else None
+    return {
+        "code": code,
+        "retryable": retryable,
+        "retry_after_seconds": math.ceil(retry_after) if retry_after else None,
+        "message": _TURN_ERROR_MESSAGES.get(code, "The agent failed to complete this turn."),
+    }
+
+
+def _apply_bot_loop_config(config_kwargs: Dict[str, Any], ch_cfg: Mapping[str, Any]) -> None:
+    """Fold a channel's ``allow_bots`` / ``bot_loop_protection`` into BotConfig.
+
+    Issue #5062: mirrors how ``unknown_user_policy`` is wired from ``gateway.yaml``.
+    ``allow_bots`` (bool, string, or 0/1) opts the channel into bot-authored
+    inbound messages; ``bot_loop_protection`` is a dict passed through untouched
+    so the adapter can build a ``BotLoopGuard`` from it. Both are only set when
+    present, so a channel that declares neither is byte-for-byte unchanged.
+    """
+    _raw_allow_bots = ch_cfg.get("allow_bots")
+    if _raw_allow_bots is not None:
+        if isinstance(_raw_allow_bots, str):
+            allow_bots = _raw_allow_bots.strip().lower() in ("1", "true", "yes", "on")
+        else:
+            allow_bots = bool(_raw_allow_bots)
+        config_kwargs["allow_bots"] = allow_bots
+    _raw_loop = ch_cfg.get("bot_loop_protection")
+    if isinstance(_raw_loop, dict):
+        config_kwargs["bot_loop_protection"] = dict(_raw_loop)
 
 
 def _should_bypass_loopback_auth(
@@ -362,6 +532,16 @@ class GatewaySession:
     # Stepper & Concurrency logic
     _inbox: asyncio.Queue = field(default_factory=asyncio.Queue)
     _is_executing: bool = False
+    # Issue #5129: monotonic counter bumped by a SESSION-scoped stop. The queue
+    # worker snapshots it right after dequeuing a message and re-checks it after
+    # admission/executor placement; a mismatch means a session stop landed in the
+    # dequeue-to-registration gap, so the already-dequeued message is dropped
+    # rather than executed after the user cancelled it.
+    _stop_epoch: int = 0
+    # Issue #5129: ``True`` only while a message has been dequeued from ``_inbox``
+    # but its turn is not yet registered/dispatched (the race window). A SESSION
+    # stop counts this in-flight-but-unstarted message toward ``pending_cancelled``.
+    _inflight_unstarted: bool = False
     # Issue #3379: for channel-originated sessions (e.g. a Telegram user), the
     # ``"channel:target"`` address to proactively notify if an in-flight turn is
     # interrupted by a gateway restart. ``None`` for direct-client sessions,
@@ -626,6 +806,77 @@ class ReloadPlan:
         self.restart_channels.clear()  # No need for selective restarts
 
 
+class _TerminalTurn(str):
+    """A terminal turn response that also carries its outcome classification.
+
+    A driven turn normally returns the agent's reply string with an implicit
+    ``ok`` outcome. Some terminal endings (e.g. a wedged worker torn down by the
+    executor) *are* the reply text the client should see but must NOT be
+    classified as a successful turn. Subclassing ``str`` keeps every existing
+    consumer (``session.add_message``, the ``content`` frame, ``.lower()`` in
+    tests) working unchanged, while ``outcome_status`` lets the session queue
+    report the true terminal outcome instead of a default ``ok``. ``error`` is
+    the optional typed wire error (#5802) for a failed terminal ending.
+    """
+
+    __slots__ = ("outcome_status", "error")
+
+    def __new__(
+        cls, value: str, *, outcome_status: str = "ok",
+        error: Optional[Dict[str, Any]] = None,
+    ) -> "_TerminalTurn":
+        obj = super().__new__(cls, value)
+        obj.outcome_status = outcome_status
+        obj.error = error
+        return obj
+
+
+class _GatewayRequestChannel:
+    """Concrete ``GatewayRequestChannelProtocol`` bound to a running gateway.
+
+    Delivers a :class:`GatewayServerRequest` to the session's connected client
+    as a ``server_request`` frame, awaits the correlated ``server_reply`` on a
+    per-request Future with a bounded timeout, and keeps the request in the
+    gateway's open-request set until it is answered/times out so the resume
+    path can replay still-open requests to a reconnecting client (Issue #5351).
+    """
+
+    def __init__(self, gateway: "WebSocketGateway") -> None:
+        self._gateway = gateway
+
+    async def request(self, req: Any, *, timeout_s: float = 120.0) -> Any:
+        gw = self._gateway
+        session_id = getattr(req, "session_id", "") or ""
+        request_id = getattr(req, "request_id", "")
+        loop = asyncio.get_event_loop()
+        future: "asyncio.Future" = loop.create_future()
+        gw._open_requests.setdefault(session_id, {})[request_id] = req
+        gw._request_waiters[request_id] = future
+        try:
+            client_id = gw._session_client_id(session_id)
+            if client_id is not None:
+                await gw._send_to_client(
+                    client_id,
+                    {"type": "server_request", "request": req.as_dict()},
+                )
+            try:
+                return await asyncio.wait_for(future, timeout=timeout_s)
+            except asyncio.TimeoutError:
+                return None
+        finally:
+            gw._request_waiters.pop(request_id, None)
+            open_for_session = gw._open_requests.get(session_id)
+            if open_for_session is not None:
+                open_for_session.pop(request_id, None)
+                if not open_for_session:
+                    gw._open_requests.pop(session_id, None)
+
+    def open_requests(self, session_id: str) -> List[Any]:
+        return list(gw_reqs.values()) if (
+            gw_reqs := self._gateway._open_requests.get(session_id)
+        ) else []
+
+
 class WebSocketGateway:
     """WebSocket gateway server for multi-agent coordination.
     
@@ -858,6 +1109,16 @@ class WebSocketGateway:
         """
         self.config = config or GatewayConfig(host=host, port=port)
 
+        # Issue #4766: resolve the per-session turn-execution seam. ``None`` (the
+        # default) resolves to the zero-cost in-process executor, so every turn
+        # runs on the current loop exactly as before — byte-for-byte backward
+        # compatible. Supplying an isolated executor via ``GatewayConfig.executor``
+        # is what contains a wedged/runaway turn to its own worker instead of the
+        # process-wide ``os._exit`` remedy.
+        from praisonaiagents.gateway.protocols import InProcessTurnExecutor
+
+        self._executor = getattr(self.config, "executor", None) or InProcessTurnExecutor()
+
         # Issue #3020: shared cross-platform identity resolver. Mirrors BotOS —
         # stamped onto each channel bot's session manager in ``start_channels``
         # / ``_start_single_channel`` so continuity works in the flagship
@@ -959,6 +1220,14 @@ class WebSocketGateway:
         # a per-turn timeout can cancel a runaway turn. Maps session_id ->
         # (driving asyncio.Task, InterruptController).
         self._active_turns: Dict[str, Tuple[Any, Any]] = {}
+        # Issue #5351: server→client interactive request channel. Tracks the
+        # still-open (unanswered) requests per session and the asyncio.Futures
+        # awaiting each correlated reply, so a blocked HITL turn can reach a
+        # gateway client and — critically — be replayed on reconnect. Bound
+        # lazily via ``request_channel``.
+        self._open_requests: Dict[str, Dict[str, Any]] = {}  # session_id -> {request_id: GatewayServerRequest}
+        self._request_waiters: Dict[str, "asyncio.Future"] = {}  # request_id -> Future[GatewayServerReply]
+        self._request_channel: Optional["_GatewayRequestChannel"] = None
         # Issue #2661: fingerprint of the shared secret each authenticated
         # client connected under, so rotating ``auth_token`` can force-close
         # every session stamped with a stale secret (instant credential
@@ -982,6 +1251,13 @@ class WebSocketGateway:
         
         # Multi-bot lifecycle
         self._channel_bots: Dict[str, Any] = {}  # channel_name -> bot instance
+        # Issue #5146: shared webhook ingress. Adapters that report
+        # ``accepts_webhooks`` and are configured with no explicit
+        # ``webhook_port`` are mounted here (``channel_name -> adapter``) and
+        # served through the gateway's single Starlette listener at
+        # ``/webhooks/<channel>`` — one port, one public URL, routed by path —
+        # instead of each binding its own private ``TCPSite``.
+        self._webhook_channels: Dict[str, Any] = {}
         # Issue #3159: channels configured but skipped at startup because their
         # credential was unavailable (empty token) are tracked here so they stay
         # visible in ``health()`` as ``degraded`` instead of vanishing — a
@@ -1093,6 +1369,8 @@ class WebSocketGateway:
         # contract; the durable backend makes the atomic "already seen or in
         # flight" claim a crash-safe ``UNIQUE`` insert.
         self._hook_idem: Any = None
+        # Lazily-built burst coalescer for hooks with ``coalesce`` (#5867).
+        self._hook_coalescer: Any = None
         self._hook_idempotency_max = 10_000
         self._hook_idempotency_ttl = 86_400.0  # 24h
         # Backend selected by ``hooks.idempotency.store_backend`` in the parsed
@@ -1120,6 +1398,37 @@ class WebSocketGateway:
         self._lifecycle_task: Optional[asyncio.Task] = None
         self._drain_marker_task: Optional[asyncio.Task] = None
         self._lifecycle_drain_timeout: Optional[float] = None
+
+        # Issue #5170: opt-in out-of-band idle-session compaction. A background
+        # sweep compacts sessions that have been idle beyond a threshold off the
+        # turn critical path, so a returning user resumes an already-compacted
+        # session with no first-message latency spike and idle transcripts stay
+        # bounded. All off unless ``lifecycle.idle_compaction.enabled`` is set,
+        # so always-on gateways are unchanged. ``_idle_compaction_cooldown`` is a
+        # per-session backoff (session_id -> retry-not-before ts) so a session we
+        # cannot shrink is not re-compacted every sweep.
+        self._idle_compaction_cfg: Optional[Dict[str, Any]] = None
+        self._idle_compaction_task: Optional[asyncio.Task] = None
+        self._idle_compaction_cooldown: Dict[str, float] = {}
+
+        # Issue #4603: durable, boot-scoped process-lifecycle ledger. Detects an
+        # unclean/OOM death of the *previous* process (which runs no signal
+        # handler, so forensics never fire), surfaces memory/disk pressure on
+        # ``/health``, and backs a restart-loop breaker that survives the very
+        # restart it guards. Off unless a ``lifecycle.ledger``/``health`` block
+        # enables it, so always-on gateways are unchanged.
+        self._lifecycle_ledger: Optional[Any] = None
+        self._ledger_heartbeat_task: Optional[asyncio.Task] = None
+        self._ledger_heartbeat_interval: float = 15.0
+
+        # Issue #5153: shed the coldest *already-persisted* live sessions before
+        # the cgroup memory ceiling OOM-kills the process. Reuses the core
+        # planner (``plan_pressure_evictions``) + the concrete stdlib cgroup
+        # reader that the bot warm-agent cache already uses; folded into the
+        # existing liveness-heartbeat tick, so there is no new task and it is a
+        # no-op on hosts without a cgroup limit or without a session store.
+        self._memory_pressure: Optional[Any] = None
+        self._pressure_headroom: float = 0.9
 
     @property
     def is_running(self) -> bool:
@@ -1379,6 +1688,56 @@ class WebSocketGateway:
                 status_code=403,
             )
 
+        def _client_subject(peer_ip, headers) -> str:
+            """Resolve the per-IP policy subject for an inbound request.
+
+            Consults the pure core ``resolve_ingress_attribution`` contract
+            (Issue #5312) so rate-limiting, the pre-auth budget, and the
+            operator id all key on the *real* client behind a declared trusted
+            proxy — and fail closed (one bucket keyed on the socket peer, never
+            a spoofable header) for anything proxy-shaped but unattributable.
+
+            When core predates the contract, or no ``trusted_proxies`` are
+            configured, this returns the raw socket peer — today's behaviour.
+            """
+            peer = peer_ip or "unknown"
+            # Precedence (highest first) so a live config reload is honoured
+            # and a removed proxy stops being trusted without a restart (#5312):
+            #   1. CLI ``--trusted-proxy`` override — operator-pinned, wins always.
+            #   2. Live YAML ``gateway.trusted_proxies`` from ``_loaded_config`` —
+            #      re-read every request so reload adds/removals take effect.
+            #   3. ``self.config.trusted_proxies`` — the Python/no-config value.
+            override = getattr(self, "_trusted_proxies_override", None)
+            trusted: list = []
+            if override:
+                trusted = [str(p).strip() for p in override if str(p).strip()]
+            else:
+                loaded = getattr(self, "_loaded_config", None) or {}
+                gw = loaded.get("gateway", {}) if isinstance(loaded, dict) else {}
+                if isinstance(gw, dict) and "trusted_proxies" in gw:
+                    raw = gw.get("trusted_proxies")
+                    if isinstance(raw, (list, tuple)):
+                        trusted = [str(p).strip() for p in raw if str(p).strip()]
+                else:
+                    trusted = [
+                        str(p).strip()
+                        for p in (getattr(self.config, "trusted_proxies", None) or [])
+                        if str(p).strip()
+                    ]
+            if resolve_ingress_attribution is None or not trusted:
+                return peer
+            attr = resolve_ingress_attribution(
+                peer_ip=peer,
+                forwarded_for=parse_forwarded_for(
+                    headers.get("x-forwarded-for")
+                ),
+                real_ip=headers.get("x-real-ip"),
+                trusted_proxies=trusted,
+            )
+            if attr.fail_closed:
+                return f"proxy:{peer}"
+            return attr.client_ip
+
         def _resolve_operator_identity(request) -> str:
             """Derive a stable, non-secret operator identity for the audit trail.
 
@@ -1406,7 +1765,10 @@ class WebSocketGateway:
                 digest = hashlib.sha256(token.encode("utf-8")).hexdigest()[:12]
                 return f"operator:{digest}"
             client_ip = request.client.host if request.client else None
-            return f"operator:{client_ip}" if client_ip else "gateway"
+            if not client_ip:
+                return "gateway"
+            subject = _client_subject(client_ip, request.headers)
+            return f"operator:{subject}"
 
         async def info(request):
             auth_err = _check_auth(request)
@@ -1415,11 +1777,15 @@ class WebSocketGateway:
             api_cfg = getattr(self.config, "api", None)
             return JSONResponse({
                 "name": "PraisonAI Gateway",
-                "version": "1.0.0",
+                "version": _installed_gateway_version(),
+                "protocol_version": GATEWAY_PROTOCOL_VERSION,
                 "agents": list(self._agents.keys()),
                 "sessions": len(self._sessions),
                 "clients": len(self._clients),
                 "api": api_cfg.to_dict() if api_cfg is not None else {},
+                # The caller's effective operator scopes, so `gateway status`
+                # can tell "reachable but under-authorised" apart (#5776).
+                "scopes": _resolve_operator_scopes(request),
             })
         
         async def _reject_connection(
@@ -1450,11 +1816,16 @@ class WebSocketGateway:
                 )
 
         async def websocket_endpoint(websocket: WebSocket):
-            # Get client IP for rate limiting
-            client_ip = websocket.client.host if websocket.client else "unknown"
+            # Raw socket peer: used for the loopback exemption decision (a
+            # trusted proxy hop is not loopback) and as the fail-closed bucket.
+            peer_ip = websocket.client.host if websocket.client else "unknown"
+            # Resolve the real client behind a declared trusted proxy so per-IP
+            # rate-limit/budget buckets are not collapsed onto the proxy peer
+            # (Issue #5312). Falls back to the peer when no proxy is trusted.
+            client_ip = _client_subject(peer_ip, websocket.headers)
 
             # Rate limiting for WebSocket upgrades (exempt loopback per acceptance criteria)
-            if not is_loopback(client_ip) and not is_loopback(self._host):
+            if not is_loopback(peer_ip) and not is_loopback(self._host):
                 if not _ws_upgrade_rate.allow("ws_upgrade", client_ip):
                     retry = _ws_upgrade_rate.time_until_allowed("ws_upgrade", client_ip)
                     await _reject_connection(
@@ -1475,7 +1846,7 @@ class WebSocketGateway:
             # once so a hostile client cannot park many half-open connections up
             # to max_connections. Loopback is exempt so local CLIs are never
             # locked out. The slot is released on auth-success or on close.
-            _ip_is_loopback = is_loopback(client_ip) or is_loopback(self._host)
+            _ip_is_loopback = is_loopback(peer_ip) or is_loopback(self._host)
             _released = {"done": False}
 
             def _release_budget():
@@ -1651,7 +2022,7 @@ class WebSocketGateway:
         # Lazy-import approval machinery so it doesn't slow down startup
         # or fail if optional deps are missing.
         from .exec_approval import Resolution, get_exec_approval_manager
-        from .rate_limiter import AuthRateLimiter
+        from .rate_limiter import build_auth_rate_limiter
         from .pairing_routes import create_pairing_routes
 
         _approval_mgr = get_exec_approval_manager()
@@ -1662,8 +2033,15 @@ class WebSocketGateway:
             await _approval_mgr.rehydrate()
         except Exception:
             logger.exception("Failed to rehydrate pending gateway approvals")
-        _approval_rate = AuthRateLimiter(max_attempts=10, window_seconds=60)
-        _ws_upgrade_rate = AuthRateLimiter(max_attempts=10, window_seconds=60)
+        # Issue #5914: when ``push.redis`` is configured the auth limiters share
+        # buckets across replicas so limits are cluster-wide, not per-replica.
+        _auth_redis = getattr(getattr(self.config, "push", None), "redis", None)
+        _approval_rate = build_auth_rate_limiter(
+            _auth_redis, max_attempts=10, window_seconds=60
+        )
+        _ws_upgrade_rate = build_auth_rate_limiter(
+            _auth_redis, max_attempts=10, window_seconds=60
+        )
         # Issue #2620: pre-auth concurrent-connection budget per source IP.
         from .rate_limiter import PreauthConnectionBudget
         _preauth_budget = PreauthConnectionBudget(
@@ -1685,8 +2063,12 @@ class WebSocketGateway:
             auth_err = _check_auth(request)
             if auth_err:
                 return auth_err
+            scope_err = _require_scope(request, OperatorScope.APPROVALS)
+            if scope_err:
+                return scope_err
 
-            client_ip = request.client.host if request.client else "unknown"
+            peer_ip = request.client.host if request.client else "unknown"
+            client_ip = _client_subject(peer_ip, request.headers)
             if not _approval_rate.allow("approval_pending", client_ip):
                 retry = _approval_rate.time_until_allowed("approval_pending", client_ip)
                 return JSONResponse(
@@ -1712,7 +2094,8 @@ class WebSocketGateway:
             if scope_err:
                 return scope_err
 
-            client_ip = request.client.host if request.client else "unknown"
+            peer_ip = request.client.host if request.client else "unknown"
+            client_ip = _client_subject(peer_ip, request.headers)
             if not _approval_rate.allow("approval_resolve", client_ip):
                 retry = _approval_rate.time_until_allowed("approval_resolve", client_ip)
                 return JSONResponse(
@@ -1789,7 +2172,8 @@ class WebSocketGateway:
             if scope_err:
                 return scope_err
 
-            client_ip = request.client.host if request.client else "unknown"
+            peer_ip = request.client.host if request.client else "unknown"
+            client_ip = _client_subject(peer_ip, request.headers)
             if not _approval_rate.allow("approval_allowlist", client_ip):
                 retry = _approval_rate.time_until_allowed("approval_allowlist", client_ip)
                 return JSONResponse(
@@ -1851,11 +2235,12 @@ class WebSocketGateway:
         # ── Magic Link Authentication ────────────────────────────────────
         from .magic_link import MagicLinkStore
         from .cookie_auth import create_auth_manager_from_env
-        from .rate_limiter import AuthRateLimiter
         
         # Initialize magic link store and rate limiter
         _magic_store = MagicLinkStore()
-        _magic_rate = AuthRateLimiter(max_attempts=5, window_seconds=60)
+        _magic_rate = build_auth_rate_limiter(
+            _auth_redis, max_attempts=5, window_seconds=60
+        )
         
         async def magic_link_handler(request):
             """Handle GET /?link=<nonce> magic link authentication."""
@@ -2059,6 +2444,24 @@ class WebSocketGateway:
             if not self._hook_reserve(idem):
                 return JSONResponse({"ok": True, "deduplicated": True})
 
+            # Burst coalescing (#5867): buffer the delivery under its group key
+            # and acknowledge it now; one run fires for the whole burst. The
+            # delivery is recorded as accepted so a sender retry stays deduped.
+            group = hook.resolve_coalesce_key(payload)
+            if group is not None:
+                pending = self._get_hook_coalescer().submit(group, hook, payload)
+                if pending is None:
+                    self._hook_release(idem)
+                    return JSONResponse(
+                        {"ok": False, "error": "too many pending coalesced groups"},
+                        status_code=503, headers={"Retry-After": "30"},
+                    )
+                self._hook_record(idem)
+                return JSONResponse(
+                    {"ok": True, "coalesced": True, "pending": pending},
+                    status_code=202,
+                )
+
             try:
                 result = await self._run_hook(hook, payload)
             except Exception as e:  # noqa: BLE001
@@ -2076,9 +2479,53 @@ class WebSocketGateway:
             status = 200 if ok else 500
             return JSONResponse(result, status_code=status)
 
+        async def webhooks_handler(request) -> "JSONResponse":
+            """{GET,POST} /webhooks/{channel} — shared platform-webhook ingress.
+
+            Issue #5146: serve every ``mode: webhook`` channel that runs in
+            shared-listener mode (no explicit ``webhook_port``) through this one
+            listener, routed by path, instead of each adapter binding its own
+            private port. Verification is delegated to the adapter's own
+            ``handle_shared_request`` (which enforces the
+            ``WebhookVerifierProtocol`` fail-closed); an unknown path returns
+            404 so it can never fall through to another channel's handler.
+            """
+            from starlette.responses import PlainTextResponse
+
+            channel = request.path_params.get("channel", "")
+            adapter = self._webhook_channels.get(channel)
+            if adapter is None:
+                return JSONResponse({"error": "webhook not found"}, status_code=404)
+
+            raw_body = await request.body()
+            handler = getattr(adapter, "handle_shared_request", None)
+            if not callable(handler):
+                return JSONResponse(
+                    {"error": "webhook not available"}, status_code=404
+                )
+            try:
+                status, text = await handler(
+                    raw_body=raw_body,
+                    headers=dict(request.headers),
+                    query=dict(request.query_params),
+                )
+            except Exception:  # noqa: BLE001
+                logger.error(
+                    "Shared webhook dispatch failed for channel %r",
+                    channel,
+                    exc_info=True,
+                )
+                return PlainTextResponse("Dispatch failed", status_code=500)
+            return PlainTextResponse(text, status_code=status)
+
         routes = [
             Route("/", magic_link_handler, methods=["GET"]),
             Route("/hooks/{path:path}", hook_handler, methods=["POST"]),
+            Route(
+                "/webhooks/{channel}",
+                webhooks_handler,
+                methods=["GET", "POST"],
+            ),
             Route("/health", health, methods=["GET"]),
             Route("/ready", ready, methods=["GET"]),
             Route("/live", live, methods=["GET"]),
@@ -2126,6 +2573,18 @@ class WebSocketGateway:
                         _api_guarded(self._api_endpoints.openai_responses),
                         methods=["POST"],
                     ),
+                    # Issue #5335: background/async runs — retrieve a stored
+                    # Response by id and cancel an in-flight background run.
+                    Route(
+                        "/v1/responses/{id}",
+                        _api_guarded(self._api_endpoints.openai_responses_get),
+                        methods=["GET"],
+                    ),
+                    Route(
+                        "/v1/responses/{id}/cancel",
+                        _api_guarded(self._api_endpoints.openai_responses_cancel),
+                        methods=["POST"],
+                    ),
                     Route(
                         "/v1/models",
                         _api_guarded(self._api_endpoints.openai_models),
@@ -2163,13 +2622,34 @@ class WebSocketGateway:
         if self._session_store:
             await self._start_session_cleanup()
 
-        # Issue #3379: re-drive any turn that was in-flight when a previous
-        # process restarted, and proactively notify the originating channel.
-        # Mirrors the durable approval rehydrate above; a no-op without a store.
-        try:
-            await self._resume_interrupted_turns()
-        except Exception:
-            logger.exception("Failed to resume interrupted turns on boot")
+        # Issue #4603: record this boot in the durable lifecycle ledger before
+        # anything else. This reads the prior sentinel, classifies whether the
+        # previous process exited cleanly (an unclean/OOM death runs no signal
+        # handler, so this is the only place it becomes visible), and restamps
+        # ``phase="running"``. No-op when the ledger is unconfigured.
+        if self._lifecycle_ledger is not None:
+            try:
+                self._lifecycle_ledger.record_boot()
+            except Exception:
+                logger.exception("Failed to record boot in lifecycle ledger")
+
+        # Issue #4603: if the persistent restart-loop breaker has already
+        # tripped across prior boots, skip the boot-time auto-resume re-drive
+        # (which is what keeps crashing the process) while still serving fresh
+        # inbound — instead of the supervisor respawning into the same crash.
+        if self._auto_resume_suspended():
+            logger.error(
+                "Persistent restart-loop breaker tripped; suspending boot-time "
+                "auto-resume of interrupted turns (still serving fresh inbound)"
+            )
+        else:
+            # Issue #3379: re-drive any turn that was in-flight when a previous
+            # process restarted, and proactively notify the originating channel.
+            # Mirrors the durable approval rehydrate above; a no-op without a store.
+            try:
+                await self._resume_interrupted_turns()
+            except Exception:
+                logger.exception("Failed to resume interrupted turns on boot")
 
         # Issue #3881: drive recovery from the durable run ledger too. The
         # session-blob scan above is heuristic; the ledger is the source of
@@ -2197,6 +2677,15 @@ class WebSocketGateway:
             self._liveness_task = asyncio.create_task(
                 self._liveness_loop(), name="gateway-liveness"
             )
+
+        # Issue #4603: fold a cheap ``/proc``+cgroup memory sample into the
+        # durable lifecycle sentinel on a slow cadence, so a later signal-less
+        # OOM/SIGKILL leaves the last memory reading behind for the next boot to
+        # flag ``suspected_oom``. No-op when the ledger is unconfigured.
+        if self._lifecycle_ledger is not None and self._ledger_heartbeat_task is None:
+            self._ledger_heartbeat_task = asyncio.create_task(
+                self._ledger_heartbeat_loop(), name="gateway-lifecycle-ledger"
+            )
         try:
             await self._server.serve()
         except Exception as e:
@@ -2209,6 +2698,22 @@ class WebSocketGateway:
         finally:
             self._disarm_watchdog()
             await self._cancel_liveness_task()
+            # Issue #4603: ``serve()`` returns through here on every graceful
+            # termination — the SIGINT/SIGTERM handler only flips
+            # ``should_exit`` and uvicorn unwinds, so ``stop()`` is not
+            # guaranteed to run. Stamp the clean-exit marker here (after
+            # cancelling the sampler so it cannot re-stamp ``running``) so a
+            # normal shutdown is not misreported as an unclean/OOM death on the
+            # next boot. ``mark_exited`` is pid-owned and idempotent, so a later
+            # explicit ``stop()`` is harmless.
+            await self._cancel_ledger_heartbeat()
+            if self._lifecycle_ledger is not None:
+                try:
+                    self._lifecycle_ledger.mark_exited()
+                except Exception:
+                    logger.debug(
+                        "Failed to mark clean exit in lifecycle ledger (serve)"
+                    )
 
     async def _cancel_liveness_task(self) -> None:
         """Stop the connection-liveness heartbeat/reaper task (idempotent)."""
@@ -2222,6 +2727,95 @@ class WebSocketGateway:
                 pass
             except Exception:
                 logger.debug("Liveness task exited with error on cancel")
+
+    async def _cancel_ledger_heartbeat(self) -> None:
+        """Stop the lifecycle-ledger memory-sample heartbeat (idempotent)."""
+        task = self._ledger_heartbeat_task
+        self._ledger_heartbeat_task = None
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.debug("Lifecycle-ledger heartbeat exited with error")
+
+    async def _ledger_heartbeat_loop(self) -> None:
+        """Periodically fold a memory sample into the durable lifecycle sentinel.
+
+        Best-effort and cheap (<1ms of ``/proc``+cgroup I/O per tick). Runs only
+        while the ledger is configured; any error is swallowed so it never
+        crashes the gateway it is meant to make observable.
+        """
+        ledger = self._lifecycle_ledger
+        if ledger is None:
+            return
+        interval = self._ledger_heartbeat_interval
+        while self._is_running:
+            try:
+                await asyncio.sleep(interval)
+                ledger.sample_memory()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.debug("Lifecycle-ledger sample failed", exc_info=True)
+
+    def _auto_resume_suspended(self) -> bool:
+        """Whether the persistent restart-loop breaker has tripped this boot.
+
+        Only meaningful for a :class:`PersistentRestartLoopGuard` whose events
+        survive process boots. When there are interrupted turns to re-drive, a
+        boot is restart-worthy: record it and, once ``max_restarts`` such boots
+        fall within the window, report tripped so the caller skips the poison
+        re-drive that keeps crashing the process. Returns ``False`` for the
+        in-memory guard (which cannot see prior boots) and when unconfigured.
+        """
+        guard = self._restart_loop_guard
+        if guard is None:
+            return False
+        # Only the persistent guard carries cross-boot state; the in-memory one
+        # is rebuilt fresh each boot and must not gate the resume path.
+        if not hasattr(guard, "_store"):
+            return False
+        # Nothing to re-drive ⇒ this boot is not restart-interrupted; don't
+        # count it against the breaker and let it re-arm on a clean boot.
+        if not self._has_interrupted_turns():
+            try:
+                guard.reset()
+            except Exception:
+                pass
+            return False
+        try:
+            return guard.record(now=time.time())
+        except Exception:
+            return False
+
+    def _has_interrupted_turns(self) -> bool:
+        """Best-effort check for a persisted in-flight turn left by a restart."""
+        store = self._session_store
+        if not store:
+            return False
+        lister = getattr(store, "list_sessions", None)
+        if not callable(lister):
+            return False
+        try:
+            try:
+                summaries = lister(limit=1_000_000)
+            except TypeError:
+                summaries = lister()
+        except Exception:
+            return False
+        for summary in summaries or []:
+            sid = summary.get("session_id") if isinstance(summary, dict) else summary
+            if not sid:
+                continue
+            data = self._load_persisted_session_data(sid)
+            if not data:
+                continue
+            if bool(data.get("is_executing")) or bool(data.get("pending_inbox")):
+                return True
+        return False
 
     # ── Event-loop liveness watchdog (Issue #3410) ──
 
@@ -2265,11 +2859,21 @@ class WebSocketGateway:
         try:
             interval = float(watchdog_cfg.get("liveness_interval", 5.0))
             strikes = int(watchdog_cfg.get("liveness_strikes", 3))
-            policy = LoopWatchdogPolicy(
+            policy_kwargs: Dict[str, Any] = dict(
                 probe_interval_s=interval,
                 missed_probes_before_wedged=strikes,
                 dump_file=watchdog_cfg.get("dump_file") or None,
             )
+            # Issue #5079: optional shutdown-phase deadline grace budget. Only
+            # forwarded when the core policy supports it, so an older core
+            # (liveness only) still loads.
+            if "shutdown_grace" in watchdog_cfg and hasattr(
+                LoopWatchdogPolicy, "shutdown_grace_s"
+            ):
+                policy_kwargs["shutdown_grace_s"] = float(
+                    watchdog_cfg.get("shutdown_grace")
+                )
+            policy = LoopWatchdogPolicy(**policy_kwargs)
         except (TypeError, ValueError) as exc:
             logger.warning("Invalid gateway.watchdog config (%s); disabling", exc)
             return
@@ -2302,6 +2906,57 @@ class WebSocketGateway:
             watchdog.disarm()
         except Exception:  # pragma: no cover - fail open
             pass
+
+    def _arm_shutdown_deadline(self, deadline_s: float) -> None:
+        """Arm a bounded self-exit around the stop path (Issue #5079).
+
+        The liveness watchdog only fires on a *wedged loop* and is disarmed on
+        a deliberate stop (#3410) — so a teardown step that blocks while the
+        loop is still alive would otherwise hang until an external ``SIGKILL``.
+        Arming the core watchdog's deadline mode gives that path an all-thread
+        stack dump + bounded ``os._exit`` before the supervisor kills us. Opt-in
+        and no-op when the watchdog is unconfigured; fail-open on any error.
+        """
+        watchdog = self._watchdog
+        if watchdog is None:
+            return
+        try:
+            watchdog.arm_deadline(deadline_s)
+        except Exception:  # pragma: no cover - fail open, never block stop
+            logger.debug("Could not arm shutdown deadline", exc_info=True)
+
+    def _cancel_shutdown_deadline(self) -> None:
+        """Cancel the shutdown deadline so a clean stop never self-exits."""
+        watchdog = self._watchdog
+        if watchdog is None:
+            return
+        try:
+            watchdog.cancel()
+        except Exception:  # pragma: no cover - fail open
+            pass
+
+    def _resolve_shutdown_grace(self, grace: Optional[float]) -> float:
+        """Resolve the shutdown grace budget (CLI/Python override or policy)."""
+        if grace is not None:
+            try:
+                grace = float(grace)
+            except (TypeError, ValueError):
+                grace = None
+            # Issue #5079: a NaN/inf override would flow into ``deadline_s`` and
+            # make ``arm_deadline`` silently no-op (it rejects non-finite),
+            # quietly disabling the backstop it was asked to size. Treat a
+            # non-finite override as "unset" and fall back to the policy default.
+            if grace is not None and not math.isfinite(grace):
+                grace = None
+        if grace is None:
+            watchdog = self._watchdog
+            if watchdog is not None:
+                grace = getattr(watchdog.policy, "shutdown_grace_s", 5.0)
+            else:
+                grace = 5.0
+        if grace < 0:
+            grace = 0.0
+        return grace
 
     # ── Gateway lifecycle: idle/scale-to-zero + drain marker (Issue #3021) ──
 
@@ -2349,6 +3004,63 @@ class WebSocketGateway:
                 logger.warning("Invalid scale_to_zero config; disabling: %s", e)
                 self._idle_policy = None
 
+        # Issue #5170: opt-in out-of-band idle-session compaction. Parse the
+        # config into a plain dict of validated numbers; the sweep itself lives
+        # in ``_run_idle_compaction_loop`` beside the other lifecycle loops. Off
+        # unless ``enabled`` is truthy and a durable session store is bound
+        # (nothing to enumerate/persist otherwise).
+        ic = lifecycle_cfg.get("idle_compaction")
+        if isinstance(ic, dict) and _as_bool(ic.get("enabled")):
+            if self._session_store is None:
+                logger.warning(
+                    "Gateway idle_compaction requires a persistent session "
+                    "store; disabling"
+                )
+                self._idle_compaction_cfg = None
+            else:
+                try:
+                    parsed = {
+                        "idle_after_seconds": float(
+                            ic.get("idle_after_seconds", 1800.0)
+                        ),
+                        "min_tokens": int(ic.get("min_tokens", 8000)),
+                        "sweep_interval_seconds": float(
+                            ic.get("sweep_interval_seconds", 300.0)
+                        ),
+                        "cooldown_seconds": float(
+                            ic.get("cooldown_seconds", 3600.0)
+                        ),
+                        "max_per_sweep": int(ic.get("max_per_sweep", 20)),
+                        # How many sessions to enumerate per sweep. Stores return
+                        # newest-first, so a small cap would starve older idle
+                        # sessions on a busy gateway (Issue #5170 review).
+                        "scan_limit": int(ic.get("scan_limit", 5000)),
+                    }
+                    # Reject non-positive numbers instead of starting a broken
+                    # loop: a zero/negative sweep interval would busy-spin or
+                    # make ``asyncio.sleep`` raise and kill the task, and
+                    # non-positive token/cooldown/limit values disable the
+                    # safeguards the sweep depends on (Issue #5170 review).
+                    invalid = [k for k, v in parsed.items() if v <= 0]
+                    if invalid:
+                        raise ValueError(
+                            "non-positive values not allowed: "
+                            + ", ".join(sorted(invalid))
+                        )
+                    self._idle_compaction_cfg = parsed
+                    logger.info(
+                        "Gateway idle_compaction enabled "
+                        "(idle_after=%ss, min_tokens=%s, sweep=%ss)",
+                        self._idle_compaction_cfg["idle_after_seconds"],
+                        self._idle_compaction_cfg["min_tokens"],
+                        self._idle_compaction_cfg["sweep_interval_seconds"],
+                    )
+                except (TypeError, ValueError) as e:
+                    logger.warning(
+                        "Invalid idle_compaction config; disabling: %s", e
+                    )
+                    self._idle_compaction_cfg = None
+
         # Epoch-aware external drain marker.
         drain = lifecycle_cfg.get("drain")
         if isinstance(drain, dict) and drain.get("marker_path"):
@@ -2382,6 +3094,58 @@ class WebSocketGateway:
             except (ImportError, ValueError) as e:
                 logger.warning("Invalid restart_loop_guard config; disabling: %s", e)
                 self._restart_loop_guard = None
+
+        # Issue #4603: durable process-lifecycle ledger. Enabled via
+        # ``lifecycle.ledger.enabled`` (or implicitly when
+        # ``restart_loop_guard.persist`` is set) so an unclean/OOM prior death
+        # is detected at boot, pressure is surfaced on ``/health``, and — when
+        # ``restart_loop_guard.persist`` is truthy — the crash-loop breaker
+        # persists across boots and covers the auto-resume path. Off by default.
+        ledger_cfg = lifecycle_cfg.get("ledger")
+        if not isinstance(ledger_cfg, dict):
+            ledger_cfg = {}
+        persist_guard = isinstance(rlg, dict) and _as_bool(rlg.get("persist"))
+        ledger_enabled = _as_bool(ledger_cfg.get("enabled")) or persist_guard
+        if ledger_enabled:
+            try:
+                from .lifecycle_ledger import (
+                    LifecycleLedger,
+                    build_persistent_restart_guard,
+                    default_sentinel_path,
+                )
+
+                health_cfg = lifecycle_cfg.get("health")
+                if not isinstance(health_cfg, dict):
+                    health_cfg = {}
+                path = ledger_cfg.get("path") or default_sentinel_path()
+                self._lifecycle_ledger = LifecycleLedger(
+                    str(path),
+                    memory_budget_fraction=float(
+                        health_cfg.get("memory_budget_fraction", 0.9)
+                    ),
+                    disk_min_free_mb=float(
+                        health_cfg.get("disk_min_free_mb", 512.0)
+                    ),
+                )
+                # When persistence is requested, upgrade the in-memory guard to
+                # one whose events survive the restart it guards and share the
+                # ledger's sentinel file.
+                if persist_guard:
+                    rlg = rlg if isinstance(rlg, dict) else {}
+                    self._restart_loop_guard = build_persistent_restart_guard(
+                        self._lifecycle_ledger,
+                        max_restarts=int(rlg.get("max_restarts", 3)),
+                        window_seconds=float(
+                            rlg.get("window_seconds", 3600.0)
+                        ),
+                    )
+                logger.info(
+                    "Gateway lifecycle ledger enabled (path=%s, persist_guard=%s)",
+                    path, persist_guard,
+                )
+            except (ImportError, ValueError, OSError) as e:
+                logger.warning("Invalid lifecycle ledger config; disabling: %s", e)
+                self._lifecycle_ledger = None
 
     def _merge_lifecycle_overrides(
         self,
@@ -2417,7 +3181,10 @@ class WebSocketGateway:
         return merged
 
     def _merge_watchdog_overrides(
-        self, watchdog_cfg: Optional[Dict[str, Any]]
+        self,
+        watchdog_cfg: Optional[Dict[str, Any]],
+        *,
+        yaml_present: bool = False,
     ) -> Optional[Dict[str, Any]]:
         """Fold CLI watchdog overrides into the YAML ``watchdog`` block (#3410).
 
@@ -2430,6 +3197,21 @@ class WebSocketGateway:
         """
         enable = getattr(self, "_watchdog_override", None)
         timeout = getattr(self, "_watchdog_timeout_override", None)
+        # Issue #5362: fall back to the public ``GatewayConfig`` fields so a
+        # Python embedder building ``GatewayConfig(watchdog=True, …)`` enables
+        # the backstop without a YAML block or CLI flag. Precedence: CLI flag >
+        # explicit YAML (block *or* scalar, incl. ``watchdog: false``) > Python
+        # config field. ``yaml_present`` distinguishes an explicit scalar/block
+        # from an absent key so an explicit ``watchdog: false`` is honoured and
+        # not silently re-enabled by ``GatewayConfig(watchdog=True)``.
+        if enable is None and not yaml_present:
+            cfg_enable = getattr(self.config, "watchdog", None)
+            if cfg_enable:
+                enable = True
+        if timeout is None:
+            cfg_timeout = getattr(self.config, "watchdog_timeout", None)
+            if cfg_timeout is not None:
+                timeout = cfg_timeout
         if enable is None and timeout is None:
             return watchdog_cfg
 
@@ -2569,6 +3351,229 @@ class WebSocketGateway:
         except asyncio.CancelledError:
             raise
 
+    def _idle_compaction_candidates(
+        self, cfg: Dict[str, Any], now: float, listing: Any = None
+    ) -> List[Tuple[str, Optional[int]]]:
+        """Select persisted sessions eligible for off-path compaction.
+
+        Pure selection over the durable store's session listing: a session is a
+        candidate when it has been idle at least ``idle_after_seconds``, its
+        transcript is at least ``min_tokens``, it is not currently held live and
+        executing in this gateway, and it is not inside its per-session cooldown.
+        Kept separate from the loop so the decision stays testable.
+
+        Returns ``(session_id, message_count)`` pairs. The message count is the
+        transcript length observed at selection time; the loop rechecks it before
+        committing a checkpoint so a turn that arrives during summarisation is
+        never silently dropped (Issue #5170 review). ``listing`` may be supplied
+        by the caller (e.g. fetched off-thread); otherwise it is read here.
+        """
+        store = self._session_store
+        if store is None or not hasattr(store, "list_sessions"):
+            return []
+        idle_after = cfg["idle_after_seconds"]
+        min_tokens = cfg["min_tokens"]
+        if listing is None:
+            try:
+                listing = store.list_sessions(limit=cfg.get("scan_limit", 5000))
+            except Exception as e:
+                logger.debug("idle_compaction list_sessions failed: %s", e)
+                return []
+        candidates: List[Tuple[str, Optional[int]]] = []
+        for row in listing:
+            sid = row.get("session_id") or row.get("id")
+            if not sid:
+                continue
+            not_before = self._idle_compaction_cooldown.get(sid)
+            if not_before is not None and now < not_before:
+                continue
+            live = self._sessions.get(sid)
+            if live is not None and getattr(live, "_is_executing", False):
+                continue
+            updated_at = row.get("updated_at")
+            idle_seconds = self._seconds_since_iso(updated_at, now)
+            if idle_seconds is None or idle_seconds < idle_after:
+                continue
+            total_tokens = row.get("total_tokens")
+            if isinstance(total_tokens, (int, float)) and total_tokens < min_tokens:
+                continue
+            mc = row.get("message_count")
+            candidates.append((sid, mc if isinstance(mc, int) else None))
+        return candidates
+
+    @staticmethod
+    def _seconds_since_iso(value: Any, now: float) -> Optional[float]:
+        """Seconds elapsed since an ISO-8601 timestamp, or ``None`` if unparsable."""
+        if not isinstance(value, str) or not value:
+            return None
+        try:
+            from datetime import datetime
+
+            ts = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            return now - ts.timestamp()
+        except (ValueError, OverflowError):
+            return None
+
+    async def _run_idle_compaction_loop(self) -> None:
+        """Compact idle sessions out-of-band so returning users pay no penalty.
+
+        Only scheduled when ``lifecycle.idle_compaction.enabled`` is set and a
+        durable session store is bound (Issue #5170). Each sweep selects idle,
+        over-budget sessions, rebuilds their cheap working history (summary +
+        tail), runs the reusable ``ContextCompactor`` off the turn critical
+        path, and persists a compaction checkpoint so the next user message
+        resumes an already-compacted session. A per-session cooldown prevents
+        re-compacting a session that could not be shrunk every sweep.
+        """
+        cfg = self._idle_compaction_cfg
+        store = self._session_store
+        if cfg is None or store is None:
+            return
+        if not hasattr(store, "get_working_history") or not hasattr(
+            store, "append_compaction_checkpoint"
+        ):
+            logger.info(
+                "Gateway idle_compaction: session store lacks working-history/"
+                "checkpoint support; disabling"
+            )
+            return
+        try:
+            from praisonaiagents.compaction.compactor import ContextCompactor
+            from praisonaiagents.compaction.strategy import CompactionStrategy
+        except ImportError as e:
+            logger.warning("Gateway idle_compaction unavailable: %s", e)
+            return
+
+        min_tokens = cfg["min_tokens"]
+        cooldown_seconds = cfg["cooldown_seconds"]
+        max_per_sweep = cfg["max_per_sweep"]
+        # Target a comfortable fraction of the budget so a compacted session
+        # stays under threshold for a while rather than re-tripping next sweep.
+        compactor = ContextCompactor(
+            max_tokens=min_tokens,
+            target_tokens=int(min_tokens * 0.75),
+            strategy=CompactionStrategy.SUMMARIZE,
+        )
+        scan_limit = cfg.get("scan_limit", 5000)
+        logger.info("Gateway idle-compaction sweep armed")
+        try:
+            while self._is_running:
+                await asyncio.sleep(cfg["sweep_interval_seconds"])
+                if self._is_dormant:
+                    continue
+                now = time.time()
+                # Store I/O is synchronous; run it off the gateway event loop so
+                # websocket and turn handling are never paused by a sweep
+                # (Issue #5170 review).
+                try:
+                    listing = await asyncio.to_thread(
+                        store.list_sessions, limit=scan_limit
+                    )
+                except Exception as e:
+                    logger.debug("idle_compaction list_sessions failed: %s", e)
+                    continue
+                candidates = self._idle_compaction_candidates(cfg, now, listing)
+                processed = 0
+                for sid, seen_count in candidates:
+                    if processed >= max_per_sweep:
+                        break
+                    try:
+                        messages = await asyncio.to_thread(
+                            store.get_working_history, sid
+                        )
+                    except Exception as e:
+                        logger.debug(
+                            "idle_compaction get_working_history(%s) failed: %s",
+                            sid, e,
+                        )
+                        continue
+                    if not compactor.needs_compaction(messages):
+                        continue
+                    processed += 1
+                    try:
+                        _, result = await compactor.compact_async(messages)
+                    except Exception as e:
+                        logger.debug(
+                            "idle_compaction compact(%s) failed: %s", sid, e
+                        )
+                        self._idle_compaction_cooldown[sid] = now + cooldown_seconds
+                        continue
+                    shrank = (
+                        result.compacted_tokens < result.original_tokens
+                        and not result.was_skipped_due_to_low_savings
+                        and bool((result.summary or "").strip())
+                    )
+                    if shrank:
+                        # Guard against the stale-checkpoint race: if a turn was
+                        # persisted while we were summarising, the transcript
+                        # grew and the summary no longer covers the whole log.
+                        # ``append_compaction_checkpoint`` anchors to the *current*
+                        # length, so committing now would drop the new turn from
+                        # resume context. Re-read the length and skip if it moved
+                        # (Issue #5170 review); the session is cooled down and
+                        # retried on a later sweep.
+                        grew = False
+                        if seen_count is not None:
+                            grew = await asyncio.to_thread(
+                                self._session_grew, store, sid, seen_count,
+                                scan_limit,
+                            )
+                        if grew:
+                            logger.debug(
+                                "idle_compaction skip(%s): transcript grew "
+                                "during compaction; will retry",
+                                sid,
+                            )
+                        else:
+                            try:
+                                await asyncio.to_thread(
+                                    store.append_compaction_checkpoint,
+                                    sid,
+                                    result.summary,
+                                    tokens_before=result.original_tokens,
+                                    tokens_after=result.compacted_tokens,
+                                    metadata={"source": "idle_compaction"},
+                                )
+                                logger.info(
+                                    "[idle-compaction] %s: %s->%s tokens",
+                                    sid,
+                                    result.original_tokens,
+                                    result.compacted_tokens,
+                                )
+                            except Exception as e:
+                                logger.debug(
+                                    "idle_compaction checkpoint(%s) failed: %s",
+                                    sid, e,
+                                )
+                    # Cool the session down either way: if it shrank we do not
+                    # need to revisit it soon; if it could not shrink we must
+                    # not retry it every sweep.
+                    self._idle_compaction_cooldown[sid] = now + cooldown_seconds
+        except asyncio.CancelledError:
+            raise
+
+    @staticmethod
+    def _session_grew(
+        store: Any, session_id: str, seen_count: int, scan_limit: int = 5000
+    ) -> bool:
+        """Return True if the persisted transcript grew past ``seen_count``.
+
+        Used to detect a turn appended while we were summarising off-path, so a
+        stale checkpoint is not committed over it. Unknown length (store cannot
+        report a fresh count) is treated as "not grown" to avoid starving
+        compaction on stores lacking a cheap length probe.
+        """
+        try:
+            listing = store.list_sessions(limit=scan_limit)
+        except Exception:
+            return False
+        for row in listing:
+            sid = row.get("session_id") or row.get("id")
+            if sid == session_id:
+                mc = row.get("message_count")
+                return isinstance(mc, int) and mc > seen_count
+        return False
+
     def _read_drain_marker(self) -> Optional[Dict[str, Any]]:
         """Read + parse the external drain marker file, or ``None`` if absent."""
         path = self._drain_marker_path
@@ -2646,9 +3651,11 @@ class WebSocketGateway:
         # corresponding feature rather than leaving stale state.
         prev_idle = self._idle_policy is not None
         prev_drain = self._drain_marker_policy is not None
+        prev_idle_compaction = self._idle_compaction_cfg is not None
         self._idle_policy = None
         self._drain_marker_policy = None
         self._drain_marker_path = None
+        self._idle_compaction_cfg = None
         self._configure_lifecycle(lifecycle_cfg)
 
         try:
@@ -2658,6 +3665,7 @@ class WebSocketGateway:
 
         now_idle = self._idle_policy is not None
         now_drain = self._drain_marker_policy is not None
+        now_idle_compaction = self._idle_compaction_cfg is not None
 
         if now_idle != prev_idle:
             if self._lifecycle_task is not None:
@@ -2677,6 +3685,16 @@ class WebSocketGateway:
                 self._drain_marker_task = loop.create_task(
                     self._run_drain_marker_watch(self._lifecycle_drain_timeout),
                     name="gateway-drain-marker",
+                )
+
+        if now_idle_compaction != prev_idle_compaction:
+            if self._idle_compaction_task is not None:
+                self._idle_compaction_task.cancel()
+                self._idle_compaction_task = None
+            if now_idle_compaction:
+                self._idle_compaction_task = loop.create_task(
+                    self._run_idle_compaction_loop(),
+                    name="gateway-idle-compaction",
                 )
 
     async def _drain_active_sessions(self, reason: str = "shutdown", timeout: float = 10.0) -> None:
@@ -2746,15 +3764,34 @@ class WebSocketGateway:
                 except Exception as e:
                     logger.error(f"Failed to persist timed-out session {session.session_id}: {e}")
 
-    async def stop(self, drain_timeout: float = 10.0) -> None:
+    async def stop(self, drain_timeout: float = 10.0, grace: Optional[float] = None) -> None:
         """Stop the gateway server with graceful drain.
         
         Args:
             drain_timeout: Maximum time to wait for active sessions to complete (default: 10.0)
+            grace: Extra budget (seconds) beyond ``drain_timeout`` before the
+                shutdown-phase deadline watchdog fires a bounded, diagnosable
+                self-exit (Issue #5079). ``None`` uses ``gateway.watchdog.
+                shutdown_grace`` (default 5s). Only active when a watchdog is
+                configured; otherwise this is a plain no-op.
         """
         if not self._is_running:
             return
-        
+
+        # Issue #5079: arm a wall-clock shutdown deadline so a teardown step
+        # that blocks while the loop is still alive gets an all-thread stack
+        # dump + bounded os._exit instead of an external SIGKILL. Armed at the
+        # start of the drain; cancelled in the finally on a clean stop so a
+        # healthy shutdown never self-exits. No-op unless a watchdog is set.
+        shutdown_grace = self._resolve_shutdown_grace(grace)
+        self._arm_shutdown_deadline(drain_timeout + shutdown_grace)
+        try:
+            await self._stop_inner(drain_timeout)
+        finally:
+            self._cancel_shutdown_deadline()
+
+    async def _stop_inner(self, drain_timeout: float) -> None:
+        """The ordered teardown, bounded by the shutdown deadline (#5079)."""
         # Flip readiness to draining BEFORE draining so load balancers stop
         # routing new traffic while in-flight sessions finish. Keep _is_running
         # True so liveness (/live) still reports the process as alive during drain.
@@ -2762,6 +3799,9 @@ class WebSocketGateway:
         
         # Gracefully drain active sessions before closing
         await self._drain_active_sessions(reason="shutdown", timeout=drain_timeout)
+
+        if self._hook_coalescer is not None:
+            await self._hook_coalescer.aclose()
         
         self._is_running = False
         
@@ -2790,6 +3830,18 @@ class WebSocketGateway:
 
         # Issue #2798/#3911: stop the connection-liveness heartbeat/reaper.
         await self._cancel_liveness_task()
+
+        # Issue #4603: this is the graceful-stop path, so stamp a clean exit in
+        # the durable lifecycle sentinel before we go. Only the process that
+        # wrote the boot marker can do so (ownership-checked in the ledger), so
+        # a later unclean death of *another* boot is never masked. Cancel the
+        # sampler first so it cannot re-stamp ``phase="running"`` after this.
+        await self._cancel_ledger_heartbeat()
+        if self._lifecycle_ledger is not None:
+            try:
+                self._lifecycle_ledger.mark_exited()
+            except Exception:
+                logger.debug("Failed to mark clean exit in lifecycle ledger")
 
         # Release PID lock
         if hasattr(self, '_pid_lock') and self._pid_lock:
@@ -2837,6 +3889,34 @@ class WebSocketGateway:
             return
         if msg_type == EventType.PONG.value:
             return
+
+        # Issue #5166: central, default-deny authorization gate. Resolve the
+        # scope this method requires from the declarative registry (the single
+        # source of truth) and deny before dispatch when the client lacks it.
+        # A method nobody classified is ADMIN-only by omission rather than
+        # reachable ungated, and plugin-registered methods are gated too. The
+        # per-endpoint ``_client_has_scope`` checks below become a redundant
+        # (harmless) second line rather than the sole gate. ``PING``/``PONG``
+        # are transport frames handled above and never reach here. If the core
+        # is too old to expose the guard, fall through to the legacy checks.
+        if authorize_method is not None:
+            try:
+                params = data if isinstance(data, dict) else None
+                authorize_method(
+                    msg_type, self._client_scope_set(client_id), params
+                )
+            except GatewayUnauthorized as exc:
+                await self._send_to_client(client_id, {
+                    "type": "error",
+                    "code": "insufficient_scope",
+                    "message": "insufficient scope",
+                    "required_scope": (
+                        exc.required.value
+                        if getattr(exc, "required", None) is not None
+                        else None
+                    ),
+                })
+                return True
 
         # Handle versioned handshake
         if msg_type == "hello":
@@ -2992,6 +4072,13 @@ class WebSocketGateway:
                 "max_queued_frames": getattr(self.config, 'max_queued_frames', 1000),
                 "heartbeat_ms": heartbeat_ms,
             }
+            # Issue #5207: fold the attachment ceilings into the advertised policy
+            # so any /ws client can self-limit/chunk before sending. Only adds
+            # keys when attachments are enabled, so a gateway with attachments
+            # disabled advertises exactly today's policy shape (backward compatible).
+            attachments = getattr(self.config, 'attachments', None)
+            if attachments is not None and hasattr(attachments, 'to_policy'):
+                policy.update(attachments.to_policy())
             
             # Send successful handshake response
             result = HelloResult(
@@ -3019,6 +4106,12 @@ class WebSocketGateway:
                     "type": "replay",
                     "event": event.to_dict(),
                 })
+
+            # Issue #5351: re-issue every still-open interactive request for
+            # this session so a reconnecting client can re-render and answer a
+            # prompt that was in flight when it dropped — a turn is never wedged
+            # awaiting an answer the reconnected client never saw.
+            await self._replay_open_requests(client_id, session.session_id)
         
         # Keep backward compatibility with old join message
         elif msg_type == "join":
@@ -3083,7 +4176,15 @@ class WebSocketGateway:
                 
                 # Set negotiated protocol version for the session
                 session._protocol_version = negotiated_version
-                
+
+                # Rebind client_id to session for correct routing (parity with
+                # the ``hello`` path). Without this a joining client would not
+                # become the session's preferred delivery target, so a new
+                # server→client request could be sent to a stale client and the
+                # joining client would miss the next prompt (Issue #5351).
+                if hasattr(session, '_client_id'):
+                    session._client_id = client_id
+
                 self._client_sessions[client_id] = session.session_id
                 
                 # Check if resync is required
@@ -3138,6 +4239,12 @@ class WebSocketGateway:
                             "event": event_data,
                             "seq": seq,
                         })
+
+                # Issue #5351: re-issue every still-open interactive request for
+                # this session (independent of the resync/replay path) so a
+                # reconnecting client recovers a prompt that was in flight when
+                # it dropped and the turn is never wedged awaiting a lost answer.
+                await self._replay_open_requests(client_id, session.session_id)
                 
                 # If session was resumed with pending messages or was executing, restart processing
                 if session._was_resumed and (not session._inbox.empty() or session._is_executing):
@@ -3177,15 +4284,59 @@ class WebSocketGateway:
                 session = self._sessions.get(session_id)
                 if session:
                     content = data.get("content", "")
+                    # Issue #5193: optional client-supplied request idempotency
+                    # key. A client that queues a request while reconnecting and
+                    # flushes it on reconnect resends the SAME ``request_id``; the
+                    # server dedups by it (reusing the durable inbound store) so
+                    # the turn runs exactly once instead of double-running. A
+                    # duplicate is acked (not re-enqueued). Missing id keeps the
+                    # legacy fire-and-forget behaviour untouched.
+                    request_id = data.get("request_id")
+                    if request_id is not None:
+                        rid_key = f"op:{session_id}:{request_id}"
+                        try:
+                            fresh = self._get_hook_idem_store().reserve(rid_key)
+                        except Exception:  # pragma: no cover - defensive
+                            fresh = True
+                        if not fresh:
+                            await self._send_to_client(client_id, {
+                                "type": "response",
+                                "status": "duplicate",
+                                "session_id": session_id,
+                                "request_id": request_id,
+                            })
+                            return True
                     # Issue #3467: portable stop command. A chat/operator client
                     # can abort the in-flight turn by sending "/stop" (or "stop")
                     # instead of a dedicated abort frame.
-                    if isinstance(content, str) and content.strip().lower() in ("/stop", "stop"):
-                        aborted = self._abort_active_turn(session_id, reason="user")
-                        await self._send_to_client(client_id, {
-                            "type": "aborted" if aborted else "no_active_turn",
+                    if isinstance(content, str) and content.strip().lower() in (
+                        "/stop", "stop", "/stop all", "/cancel",
+                    ):
+                        # Issue #5129: "/stop"/"stop" stay turn-scoped (back-compat);
+                        # "/stop all" or "/cancel" also drain the queued backlog so
+                        # no message the user just cancelled is answered afterwards.
+                        normalised = content.strip().lower()
+                        scope = (
+                            StopScope.SESSION
+                            if normalised in ("/stop all", "/cancel")
+                            else StopScope.TURN
+                        )
+                        result = self._abort_session(session_id, scope=scope, reason="user")
+                        payload = {
+                            "type": "aborted" if (
+                                result.turn_aborted or result.pending_cancelled
+                            ) else "no_active_turn",
                             "session_id": session_id,
-                        })
+                        }
+                        payload.update(result.to_dict())
+                        # A stop/cancel is not a turn: drop any reservation so
+                        # the key is not permanently held.
+                        if request_id is not None:
+                            try:
+                                self._get_hook_idem_store().release(rid_key)
+                            except Exception:  # pragma: no cover - defensive
+                                pass
+                        await self._send_to_client(client_id, payload)
                         return True
                     message = GatewayMessage(
                         content=content,
@@ -3198,6 +4349,13 @@ class WebSocketGateway:
                     # terminally here — otherwise an "accepted" ack would leave
                     # the client waiting forever for a "final" that never comes.
                     if self._agents.get(session.agent_id) is None:
+                        # The turn never ran: release the reservation so a later
+                        # retry (once the agent is available) is not deduped away.
+                        if request_id is not None:
+                            try:
+                                self._get_hook_idem_store().release(rid_key)
+                            except Exception:  # pragma: no cover - defensive
+                                pass
                         await self._send_to_client(client_id, {
                             "type": "response",
                             "status": "final",
@@ -3207,18 +4365,40 @@ class WebSocketGateway:
                         })
                         return True
 
-                    response = await self._process_agent_message(session, message)
+                    try:
+                        response = await self._process_agent_message(session, message)
+                    except BaseException:
+                        # The turn failed to be accepted/enqueued: release the
+                        # reservation so a legitimate retry of the same
+                        # request_id is not deduped away as a phantom duplicate.
+                        if request_id is not None:
+                            try:
+                                self._get_hook_idem_store().release(rid_key)
+                            except Exception:  # pragma: no cover - defensive
+                                pass
+                        raise
+
+                    # The turn was accepted/enqueued: commit the reservation so a
+                    # resend of the same request_id dedups instead of re-running.
+                    if request_id is not None:
+                        try:
+                            self._get_hook_idem_store().record(rid_key)
+                        except Exception:  # pragma: no cover - defensive
+                            pass
 
                     # Provisional acknowledgement: the turn was accepted/enqueued
                     # but is not yet resolved. A distinct status lets clients tell
                     # "accepted" from the "final" answer (sent later by
                     # _run_session_queue) instead of string-sniffing the content.
-                    await self._send_to_client(client_id, {
+                    accepted_ack = {
                         "type": "response",
                         "status": "accepted",
                         "content": response,
                         "session_id": session_id,
-                    })
+                    }
+                    if request_id is not None:
+                        accepted_ack["request_id"] = request_id
+                    await self._send_to_client(client_id, accepted_ack)
             else:
                 await self._send_to_client(client_id, {
                     "type": "error",
@@ -3244,10 +4424,81 @@ class WebSocketGateway:
                 })
                 return True
             reason = data.get("reason") or "user"
-            aborted = self._abort_active_turn(session_id, reason=str(reason))
-            await self._send_to_client(client_id, {
-                "type": "aborted" if aborted else "no_active_turn",
+            # Issue #5129: an abort frame may carry {"scope": "session"} to drain
+            # the queued backlog too; absent/unknown scope stays turn-scoped.
+            scope = StopScope.coerce(data.get("scope"))
+            result = self._abort_session(session_id, scope=scope, reason=str(reason))
+            payload = {
+                "type": "aborted" if (
+                    result.turn_aborted or result.pending_cancelled
+                ) else "no_active_turn",
                 "session_id": session_id,
+            }
+            payload.update(result.to_dict())
+            await self._send_to_client(client_id, payload)
+
+        elif msg_type == "server_reply":
+            # Issue #5351: a client's correlated answer to a server→client
+            # interactive request (approval / choice / input).
+            request_id = data.get("request_id")
+            value = data.get("value")
+            if not request_id or not isinstance(value, str):
+                await self._send_to_client(client_id, {
+                    "type": "error",
+                    "message": "server_reply requires 'request_id' and string 'value'",
+                })
+                return
+            # Locate the still-open request so ownership, scope and value can be
+            # validated against its actual session and kind. An unknown/answered
+            # request_id resolves nothing and never leaks another session's kind.
+            open_req = self._find_open_request(request_id)
+            if open_req is None:
+                await self._send_to_client(client_id, {
+                    "type": "server_reply_ack",
+                    "request_id": request_id,
+                    "status": "unknown_request",
+                })
+                return
+            req_session_id = getattr(open_req, "session_id", "") or ""
+            req_kind = getattr(open_req, "kind", "input")
+            # Session ownership: only a client bound to the request's own session
+            # may answer it — a WRITE client in another session must not resolve
+            # a foreign turn's prompt by guessing its request_id.
+            if self._client_sessions.get(client_id) != req_session_id:
+                await self._send_to_client(client_id, {
+                    "type": "error",
+                    "code": "session_mismatch",
+                    "message": "server_reply for a request not owned by this session",
+                })
+                return True
+            # Answering an approval on behalf of the turn is an approval decision
+            # and requires the APPROVALS scope (parity with approvals.resolve);
+            # choice/input answers require WRITE like sending a message.
+            required_scope = (
+                OperatorScope.APPROVALS if req_kind == "approval" else OperatorScope.WRITE
+            )
+            if not self._client_has_scope(client_id, required_scope):
+                await self._send_to_client(client_id, {
+                    "type": "error",
+                    "code": "insufficient_scope",
+                    "message": "insufficient scope",
+                    "required_scope": required_scope.value,
+                })
+                return True
+            # Validate the answer against the request contract so hosts receive
+            # only well-formed values (allow/deny, an offered option, or text).
+            if not self._server_reply_value_ok(open_req, value):
+                await self._send_to_client(client_id, {
+                    "type": "error",
+                    "code": "invalid_value",
+                    "message": "server_reply value not permitted for this request",
+                })
+                return True
+            resolved = self._resolve_server_reply(request_id, value)
+            await self._send_to_client(client_id, {
+                "type": "server_reply_ack",
+                "request_id": request_id,
+                "status": "resolved" if resolved else "unknown_request",
             })
 
         elif msg_type == "leave":
@@ -3302,7 +4553,7 @@ class WebSocketGateway:
 
     @staticmethod
     async def _dispatch_agent_turn(
-        agent: Any, content: str, interrupt: Any = None
+        agent: Any, content: str, interrupt: Any = None, on_complete: Any = None
     ) -> Any:
         """Execute a single agent turn.
 
@@ -3321,12 +4572,31 @@ class WebSocketGateway:
         controller would let one session's abort/timeout interrupt another. A
         legacy fallback stamps ``agent.interrupt_controller`` only for agents
         whose entry point does not accept ``cancel_token``.
+
+        Issue #4656: ``on_complete(agent)`` — when supplied — is invoked
+        **synchronously in the same execution context that produced the turn's
+        result, before that context is handed back to the loop**. For a
+        sync-only agent this runs *inside the worker thread* right after
+        ``agent.chat`` returns, so per-turn state the agent stores on shared,
+        mutable attributes (e.g. ``llm.last_token_metrics``) is snapshotted for
+        *this* turn before any concurrent turn — on another worker thread or a
+        later event-loop tick — can overwrite it. This closes the cross-request
+        usage-misattribution race for the sync ``chat`` fallback (Greptile/Qodo
+        P1). The callback must be non-blocking and must not raise; its return
+        value is ignored.
         """
         _kw = {"cancel_token": interrupt} if interrupt is not None else {}
 
+        def _snapshot() -> None:
+            if on_complete is not None:
+                try:
+                    on_complete(agent)
+                except Exception:
+                    pass
+
         async def _call_async(fn: Any) -> Any:
             try:
-                return await fn(content, **_kw)
+                result = await fn(content, **_kw)
             except TypeError:
                 if not _kw:
                     raise
@@ -3334,7 +4604,11 @@ class WebSocketGateway:
                 # attribute for this turn (best-effort, non-isolated).
                 if hasattr(agent, "interrupt_controller"):
                     agent.interrupt_controller = interrupt
-                return await fn(content)
+                result = await fn(content)
+            # No ``await`` between the turn completing and the snapshot: the
+            # single-threaded loop cannot run another turn in between.
+            _snapshot()
+            return result
 
         for _name in ("arun", "achat"):
             _fn = getattr(agent, _name, None)
@@ -3345,13 +4619,18 @@ class WebSocketGateway:
 
         def _call_sync() -> Any:
             try:
-                return agent.chat(content, **_kw)
+                result = agent.chat(content, **_kw)
             except TypeError:
                 if not _kw:
                     raise
                 if hasattr(agent, "interrupt_controller"):
                     agent.interrupt_controller = interrupt
-                return agent.chat(content)
+                result = agent.chat(content)
+            # Snapshot in *this* worker thread, immediately after the turn
+            # produced its result, before the thread returns to the pool and a
+            # concurrent turn can overwrite the agent's shared metrics.
+            _snapshot()
+            return result
 
         return await loop.run_in_executor(None, _call_sync)
 
@@ -3397,6 +4676,49 @@ class WebSocketGateway:
                 pass
         return True
 
+    def _abort_session(
+        self,
+        session_id: str,
+        *,
+        scope: StopScope = StopScope.TURN,
+        reason: str = "user",
+    ) -> StopResult:
+        """Scoped stop for ``session_id`` (Issue #5129).
+
+        ``scope=TURN`` (default) cancels only the in-flight turn — today's
+        behaviour. ``scope=SESSION`` additionally drains the session inbox so no
+        queued-but-unstarted message is executed after the stop. The drained
+        count is returned as a visible, intentional non-outcome rather than
+        silently dropped, so a session stop always accounts for both running and
+        queued work even when there is no active turn.
+
+        The queue worker dequeues a message *before* registering it as an active
+        turn, so a naive inbox drain would miss a message caught in that
+        dequeue-to-registration gap. Bumping ``_stop_epoch`` closes that race:
+        the worker re-checks the epoch after admission/placement and drops any
+        message whose epoch is stale, and that in-flight message is counted here
+        so the reported ``pending_cancelled`` reflects it.
+        """
+        turn_aborted = self._abort_active_turn(session_id, reason=reason)
+        cancelled = 0
+        if scope is StopScope.SESSION:
+            session = self._sessions.get(session_id)
+            if session is not None:
+                # Invalidate any message already dequeued but not yet running
+                # (the race window). The worker will observe the bumped epoch and
+                # drop it; count it here so it is not silently lost.
+                if getattr(session, "_inflight_unstarted", False):
+                    cancelled += 1
+                session._stop_epoch = getattr(session, "_stop_epoch", 0) + 1
+                inbox = session._inbox
+                while not inbox.empty():
+                    try:
+                        inbox.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                    cancelled += 1
+        return StopResult(scope=scope, turn_aborted=turn_aborted, pending_cancelled=cancelled)
+
     async def _drive_turn(
         self,
         session: GatewaySession,
@@ -3404,7 +4726,7 @@ class WebSocketGateway:
         content: str,
         controller: Any,
         timeout: float,
-    ) -> Any:
+    ) -> Any:  # noqa: D401 - see _TerminalTurn for the outcome-carrying return
         """Run one agent turn cancellably and under an optional per-turn timeout.
 
         Registers the driving task in ``_active_turns`` so ``_abort_active_turn``
@@ -3421,10 +4743,30 @@ class WebSocketGateway:
         actually finish before advancing the serial session queue — otherwise a
         timed-out sync turn could keep mutating shared agent state concurrently
         with the next turn.
+
+        Issue #4766: the turn is dispatched *through the configured turn
+        executor* — ``place(session_id)`` obtains the placement that owns the
+        session's turns, then ``execute_turn`` runs it on that placement. The
+        default in-process executor awaits the turn on this loop exactly as
+        before (byte-for-byte). If an isolated executor raises
+        ``WorkerWedgedError``, only that session's worker is torn down and the
+        session recovered — the wedge no longer forces a whole-process exit.
         """
+        from praisonaiagents.gateway.protocols import WorkerWedgedError
+
         sid = session.session_id
+
+        async def _turn() -> Any:
+            return await self._dispatch_agent_turn(
+                agent, content, interrupt=controller
+            )
+
+        placement = await self._executor.place(sid)
+        limits = getattr(self.config, "executor_limits", None)
         task = asyncio.ensure_future(
-            self._dispatch_agent_turn(agent, content, interrupt=controller)
+            self._executor.execute_turn(
+                placement, _turn, cancel_token=controller, limits=limits
+            )
         )
         self._active_turns[sid] = (task, controller)
         try:
@@ -3439,6 +4781,27 @@ class WebSocketGateway:
             reason = controller.reason or "user"
             await self._settle_cancelled_turn(task, controller, reason)
             return self._finalise_aborted_turn(controller, reason)
+        except WorkerWedgedError:
+            # Scope the blast radius to this session only: reclaim the wedged
+            # worker and let the session be re-placed on its next turn, instead
+            # of the process-wide ``os._exit`` a shared loop would force.
+            try:
+                await self._executor.teardown(placement, reason="wedged")
+            except Exception:
+                logger.warning(
+                    "Executor teardown failed for wedged session %s", sid,
+                    exc_info=True,
+                )
+            return _TerminalTurn(
+                "Turn cancelled: worker wedged; session will be re-placed.",
+                outcome_status="error",
+                error={
+                    "code": "transient",
+                    "retryable": True,
+                    "retry_after_seconds": None,
+                    "message": _TURN_ERROR_MESSAGES["transient"],
+                },
+            )
         finally:
             existing = self._active_turns.get(sid)
             if existing is not None and existing[0] is task:
@@ -3494,7 +4857,17 @@ class WebSocketGateway:
                 content = session.get_next_message()
                 if not content:
                     break  # Queue is empty, exit loop
-                
+
+                # Issue #5129: snapshot the session stop epoch the instant this
+                # message leaves the inbox. A SESSION-scoped stop that lands in
+                # the gap before the turn is registered bumps this epoch; we
+                # re-check it just before dispatch and drop the message so a
+                # cancelled backlog item is never executed after the stop.
+                dequeued_stop_epoch = getattr(session, "_stop_epoch", 0)
+                # Mark this message as in-flight-but-unstarted so a SESSION stop
+                # in the gap below counts it toward ``pending_cancelled``.
+                session._inflight_unstarted = True
+
                 # Wire streaming relay if agent has a stream_emitter.
                 # ``relay_futures`` collects the cross-thread sends the relay
                 # schedules so we can drain them before the final frame,
@@ -3516,6 +4889,11 @@ class WebSocketGateway:
                 controller = InterruptController()
                 timeout = getattr(self.config, "per_turn_timeout", 0.0) or 0.0
                 outcome_status = "ok"
+                turn_error: Optional[Dict[str, Any]] = None
+                # Issue #5129: a SESSION stop during admission/placement drops
+                # this already-dequeued message instead of running it. Skipped
+                # here is accounted for by ``_abort_session`` (pending_cancelled).
+                _stop_sentinel = object()
                 try:
                     gate = getattr(self, "_admission_gate", None)
                     if gate is not None and getattr(gate, "enabled", False):
@@ -3525,13 +4903,20 @@ class WebSocketGateway:
                         from ..bots._admission import AdmissionRejected
                         try:
                             async with gate.admit(session_id=session.session_id):
-                                response = await self._drive_turn(
-                                    session, agent, content, controller, timeout
-                                )
+                                if getattr(session, "_stop_epoch", 0) != dequeued_stop_epoch:
+                                    response = _stop_sentinel
+                                else:
+                                    session._inflight_unstarted = False
+                                    response = await self._drive_turn(
+                                        session, agent, content, controller, timeout
+                                    )
                         except AdmissionRejected as rej:
                             response = rej.message
                             outcome_status = "rejected"
+                    elif getattr(session, "_stop_epoch", 0) != dequeued_stop_epoch:
+                        response = _stop_sentinel
                     else:
+                        session._inflight_unstarted = False
                         response = await self._drive_turn(
                             session, agent, content, controller, timeout
                         )
@@ -3539,6 +4924,19 @@ class WebSocketGateway:
                     logger.error(f"Agent error in queue processor: {e}")
                     response = f"Error: {str(e)}"
                     outcome_status = "error"
+                    try:
+                        turn_error = _turn_error_payload(e)
+                    except Exception:  # pragma: no cover - never mask the turn failure
+                        turn_error = None
+                else:
+                    # A terminal turn (e.g. a wedged worker torn down by the
+                    # executor) carries its own outcome so a non-ok ending is
+                    # not misreported as a successful turn. Regular replies
+                    # keep the default ``ok``.
+                    carried = getattr(response, "outcome_status", None)
+                    if carried is not None:
+                        outcome_status = carried
+                        turn_error = getattr(response, "error", None)
                 finally:
                     # Always clean up the relay callback
                     if relay_callback and emitter is not None:
@@ -3556,6 +4954,12 @@ class WebSocketGateway:
                         return_exceptions=True,
                     )
 
+                # Issue #5129: a SESSION stop cancelled this dequeued message in
+                # the registration gap — emit nothing and pull the next one.
+                if response is _stop_sentinel:
+                    session._inflight_unstarted = False
+                    continue
+
                 response_message = GatewayMessage(
                     content=response,
                     sender_id=session.agent_id,
@@ -3566,15 +4970,20 @@ class WebSocketGateway:
                 # Final frame: distinct "final" status resolves the pending turn
                 # that the "accepted" ack opened, and carries a structured
                 # terminal outcome alongside the text (not just a bare string).
+                # A failed turn additionally carries a typed ``error`` (#5802).
+                outcome: Dict[str, Any] = {"status": outcome_status}
+                if turn_error is not None:
+                    outcome["error"] = turn_error
                 await self._send_to_client(client_id, {
                     "type": "response",
                     "status": "final",
                     "content": response,
-                    "outcome": {"status": outcome_status},
+                    "outcome": outcome,
                     "session_id": session.session_id,
                 })
         finally:
             session.mark_executing(False)
+            session._inflight_unstarted = False
 
     def _make_stream_relay(
         self,
@@ -3878,38 +5287,210 @@ class WebSocketGateway:
         ``LIVENESS_TIMEOUT`` and its state released. A connection with no bound
         session yet (stalled pre-``hello``/``join`` handshake) is evaluated
         against its per-connection ``_client_last_seen`` clock so it too ages
-        out. No-op when the policy is disabled (``interval_ms == 0``).
+        out. Heartbeat/reap is a no-op when the policy is disabled
+        (``interval_ms == 0``), but the loop still runs so the memory-pressure
+        sweep (issue #5153) keeps shedding cold sessions — that OOM guard must
+        not depend on liveness being enabled.
         """
         policy = self._liveness_policy()
-        if not policy.enabled:
-            return
+        # When liveness is disabled we still need a housekeeping cadence for the
+        # pressure sweep; fall back to the config's interval (or the policy
+        # default) rather than exiting, so shedding is never silently disabled.
         interval = policy.interval_seconds
+        if not policy.enabled:
+            from praisonaiagents.gateway.protocols import LivenessPolicy
+
+            interval = LivenessPolicy().interval_seconds
         while self._is_running:
             try:
                 await asyncio.sleep(interval)
                 if self._draining:
                     continue
                 now = time.time()
-                for client_id in list(self._clients.keys()):
-                    session_id = self._client_sessions.get(client_id)
-                    session = self._sessions.get(session_id) if session_id else None
-                    if session is not None:
-                        last_activity = session.last_activity
-                    else:
-                        # No bound session yet (pre-``hello``/``join``): fall
-                        # back to the per-connection last-seen clock so a
-                        # stalled handshake ages out instead of living forever.
-                        last_activity = self._client_last_seen.get(client_id, now)
-                    if policy.evaluate(last_activity, now) is LivenessDecision.REAP:
-                        await self._reap_session(client_id)
-                    else:
-                        await self._send_to_client(
-                            client_id, {"type": EventType.PING.value}
+                if policy.enabled:
+                    for client_id in list(self._clients.keys()):
+                        session_id = self._client_sessions.get(client_id)
+                        session = (
+                            self._sessions.get(session_id) if session_id else None
                         )
+                        if session is not None:
+                            last_activity = session.last_activity
+                        else:
+                            # No bound session yet (pre-``hello``/``join``): fall
+                            # back to the per-connection last-seen clock so a
+                            # stalled handshake ages out instead of living forever.
+                            last_activity = self._client_last_seen.get(client_id, now)
+                        if policy.evaluate(last_activity, now) is LivenessDecision.REAP:
+                            await self._reap_session(client_id)
+                        else:
+                            await self._send_to_client(
+                                client_id, {"type": EventType.PING.value}
+                            )
+                # Issue #5153: on the same housekeeping tick, shed the coldest
+                # already-persisted sessions if the resident set is approaching
+                # the cgroup budget — before the kernel OOM-kills the process.
+                # Runs regardless of whether liveness ping/reap is enabled.
+                self._sweep_sessions_under_pressure()
             except asyncio.CancelledError:
                 raise
             except Exception:
                 logger.exception("Liveness heartbeat/reaper iteration failed")
+
+    def _sweep_sessions_under_pressure(self) -> int:
+        """Soft-evict the coldest already-persisted live sessions under RSS pressure.
+
+        Issue #5153: the gateway's own runtime enactor for the core planner,
+        mirroring ``BotSessionManager.sweep_under_pressure`` (the warm-agent
+        cache). It reads the real container budget/anonymous RSS from a
+        :class:`praisonaiagents.gateway.MemoryPressureProtocol` (the stdlib
+        ``CgroupMemoryPressure`` reader), asks
+        :func:`praisonaiagents.gateway.plan_pressure_evictions` which sessions to
+        shed, and evicts them LRU-first via ``close_session(persist=True)`` — the
+        transcript is left durable so the next ``join`` transparently rehydrates
+        it. It re-samples RSS as it goes and stops as soon as RSS is back within
+        ``headroom`` of the budget, so it sheds the minimum.
+
+        Persistence-gated: a session is only evictable when a session store is
+        configured (its transcript is durable and rebuildable), it is not
+        currently executing a turn (never abort live work), and **no live
+        WebSocket is bound to it** — a connected client's next ordinary
+        ``message`` looks the session up in ``_sessions`` directly and would be
+        silently dropped (only ``hello``/``join`` rehydrate), so evicting a
+        bound session would strand that client. A no-op (returns ``0``) when no
+        store is configured or the platform reports no cgroup budget, preserving
+        today's behaviour exactly.
+        """
+        # No durable store ⇒ nothing is rebuildable ⇒ evicting would lose data.
+        if self._session_store is None or not self._sessions:
+            return 0
+        try:
+            from praisonaiagents.gateway import (
+                WarmSession,
+                plan_pressure_evictions,
+            )
+        except Exception:  # pragma: no cover — old/absent core
+            return 0
+        if self._memory_pressure is None:
+            try:
+                from .memory_pressure import CgroupMemoryPressure
+
+                self._memory_pressure = CgroupMemoryPressure()
+            except Exception:  # pragma: no cover — defensive
+                return 0
+        mp = self._memory_pressure
+        try:
+            budget = mp.cgroup_limit_mb()
+            rss = mp.anon_rss_mb()
+        except Exception:  # pragma: no cover — defensive
+            return 0
+        headroom = self._pressure_headroom
+        # Sessions with a live WebSocket bound to them are excluded from the
+        # eviction candidate set: evicting them would strand the connection
+        # (Finding: ordinary ``message`` frames do not rehydrate). Only cold,
+        # disconnected-but-resumable sessions are candidates.
+        bound_session_ids = set(self._client_sessions.values())
+        warm = [
+            WarmSession(
+                session_id=sid,
+                last_activity=session.last_activity,
+                in_flight=bool(getattr(session, "_is_executing", False)),
+                flushed=True,
+            )
+            for sid, session in self._sessions.items()
+            if sid not in bound_session_ids
+        ]
+        if not warm:
+            return 0
+        plan = plan_pressure_evictions(budget, rss, warm, headroom_ratio=headroom)
+        if not plan:
+            return 0
+        try:
+            target = float(budget) * float(headroom)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            target = 0.0
+        evicted = 0
+        for sid in plan:
+            session = self._sessions.get(sid)
+            # Re-check at enact time: a turn may have started, the session may
+            # already be gone, or a client may have (re)bound to it since the
+            # plan was computed. Never abort live work (an executing turn) and
+            # never strand a now-bound connection.
+            if session is None or getattr(session, "_is_executing", False):
+                continue
+            if sid in set(self._client_sessions.values()):
+                continue
+            if self._evict_persisted_session(sid):
+                evicted += 1
+                try:
+                    if mp.anon_rss_mb() <= target:
+                        break
+                except Exception:  # pragma: no cover — defensive
+                    break
+        if evicted:
+            logger.info(
+                "WebSocketGateway: soft-evicted %d cold session(s) under "
+                "memory pressure (durable, rehydrate on next join)",
+                evicted,
+            )
+        return evicted
+
+    def _evict_persisted_session(self, session_id: str) -> bool:
+        """Remove ``session_id`` from memory **only after** its transcript is durable.
+
+        Unlike ``close_session(persist=True)`` — which best-effort persists but
+        still drops the in-memory session even when the store write fails — this
+        enactor refuses to evict a session whose final snapshot could not be
+        persisted. Under memory pressure the live session may hold the only copy
+        of recent messages/events, so a failed persist must leave it in memory
+        (no data loss) rather than count it as safely shed. ``add_message``
+        signals failure two ways — a raised exception *or* a falsy return
+        (``SessionStoreProtocol.add_message`` returns ``bool`` and both built-in
+        stores return ``False`` on a failed write); both must retain the session.
+        """
+        session = self._sessions.get(session_id)
+        if session is None:
+            return False
+        store = self._session_store
+        if store is None:  # pragma: no cover — guarded by caller
+            return False
+        try:
+            persisted = store.add_message(
+                session_id=session_id,
+                role="system",
+                content="Session closed",
+                metadata={"session_data": session.to_dict()},
+            )
+        except Exception as exc:  # persist raised ⇒ keep session in memory
+            logger.warning(
+                "WebSocketGateway: skipped pressure eviction of %s — "
+                "persistence failed (%s); session retained in memory",
+                session_id,
+                exc,
+            )
+            return False
+        # A store may report a failed write via a falsy return instead of
+        # raising; treat that identically so we never drop the only live copy.
+        # ``None`` (legacy stores with no return) is treated as success to
+        # preserve today's behaviour for stores that persist without reporting.
+        if persisted is False:
+            logger.warning(
+                "WebSocketGateway: skipped pressure eviction of %s — "
+                "store reported a failed write; session retained in memory",
+                session_id,
+            )
+            return False
+        # Durable now: mark resumable, close, and drop from the live set.
+        try:
+            session.close()
+        except Exception:  # pragma: no cover — defensive
+            pass
+        resume_window = self.config.session_config.resume_window
+        self._session_ttls[session_id] = time.time() + resume_window
+        self._sessions.pop(session_id, None)
+        logger.info(
+            "Session %s persisted, resumable for %ss", session_id, resume_window
+        )
+        return True
 
     async def _send_to_client(self, client_id: str, data: Dict[str, Any]) -> None:
         """Send data to a specific client through its bounded outbound queue."""
@@ -3965,7 +5546,98 @@ class WebSocketGateway:
                     await ws.send_json(data)
             except Exception as e:
                 logger.error(f"Error sending to client {client_id}: {e}")
-    
+
+    @property
+    def request_channel(self) -> "_GatewayRequestChannel":
+        """Return the server→client interactive request channel (Issue #5351).
+
+        Lazily bound. A blocked HITL turn uses it to deliver an approval /
+        choice / input request to the connected gateway client and await the
+        correlated reply; still-open requests are replayed on reconnect.
+        """
+        if self._request_channel is None:
+            self._request_channel = _GatewayRequestChannel(self)
+        return self._request_channel
+
+    def _session_client_id(self, session_id: str) -> Optional[str]:
+        """Return the client_id currently bound to ``session_id`` (if any)."""
+        session = self._sessions.get(session_id)
+        client_id = getattr(session, "_client_id", None) or getattr(
+            session, "client_id", None
+        )
+        if client_id and client_id in self._clients:
+            return client_id
+        for cid, sid in self._client_sessions.items():
+            if sid == session_id and cid in self._clients:
+                return cid
+        return None
+
+    async def _replay_open_requests(self, client_id: str, session_id: str) -> None:
+        """Re-issue every still-open interactive request for ``session_id``.
+
+        Called from the ``hello``/``join`` resume paths so a reconnecting client
+        recovers any in-flight approval / choice / input prompt. Answered
+        requests are already removed from the open set, so only unanswered ones
+        are replayed (Issue #5351).
+        """
+        open_for_session = self._open_requests.get(session_id)
+        if not open_for_session:
+            return
+        for req in list(open_for_session.values()):
+            await self._send_to_client(client_id, {
+                "type": "server_request",
+                "request": req.as_dict(),
+            })
+
+    def _find_open_request(self, request_id: str) -> Optional[Any]:
+        """Return the still-open request for ``request_id`` across sessions.
+
+        Used by the ``server_reply`` handler to validate session ownership,
+        scope, and value against the request's own session/kind before it
+        resolves the waiting turn (Issue #5351).
+        """
+        for open_for_session in self._open_requests.values():
+            req = open_for_session.get(request_id)
+            if req is not None:
+                return req
+        return None
+
+    @staticmethod
+    def _server_reply_value_ok(req: Any, value: str) -> bool:
+        """Validate a ``server_reply`` value against the request contract.
+
+        * ``approval`` → ``"allow"`` or ``"deny"``.
+        * ``choice`` → one of the offered ``options`` (any value if none given).
+        * ``input`` → any string.
+        """
+        kind = getattr(req, "kind", "input")
+        if kind == "approval":
+            return value in ("allow", "deny")
+        if kind == "choice":
+            options = getattr(req, "options", None)
+            if options:
+                return value in options
+            return True
+        return True
+
+    def _resolve_server_reply(self, request_id: str, value: str) -> bool:
+        """Correlate a client ``server_reply`` back to its waiting request.
+
+        Returns ``True`` when a pending waiter was resolved. Building the typed
+        :class:`GatewayServerReply` is best-effort — a core too old to expose it
+        still resolves the Future with a minimal object carrying the same
+        fields.
+        """
+        future = self._request_waiters.get(request_id)
+        if future is None or future.done():
+            return False
+        if GatewayServerReply is not None:
+            reply: Any = GatewayServerReply(request_id=request_id, value=value)
+        else:  # pragma: no cover - core predates the reply shape
+            reply = type("_Reply", (), {"request_id": request_id, "value": value})()
+        future.set_result(reply)
+        return True
+
     def register_agent(
         self,
         agent: "Agent",
@@ -4252,6 +5924,18 @@ class WebSocketGateway:
             self._hook_idem = None  # rebuild lazily under the new backend
 
         self._hooks.clear()
+        if entries and os.environ.get(
+            "PRAISONAI_NO_PLUGINS", ""
+        ).strip().lower() in ("true", "1", "yes"):
+            # Safe mode (--pure / --no-plugins / --safe-mode; #5747): serve the
+            # core agent + channels only so a fault can be attributed to the
+            # gateway core vs. an extension in one restart.
+            logger.warning(
+                "SAFE MODE: %d inbound hook(s) disabled; external plugins "
+                "skipped (PRAISONAI_NO_PLUGINS)",
+                len(entries),
+            )
+            return
         if entries:
             self._register_hooks_from_config(entries)
 
@@ -4278,11 +5962,17 @@ class WebSocketGateway:
             from pathlib import Path
             from praisonai_bot.bots import build_idempotency_store
 
+            # Reuse the gateway's push ``RedisConfig`` (as ``build_turn_lock``
+            # does) so ``store_backend='redis'`` gets cluster-wide exactly-once
+            # admission (#5154). Non-redis backends ignore it.
+            push = getattr(getattr(self, "config", None), "push", None)
+            redis_config = getattr(push, "redis", None)
             self._hook_idem = build_idempotency_store(
                 backend,
                 path=Path.home() / ".praisonai" / "state" / "hook_idempotency.sqlite",
                 max_size=self._hook_idempotency_max,
                 ttl_seconds=self._hook_idempotency_ttl,
+                redis_config=redis_config,
             )
         except Exception as e:  # pragma: no cover - defensive
             from praisonaiagents.gateway import InMemoryIdempotencyStore
@@ -4317,8 +6007,28 @@ class WebSocketGateway:
         """Record ``key`` as processed after a successful run."""
         self._get_hook_idem_store().record(key)
 
-    async def _run_hook(self, hook: Any, payload: Dict[str, Any]) -> Dict[str, Any]:
+    def _get_hook_coalescer(self) -> Any:
+        if self._hook_coalescer is None:
+            from .hook_coalescer import HookCoalescer
+
+            async def _dispatch(hook: Any, payload: Dict[str, Any], count: int) -> None:
+                result = await self._run_hook(hook, payload, coalesced=count)
+                if not result.get("ok", False):
+                    logger.error(
+                        "Coalesced hook '%s' run failed: %s",
+                        hook.path, result.get("error"),
+                    )
+
+            self._hook_coalescer = HookCoalescer(_dispatch)
+        return self._hook_coalescer
+
+    async def _run_hook(
+        self, hook: Any, payload: Dict[str, Any], *, coalesced: int = 1
+    ) -> Dict[str, Any]:
         """Execute a hook: resolve session, run agent (or wake), deliver.
+
+        ``coalesced`` is the number of deliveries a coalesced run absorbed
+        (#5867); when > 1 the agent message notes that only the latest is shown.
 
         Returns a JSON-serializable result dict describing what happened.
         """
@@ -4394,6 +6104,11 @@ class WebSocketGateway:
             return {"ok": False, "error": "no agent available", "session": session_key}
 
         message = hook.resolve_message(payload) or ""
+        if coalesced > 1:
+            message = (
+                f"[{coalesced} events coalesced; only the latest is shown]\n\n"
+                f"{message}"
+            )
 
         try:
             gate = getattr(self, "_admission_gate", None)
@@ -4801,6 +6516,25 @@ class WebSocketGateway:
         if scopes is None:
             return True
         return OperatorScope.ADMIN.value in scopes or scope.value in scopes
+
+    def _client_scope_set(self, client_id: str) -> "Set[OperatorScope]":
+        """Return the ``OperatorScope`` set a connected client holds.
+
+        Clients connected before scopes were tracked, or when no scope policy
+        is configured, hold every scope — preserving prior binary-auth
+        behaviour so the central guard changes nothing for those callers.
+        Unknown scope strings are ignored rather than crashing the gate.
+        """
+        raw = self._client_scopes.get(client_id)
+        if raw is None:
+            return set(OperatorScope.all())
+        resolved: "Set[OperatorScope]" = set()
+        for value in raw:
+            try:
+                resolved.add(OperatorScope(value))
+            except ValueError:
+                continue
+        return resolved
 
     @staticmethod
     def _event_required_scope(event: GatewayEvent) -> OperatorScope:
@@ -5247,12 +6981,58 @@ class WebSocketGateway:
         # whether scale-to-zero is armed / the gateway is dormant / an external
         # drain watcher is active — without scraping logs. Only included when a
         # lifecycle feature is configured, so always-on gateways are unchanged.
+        lifecycle_block: Dict[str, Any] = {}
         if self._idle_policy is not None or self._drain_marker_policy is not None:
-            result["lifecycle"] = {
+            lifecycle_block.update({
                 "scale_to_zero": self._idle_policy is not None,
                 "dormant": self._is_dormant,
                 "drain_marker_watch": self._drain_marker_policy is not None,
-            }
+            })
+
+        # Issue #4603: surface the durable process-lifecycle record — whether the
+        # *previous* process exited uncleanly (OOM/SIGKILL, which runs no signal
+        # handler), any suspected OOM, the cross-boot restart count, and whether
+        # boot-time auto-resume is suspended by the persistent breaker — plus a
+        # coarse, redaction-safe memory/disk pressure block. Only included when
+        # the ledger is configured, computed defensively so health() never raises.
+        ledger = self._lifecycle_ledger
+        if ledger is not None:
+            try:
+                lifecycle_block.update(ledger.last_exit())
+            except Exception:
+                pass
+            guard = self._restart_loop_guard
+            if guard is not None and hasattr(guard, "_store"):
+                try:
+                    lifecycle_block["restarts_last_hour"] = len(
+                        [t for t in getattr(guard, "_events", [])
+                         if t >= time.time() - 3600.0]
+                    )
+                    lifecycle_block["auto_resume_suspended"] = bool(
+                        guard.tripped(time.time())
+                    )
+                except Exception:
+                    pass
+            try:
+                pressure = ledger.pressure()
+                result["pressure"] = pressure
+                # Mark the surface degraded on *critical* memory/disk so a
+                # gateway being OOM-killed between kills does not report plain
+                # healthy. ``unknown`` is surfaced verbatim in the pressure
+                # block (never asserted healthy) but does not flip status, so a
+                # host with no cgroup limit to measure keeps today's behaviour.
+                if self._is_running and any(
+                    pressure.get(k) == "critical" for k in ("memory", "disk")
+                ):
+                    result["status"] = "degraded"
+            except Exception:
+                pass
+            # An unclean prior exit also degrades the status surface.
+            if lifecycle_block.get("last_exit") == "unclean" and self._is_running:
+                result["status"] = "degraded"
+
+        if lifecycle_block:
+            result["lifecycle"] = lifecycle_block
 
         # Issue #3410: surface opt-in event-loop watchdog state so an operator
         # can confirm the liveness backstop is armed. Only included when
@@ -5326,7 +7106,20 @@ class WebSocketGateway:
         try:
             pressure = self._compute_pressure()
             if pressure is not None:
-                result["pressure"] = pressure.to_dict()
+                # Issue #4603: the lifecycle ledger may already have populated
+                # ``result["pressure"]`` with a coarse ``{"memory", "disk"}``
+                # block. Merge the saturation/back-pressure fields in rather
+                # than replacing it, so enabling both features surfaces the OS
+                # resource pressure *and* the admission/backlog signals on one
+                # ``pressure`` object instead of one silently clobbering the
+                # other. Saturation keys ("admission_*", "outbox_*", …) are
+                # disjoint from the ledger's, so the merge is non-destructive.
+                existing = result.get("pressure")
+                merged = pressure.to_dict()
+                if isinstance(existing, dict):
+                    for key, value in existing.items():
+                        merged.setdefault(key, value)
+                result["pressure"] = merged
         except Exception:
             pass
 
@@ -5418,7 +7211,7 @@ class WebSocketGateway:
     # ── Scheduled delivery ────────────────────────────────────────────
 
     async def _deliver_scheduled_result(
-        self, delivery: Any, text: str,
+        self, delivery: Any, text: str, authored_by: str = "agent",
     ) -> bool:
         """Route a scheduled job result to the correct channel bot.
 
@@ -5430,6 +7223,8 @@ class WebSocketGateway:
         Args:
             delivery: A ``DeliveryTarget`` with ``channel`` and ``channel_id``.
             text: The agent response to deliver.
+            authored_by: ``"agent"`` or ``"external"`` (non-agent text such as
+                command stdout); decides the seeded mirror role (#5928).
         """
         channel = getattr(delivery, "channel", "") or ""
         channel_id = getattr(delivery, "channel_id", "") or ""
@@ -5482,7 +7277,7 @@ class WebSocketGateway:
                 )
                 # Seed a resumable session so the user's reply in this chat
                 # resumes the job's conversation with full context (#3444).
-                self._seed_continuable_session(delivery, text)
+                self._seed_continuable_session(delivery, text, authored_by)
             else:
                 logger.error(
                     "Failed to deliver scheduled result to %s:%s", channel, channel_id,
@@ -5512,7 +7307,7 @@ class WebSocketGateway:
                 "Delivered scheduled result to %s:%s", channel, channel_id,
             )
             # Seed a resumable session so the user's reply resumes context (#3444).
-            self._seed_continuable_session(delivery, text)
+            self._seed_continuable_session(delivery, text, authored_by)
         except Exception as e:
             logger.error(
                 "Failed to deliver to %s:%s: %s", channel, channel_id, e,
@@ -5520,7 +7315,9 @@ class WebSocketGateway:
             return False
         return True
 
-    def _seed_continuable_session(self, delivery: Any, text: str) -> None:
+    def _seed_continuable_session(
+        self, delivery: Any, text: str, authored_by: str = "agent",
+    ) -> None:
         """Seed a resumable session so a reply to a delivered brief has context.
 
         Issue #3444: a scheduled/automated delivery is one-way by default — the
@@ -5571,12 +7368,14 @@ class WebSocketGateway:
             from praisonai_bot.bots._mirror import mirror_to_session
             # An inbound reply from this chat resolves its session by the chat
             # id, so mirror under ``channel_id`` — byte-identical to the key the
-            # reply will mint — with the delivered brief as the assistant turn.
+            # reply will mint. Authorship decides the role (#5928): an agent
+            # brief is an assistant turn, command/notice text a user turn.
             mirror_to_session(
                 session,
                 user_id=channel_id,
                 message_text=text,
                 source_label="cron",
+                authored_by=authored_by,
             )
             logger.info(
                 "Seeded continuable session for %s:%s", channel, channel_id,
@@ -5676,6 +7475,25 @@ class WebSocketGateway:
             denied_toolsets=denied_toolsets,
             audit_dir=cfg.get("audit_dir"),
         )
+
+    def _load_declarative_schedules(self, config: dict) -> None:
+        """Load a config's ``schedules:`` block into the shared store (#4913).
+
+        Coerces each declared recurring agent→channel delivery into a core
+        ``ScheduleJob`` and upserts it (idempotent on a stable id) so it fires
+        through the existing scheduler tick + delivery loop. Best-effort — a
+        missing scheduler package or a malformed entry never aborts startup.
+        """
+        try:
+            from praisonaiagents.scheduler import get_default_store
+            from praisonai_bot.scheduler import load_schedules_into_store
+        except ImportError as e:
+            logger.debug("Declarative schedules unavailable, skipping: %s", e)
+            return
+        try:
+            load_schedules_into_store(config, get_default_store())
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning("Failed to load declarative schedules: %s", e)
 
     def _start_scheduler_tick(self, interval: float = 15.0) -> None:
         """Start a background task that polls the scheduler for due jobs.
@@ -5985,24 +7803,49 @@ class WebSocketGateway:
                 logger.exception("run ledger recover_orphans failed on boot")
                 return 0
             recovered = 0
+            mark_delivered = getattr(ledger, "mark_delivered", None)
             for record in lost or []:
                 channel_target = self._channel_target_for_run(record)
                 if not channel_target:
+                    # No route to wake: mark delivered so the ledger does not
+                    # re-surface an undeliverable run on every subsequent boot.
+                    if callable(mark_delivered):
+                        try:
+                            mark_delivered(record.run_id)
+                        except Exception:  # pragma: no cover - defensive
+                            logger.exception(
+                                "mark_delivered failed for run %s",
+                                record.run_id,
+                            )
                     continue
                 outcome = record.terminal_outcome or "run interrupted by restart"
                 notice = (
                     "A background run was interrupted by a restart and could "
                     f"not be recovered ({outcome}). Please resend your request."
                 )
+                ok = False
                 try:
-                    await self._deliver_lost_run_notice(
+                    ok = await self._deliver_lost_run_notice(
                         channel_target, notice, record.run_id,
                     )
                 except Exception:
                     logger.exception(
                         "Failed to notify origin for lost run %s", record.run_id,
                     )
-                recovered += 1
+                # Exactly-once: only mark delivered once the notice actually
+                # landed (or was durably enqueued). A failed/raising delivery
+                # leaves ``delivered = 0`` so recover_orphans retries it on the
+                # next boot instead of dropping the user's wake-back forever.
+                if ok:
+                    if callable(mark_delivered):
+                        try:
+                            mark_delivered(record.run_id)
+                        except Exception:  # pragma: no cover - defensive
+                            logger.exception(
+                                "mark_delivered failed for run %s",
+                                record.run_id,
+                            )
+                    recovered += 1
             if recovered:
                 logger.info(
                     "Recovered %d orphaned ledger run(s) on boot", recovered,
@@ -6200,7 +8043,7 @@ class WebSocketGateway:
         elif not isinstance(channels_cfg, dict):
             errors.append("'channels' must be a non-empty dictionary")
         else:
-            _tokenless = {"email", "agentmail", "signal"}
+            _tokenless = {"email", "agentmail", "signal", "local"}
             for cname, cdef in channels_cfg.items():
                 if not isinstance(cdef, dict):
                     continue
@@ -6237,6 +8080,31 @@ class WebSocketGateway:
         # (regression guard, PR #3019 review). Platform-typo fail-closed still
         # applies — that check keys off the platform *name*, not the token.
         raw = _resolve(migrated)
+        # Expand ``group:<name>`` references against top-level
+        # ``access_groups`` (Issue #5775) so every channel admits from one
+        # authoritative definition. Unknown groups / cycles fail closed here.
+        access_groups = raw.get("access_groups") or {}
+        if access_groups and not isinstance(access_groups, dict):
+            raise ValueError(
+                f"Gateway config validation failed ({config_path}):\n"
+                "  - 'access_groups' must be a mapping of name -> list of ids"
+            )
+        for cname, cdef in (raw.get("channels") or {}).items():
+            if not isinstance(cdef, dict):
+                continue
+            for key in ("allowed_users", "allowlist", "blocklist"):
+                # Only touch core when groups are in play, so configs without
+                # them keep loading on older praisonaiagents releases.
+                if cdef.get(key) and (access_groups or "group:" in str(cdef[key])):
+                    from praisonaiagents.bots.admission import expand_access_groups
+
+                    try:
+                        cdef[key] = expand_access_groups(cdef[key], access_groups)
+                    except ValueError as exc:
+                        raise ValueError(
+                            f"Gateway config validation failed ({config_path}):\n"
+                            f"  - channels.{cname}.{key}: {exc}"
+                        ) from exc
         # Validate (raises ValueError on unknown platform / no channels). Env
         # substitution already happened above, so skip the schema's own.
         validated = validate_gateway_config(raw, apply_env_substitution=False)
@@ -6359,6 +8227,21 @@ class WebSocketGateway:
         # Auto-enable when the effective session store is durable (the default).
         return self._durable_store_present(gw_cfg)
 
+    def _register_rooms_from_config(self, rooms_cfg: Optional[Dict[str, Any]]) -> None:
+        """Register each ``rooms.<name>`` roster as a ``room:<name>`` route target.
+
+        Issue #5768: a room is agent-shaped (see ``bots._room.GatewayRoom``), so
+        binding ``routes: {group: room:standup}`` resolves it through the same
+        agent registry and session/delivery path as a single agent.
+        """
+        if not rooms_cfg:
+            return
+        from praisonai_bot.bots._room import build_rooms
+
+        for route_id, room in build_rooms(rooms_cfg, self._agents).items():
+            self._agents[route_id] = room
+            logger.info(f"Room registered: {route_id} roster={room.config.roster}")
+
     def _create_agents_from_config(
         self,
         agents_cfg: Dict[str, Dict[str, Any]],
@@ -6412,8 +8295,20 @@ class WebSocketGateway:
 
         for agent_id, agent_def in agents_cfg.items():
             instructions = agent_def.get("instructions", "")
-            # G7: Apply provider.model as fallback when agent has no model
-            model = agent_def.get("model", None) or default_model
+            # G7: Apply provider.model as fallback when agent has no model.
+            # An unset or ``"auto"`` model resolves to the detected provider's
+            # default (Issue #5609) so a non-OpenAI operator is not silently
+            # handed gpt-4o-mini; an explicit model/default_model still wins.
+            model = agent_def.get("model", None)
+            if not model or str(model).strip().lower() == "auto":
+                if default_model:
+                    model = default_model
+                else:
+                    from praisonai_bot.bots._config_schema import (
+                        resolve_model_by_provider,
+                    )
+
+                    model = resolve_model_by_provider()
             memory = agent_def.get("memory", False)
 
             # G2: Pass temperature through (optional, SDK uses its own default)
@@ -6681,11 +8576,18 @@ class WebSocketGateway:
         roles: Optional[List[str]] = None,
         channel_id: Optional[str] = None,
         account: Optional[str] = None,
+        thread_id: Optional[str] = None,
+        guild_id: Optional[str] = None,
+        parent_channel_id: Optional[str] = None,
     ) -> Any:
         """Build a RouteFacts object from inbound message facts.
 
         Returns None if the core RouteFacts type is unavailable so callers can
-        gracefully fall back to chat-type-only routing.
+        gracefully fall back to chat-type-only routing. ``thread_id`` /
+        ``guild_id`` / ``parent_channel_id`` are optional so per-thread,
+        whole-server, and parent-chain routing work when the adapter surfaces
+        them, while older adapters keep resolving exactly as before (Issue
+        #4839).
         """
         try:
             from praisonaiagents.gateway import RouteFacts
@@ -6696,6 +8598,13 @@ class WebSocketGateway:
                 roles=list(roles or []),
                 channel_id=str(channel_id) if channel_id is not None else None,
                 account=str(account) if account is not None else None,
+                thread_id=str(thread_id) if thread_id is not None else None,
+                guild_id=str(guild_id) if guild_id is not None else None,
+                parent_channel_id=(
+                    str(parent_channel_id)
+                    if parent_channel_id is not None
+                    else None
+                ),
             )
         except Exception:  # pragma: no cover - defensive
             return None
@@ -6752,8 +8661,9 @@ class WebSocketGateway:
             wa_web_mode = (channel_type == "whatsapp" and
                            ch_cfg.get("mode", "cloud").lower().strip() == "web")
             # Email/AgentMail use env vars for tokens; Signal links a device via
-            # a local bridge — none require a token in YAML.
-            is_email_platform = channel_type in ("email", "agentmail", "signal")
+            # a local bridge; ``local`` is the token-free terminal channel —
+            # none require a token in YAML.
+            is_email_platform = channel_type in ("email", "agentmail", "signal", "local")
             if not token and not wa_web_mode and not is_email_platform:
                 logger.warning(f"No token for channel '{channel_name}', skipping")
                 # Issue #3159: keep the skipped channel queryable as degraded so
@@ -6828,6 +8738,11 @@ class WebSocketGateway:
             if _raw_owner is not None and str(_raw_owner).strip():
                 config_kwargs["owner_user_id"] = str(_raw_owner).strip()
 
+            # Issue #5062: bot-to-bot inbound opt-in + loop guard. When a channel
+            # accepts bot-authored messages, the core BotLoopGuard auto-breaks a
+            # runaway A<->B reply loop using the per-pair sliding-window budget.
+            _apply_bot_loop_config(config_kwargs, ch_cfg)
+
             # Only pass default_tools when the channel explicitly overrides it,
             # so BotConfig's own default_factory stays the single source of truth.
             _raw_yaml_tools = ch_cfg.get("default_tools")
@@ -6855,6 +8770,29 @@ class WebSocketGateway:
             if _raw_voice is not None:
                 try:
                     config.metadata["voice"] = _raw_voice
+                except Exception:  # pragma: no cover — defensive
+                    pass
+
+            # Carry the session-learning opt-out (Issue #4864) through the same
+            # metadata passthrough. Gateway/bot session learning is on by
+            # default; ``learn: false`` (or ``session_learning: false``) in the
+            # channel config opts a channel out. BotConfig has no native field,
+            # so apply_bot_smart_defaults reads it back from config.metadata.
+            _raw_learn = ch_cfg.get("learn", ch_cfg.get("session_learning"))
+            if _raw_learn is not None:
+                try:
+                    config.metadata["learn"] = _raw_learn
+                except Exception:  # pragma: no cover — defensive
+                    pass
+
+            # Carry the inbound platform-event opt-in (Issue #5161) through the
+            # same metadata passthrough so ``events: [reactions, edits, …]`` in
+            # gateway.yaml actually reaches the adapter's ``_event_classes()``.
+            # Off by default; BotConfig has no native field for it.
+            _raw_events = ch_cfg.get("events")
+            if _raw_events is not None:
+                try:
+                    config.metadata["events"] = _raw_events
                 except Exception:  # pragma: no cover — defensive
                     pass
 
@@ -6898,6 +8836,12 @@ class WebSocketGateway:
                 # so polling/socket transports silently lost in-flight messages.
                 self._replay_inbound_journal(bot)
                 self._channel_bots[channel_name] = bot
+                # Issue #5146: mount webhook-bearing channels that run in
+                # shared-listener mode (no explicit ``webhook_port``) onto the
+                # gateway's single Starlette listener at ``/webhooks/<channel>``
+                # so several webhook bots share one port/public URL. A channel
+                # that set ``webhook_port`` keeps its standalone server (below).
+                self._maybe_mount_shared_webhook(channel_name, bot)
                 logger.info(f"Channel '{channel_name}' ({channel_type}) initialized")
             except Exception as e:
                 logger.error(f"Failed to create bot for '{channel_name}': {e}")
@@ -6921,6 +8865,44 @@ class WebSocketGateway:
                 # for the next boot rather than blocking startup.
                 self._schedule_outbound_recovery(bot)
             logger.info(f"Started {len(self._channel_bots)} channel bot(s)")
+
+    def _maybe_mount_shared_webhook(self, channel_name: str, bot: Any) -> None:
+        """Register a webhook adapter on the gateway's shared listener.
+
+        Issue #5146: a ``mode: webhook`` channel whose adapter reports
+        ``accepts_webhooks`` and is in shared-listener mode (it exposes
+        ``uses_shared_listener`` truthy — i.e. no explicit ``webhook_port``) is
+        added to ``_webhook_channels`` so the ``/webhooks/{channel}`` route
+        dispatches to its ``handle_shared_request``. Any channel that opted out
+        by setting ``webhook_port`` is left to bind its own server as before.
+        No-op for adapters that don't expose the seam, so non-webhook channels
+        are unaffected.
+        """
+        if not getattr(bot, "uses_shared_listener", False):
+            return
+        if not callable(getattr(bot, "handle_shared_request", None)):
+            return
+        # Confirm the adapter genuinely accepts webhooks via the core capability
+        # contract (``PlatformCapabilities.accepts_webhooks``) before mounting an
+        # ingress for it — fail-closed on ambiguity. ``default_capabilities`` is
+        # the classmethod all adapters expose (Issue #5146).
+        try:
+            caps = bot.default_capabilities()
+            if not getattr(caps, "accepts_webhooks", False):
+                return
+        except Exception:  # noqa: BLE001 — missing/odd capabilities: don't mount
+            return
+        self._webhook_channels[channel_name] = bot
+        # Tell the adapter a gateway owns its ingress so its own ``start`` is a
+        # socket-free no-op (a standalone bot would still bind a default port).
+        mark = getattr(bot, "mark_shared_mounted", None)
+        if callable(mark):
+            mark()
+        logger.info(
+            "Channel '%s' mounted on shared webhook listener at /webhooks/%s",
+            channel_name,
+            channel_name,
+        )
 
     def _schedule_outbound_recovery(self, bot: Any) -> None:
         """Fire-and-forget the boot-time outbound reply redelivery (Issue #3862).
@@ -7249,6 +9231,33 @@ class WebSocketGateway:
         elif hasattr(bot, "_identity_resolver"):
             bot._identity_resolver = resolver
 
+    def _build_turn_lock_map(self) -> Any:
+        """Build the gateway's per-turn lock backend from config (Issue #4655).
+
+        Honours ``gateway.turn_lock.backend``: the default ``"local"`` returns a
+        plain in-process ``LockMap`` (today's behaviour, byte-for-byte), while
+        ``"redis"`` returns a ``RedisTurnLock`` reusing the push ``RedisConfig``
+        so turns serialise cluster-wide across replicas. Construction fails open
+        (local fallback + a degraded record) so an outage never wedges startup.
+        """
+        cfg = getattr(self, "config", None)
+        turn_lock = getattr(cfg, "turn_lock", None)
+        push = getattr(cfg, "push", None)
+        redis_config = getattr(push, "redis", None)
+        try:
+            from ..bots._redis_turn_lock import build_turn_lock
+
+            return build_turn_lock(
+                turn_lock,
+                redis_config,
+                degraded_registry=getattr(self, "_degraded_registry", None),
+            )
+        except Exception as e:  # pragma: no cover - defensive: never block startup
+            logger.warning("Failed to build turn lock backend: %s", e)
+            from .._lockmap import LockMap
+
+            return LockMap()
+
     def _stamp_turn_lock_map(self, bot: Any) -> None:
         """Share one per-turn ``LockMap`` with a channel bot (Issue #3232).
 
@@ -7269,12 +9278,19 @@ class WebSocketGateway:
         ``start_channels`` and ``_start_single_channel`` (hot-reload) so a
         restarted channel keeps sharing the same lock map.
         """
-        if getattr(self, "_identity_resolver", None) is None:
+        # A local backend only unifies distinct channels onto one session when an
+        # identity resolver is configured (Issue #3232), so without a resolver it
+        # stays a no-op and each channel keeps its own map (today's behaviour). A
+        # distributed (``redis``) backend, however, must serialise across replicas
+        # of even a *single* channel, so it is wired unconditionally (Issue #4655).
+        cfg = getattr(self, "config", None)
+        turn_lock_cfg = getattr(cfg, "turn_lock", None)
+        distributed = bool(getattr(turn_lock_cfg, "enabled", False))
+        if getattr(self, "_identity_resolver", None) is None and not distributed:
             return
         lock_map = getattr(self, "_turn_lock_map", None)
         if lock_map is None:
-            from .._lockmap import LockMap
-            lock_map = LockMap()
+            lock_map = self._build_turn_lock_map()
             self._turn_lock_map = lock_map
         sess = (
             getattr(bot, "_session", None)
@@ -7552,7 +9568,15 @@ class WebSocketGateway:
             init_kwargs[key] = value
 
         try:
-            return adapter_cls(**init_kwargs)
+            adapter = adapter_cls(**init_kwargs)
+            # Enforce the capability contract on the gateway construction path
+            # too (parity with ``Bot._build_adapter``): a declared-but-unbacked
+            # ``supports_*`` flag must fail here — recorded as a degraded
+            # channel — rather than surfacing later inside a live turn.
+            from praisonai_bot.bots.bot import Bot
+
+            Bot._verify_capability_contract(adapter)
+            return adapter
         except Exception as exc:
             logger.warning(
                 "Failed to construct channel %r adapter: %s", channel_type, exc
@@ -7658,12 +9682,33 @@ class WebSocketGateway:
             channel_id = getattr(message.channel, "channel_id", None) if message.channel else None
             bot_user = getattr(bot, "bot_user", None)
             account = getattr(bot_user, "user_id", None) if bot_user else None
+            # Thread / guild / parent facts for finer routing (Issue #4839).
+            # ``thread_id`` is on the envelope already; guild id and thread
+            # parent, where a platform surfaces them (e.g. Discord), ride in
+            # the channel metadata so no new envelope field is required.
+            thread_id = getattr(message, "thread_id", None)
+            channel_meta = getattr(message.channel, "metadata", None) if message.channel else None
+            guild_id = None
+            parent_channel_id = None
+            if isinstance(channel_meta, dict):
+                guild_id = (
+                    channel_meta.get("guild_id")
+                    or channel_meta.get("server_id")
+                    or channel_meta.get("workspace_id")
+                )
+                parent_channel_id = (
+                    channel_meta.get("parent_channel_id")
+                    or channel_meta.get("parent_id")
+                )
             facts = gateway._build_route_facts(
                 routing_ctx,
                 peer=peer,
                 roles=roles,
                 channel_id=channel_id,
                 account=account,
+                thread_id=thread_id,
+                guild_id=guild_id,
+                parent_channel_id=parent_channel_id,
             )
             agent = gateway._resolve_agent_for_message(
                 channel_name, routing_ctx, facts=facts
@@ -7755,7 +9800,15 @@ class WebSocketGateway:
                 return  # Message was dropped by security checks
 
             user_id = message.sender.user_id if message.sender else "unknown"
-            message_text = message.content
+            # Render any resolved reply/quote context (Issue #5223) so gateway
+            # agents honour the referent too, matching the standalone adapter.
+            # ``prompt_text`` folds the (post-hook, possibly redacted) quoted
+            # block above the content; with no quote it is just the content.
+            message_text = (
+                message.prompt_text
+                if hasattr(message, "prompt_text")
+                else message.content
+            )
 
             # Determine routing context
             chat_type = update.message.chat.type if update.message.chat else "private"
@@ -7769,11 +9822,16 @@ class WebSocketGateway:
                 else None
             )
             account = bot.bot_user.user_id if getattr(bot, "bot_user", None) else None
+            # Forum-topic id doubles as the thread fact for per-thread routing
+            # (Issue #4839); the parent is the chat the topic lives under.
+            thread_id = getattr(message, "thread_id", None)
             facts = gateway._build_route_facts(
                 routing_ctx,
                 peer=user_id,
                 channel_id=chat_id,
                 account=account,
+                thread_id=thread_id,
+                parent_channel_id=chat_id if thread_id is not None else None,
             )
             agent = gateway._resolve_agent_for_message(
                 channel_name, routing_ctx, facts=facts
@@ -7989,6 +10047,12 @@ class WebSocketGateway:
             self._channel_supervisor.cleanup(name)
 
         self._channel_bots.clear()
+        # Issue #5146: the shared webhook registry lives alongside
+        # ``_channel_bots`` but is populated separately, so clear it on full
+        # teardown too — otherwise a removed webhook channel would stay
+        # reachable at ``/webhooks/<channel>`` and keep handling requests after
+        # it has been stopped.
+        self._webhook_channels.clear()
         self._routing_rules.clear()
         self._routing_bindings.clear()
 
@@ -8233,6 +10297,9 @@ class WebSocketGateway:
             
             # Remove from tracking
             del self._channel_bots[channel_name]
+            # Issue #5146: drop any shared-listener webhook mount so a reloaded
+            # or removed channel doesn't leave a stale handler on /webhooks/.
+            self._webhook_channels.pop(channel_name, None)
             
             # Clean up supervisor state
             self._channel_supervisor.cleanup(channel_name)
@@ -8269,8 +10336,9 @@ class WebSocketGateway:
         wa_web_mode = (channel_type == "whatsapp" and
                        ch_cfg.get("mode", "cloud").lower().strip() == "web")
         # Email/AgentMail use env vars for tokens; Signal links a device via a
-        # local bridge — none require a token in YAML.
-        is_email_platform = channel_type in ("email", "agentmail", "signal")
+        # local bridge; ``local`` is the token-free terminal channel — none
+        # require a token in YAML.
+        is_email_platform = channel_type in ("email", "agentmail", "signal", "local")
         
         if not token and not wa_web_mode and not is_email_platform:
             logger.warning(f"No token for channel '{channel_name}', skipping")
@@ -8337,6 +10405,9 @@ class WebSocketGateway:
         if _raw_owner is not None and str(_raw_owner).strip():
             config_kwargs["owner_user_id"] = str(_raw_owner).strip()
 
+        # Issue #5062: honour bot-to-bot opt-in + loop guard on hot-reload too.
+        _apply_bot_loop_config(config_kwargs, ch_cfg)
+
         # Only pass default_tools when the channel explicitly overrides it
         _raw_yaml_tools = ch_cfg.get("default_tools")
         if isinstance(_raw_yaml_tools, list):
@@ -8359,6 +10430,16 @@ class WebSocketGateway:
         if _raw_voice is not None:
             try:
                 config.metadata["voice"] = _raw_voice
+            except Exception:  # pragma: no cover — defensive
+                pass
+
+        # Issue #5161: carry the inbound platform-event opt-in through metadata
+        # on hot-reload too, so a reloaded channel keeps subscribing to the same
+        # ``events: [...]`` classes as start_channels().
+        _raw_events = ch_cfg.get("events")
+        if _raw_events is not None:
+            try:
+                config.metadata["events"] = _raw_events
             except Exception:  # pragma: no cover — defensive
                 pass
 
@@ -8394,6 +10475,12 @@ class WebSocketGateway:
             # gateway boot.
             self._replay_inbound_journal(bot)
             self._channel_bots[channel_name] = bot
+            # Issue #5146: a hot-reloaded/restarted webhook channel must be
+            # re-mounted on the gateway's shared listener too, otherwise the
+            # replacement falls back to its standalone port and
+            # ``/webhooks/<channel>`` 404s until a full restart. Same
+            # registration path used by ``start_channels``.
+            self._maybe_mount_shared_webhook(channel_name, bot)
             logger.info(f"Channel '{channel_name}' ({channel_type}) initialized")
         except Exception as e:
             logger.error(f"Failed to create bot for '{channel_name}': {e}")
@@ -8449,6 +10536,159 @@ class WebSocketGateway:
             error=error,
         )
 
+    async def validate_candidate(
+        self, new_config: "Mapping[str, Any]"
+    ) -> "CandidateReport":
+        """Public :class:`ReloadValidationProtocol` entry point (Issue #5144).
+
+        Build/pre-flight the candidate from ``new_config`` *without* stopping or
+        mutating the live runtime, so ``isinstance(gateway,
+        ReloadValidationProtocol)`` holds and every reload entry point (SIGHUP,
+        ``gateway reload``/``restart``) honours the same "never cut over to an
+        unvalidated candidate" contract. Delegates to the synchronous
+        :meth:`_validate_candidate`, which does no blocking I/O (it only
+        constructs Agent objects), so it is safe to await directly.
+        """
+        return self._validate_candidate(dict(new_config))
+
+    def _validate_candidate(self, new_cfg: Dict[str, Any]) -> "CandidateReport":
+        """Build candidate agents from ``new_cfg`` *without* activating them live.
+
+        Issue #5144: a structural (full-restart) reload tears the live channels
+        down before the new config is proven to work, and on a build/start
+        failure there is no rollback — a schema-valid but runtime-invalid edit
+        (bad tool/model/guardrails wiring) takes a healthy always-on gateway
+        offline. This performs the agent-build pre-flight *first*, so the
+        highest-risk step is proven before any live channel is drained.
+
+        Crucially, the candidate agents are built into an *isolated* registry
+        and returned via :attr:`CandidateReport.candidate` — the live
+        ``self._agents`` map is snapshotted and restored, so traffic in-flight
+        during the drain window can never observe the not-yet-committed
+        candidate. The caller activates the candidate with
+        :meth:`_activate_candidate` only after ingress is quiesced
+        (``stop_channels``). ``_create_agents_from_config`` writes into
+        ``self._agents``, so this temporarily borrows it, captures the built
+        maps, then restores the live snapshot exactly.
+
+        Returns a :class:`CandidateReport`; ``ok=False`` means the caller must
+        keep the previous config serving and never drain the live channels.
+        """
+        from praisonaiagents.gateway.config import CandidateReport
+
+        agents_cfg = new_cfg.get("agents", {})
+        if not agents_cfg:
+            # Nothing to build/prove for agents; channel start remains
+            # per-channel fault-tolerant, so the candidate is trivially ok.
+            return CandidateReport(ok=True, candidate={"agents": {}, "shell": {}})
+
+        provider_cfg = new_cfg.get("provider", {})
+        default_model = provider_cfg.get("model") if provider_cfg else None
+        guardrails_cfg = (new_cfg.get("guardrails") or {}).get("registry")
+        durable_runs = self._durable_runs_from_config(new_cfg)
+
+        # Borrow the live registries to reuse the existing builder, but always
+        # restore them so the live runtime is byte-for-byte untouched until the
+        # caller explicitly activates the candidate after ingress is quiesced.
+        prev_agents = dict(self._agents)
+        prev_shell = dict(self._shell_routed_agents)
+        try:
+            self._agents.clear()
+            self._shell_routed_agents.clear()
+            self._create_agents_from_config(
+                agents_cfg,
+                default_model=default_model,
+                guardrails_cfg=guardrails_cfg,
+                durable_runs=durable_runs,
+            )
+            self._register_rooms_from_config(new_cfg.get("rooms"))
+            candidate = {
+                "agents": dict(self._agents),
+                "shell": dict(self._shell_routed_agents),
+            }
+        except Exception as e:
+            logger.error(f"Candidate reload rejected — agent build failed: {e}")
+            return CandidateReport(
+                ok=False, failures=[f"agent build failed: {e}"]
+            )
+        finally:
+            # Restore live agents so no cutover has happened yet — the candidate
+            # only goes live via _activate_candidate() after stop_channels().
+            self._agents.clear()
+            self._agents.update(prev_agents)
+            self._shell_routed_agents.clear()
+            self._shell_routed_agents.update(prev_shell)
+        return CandidateReport(ok=True, candidate=candidate)
+
+    def _activate_candidate(self, candidate: Optional[Dict[str, Any]]) -> None:
+        """Install a validated candidate agent registry as the live one.
+
+        Called only after ``stop_channels`` has quiesced ingress, so the swap
+        from the previous agents to the proven candidate is atomic from the
+        perspective of any new turn. ``None``/empty candidate is a no-op (the
+        no-agents-config case), leaving the existing agents in place.
+        """
+        if not candidate:
+            return
+        agents = candidate.get("agents")
+        if not agents:
+            return
+        self._agents.clear()
+        self._agents.update(agents)
+        self._shell_routed_agents.clear()
+        self._shell_routed_agents.update(candidate.get("shell", {}))
+
+    async def _restore_previous_config(
+        self, error: str, changed_paths: Set[str]
+    ) -> None:
+        """Last-resort restore of the last-known-good config after a failed swap.
+
+        Issue #5144: if a full-restart cutover has already drained the live
+        channels and the new channels fail to start, bring the previous working
+        config back up so the gateway is never left down. The previous config +
+        agents are still stored in ``self._loaded_config``, so this rebuilds
+        agents and restarts channels from it, and records a ``rolled_back``-style
+        ``failed`` outcome (with the original error) via ``health()``.
+        """
+        prev_cfg = self._loaded_config
+        if not prev_cfg:
+            self._record_reload_status(
+                "failed",
+                changed_paths=tuple(sorted(changed_paths)),
+                error=error,
+            )
+            return
+        try:
+            prev_agents_cfg = prev_cfg.get("agents", {})
+            if prev_agents_cfg:
+                provider_cfg = prev_cfg.get("provider", {})
+                default_model = provider_cfg.get("model") if provider_cfg else None
+                guardrails_cfg = (prev_cfg.get("guardrails") or {}).get("registry")
+                durable_runs = self._durable_runs_from_config(prev_cfg)
+                self._agents.clear()
+                self._shell_routed_agents.clear()
+                self._create_agents_from_config(
+                    prev_agents_cfg,
+                    default_model=default_model,
+                    guardrails_cfg=guardrails_cfg,
+                    durable_runs=durable_runs,
+                )
+                self._register_rooms_from_config(prev_cfg.get("rooms"))
+            prev_channels_cfg = prev_cfg.get("channels", {})
+            if prev_channels_cfg:
+                await self.start_channels(prev_channels_cfg)
+            logger.info("Restored previous config after failed reload")
+        except Exception as restore_err:  # pragma: no cover - defensive
+            logger.error(
+                f"Failed to restore previous config after reload failure: "
+                f"{restore_err}"
+            )
+        self._record_reload_status(
+            "failed",
+            changed_paths=tuple(sorted(changed_paths)),
+            error=error,
+        )
+
     async def _reload_config_locked(self, config_path: str) -> None:
         """Perform the actual hot-reload. Callers must hold ``_reload_lock``."""
         logger.info(f"Hot-reloading gateway config from {config_path}...")
@@ -8495,6 +10735,7 @@ class WebSocketGateway:
                         guardrails_cfg=guardrails_cfg,
                         durable_runs=durable_runs,
                     )
+                    self._register_rooms_from_config(new_cfg.get("rooms"))
 
                 # Register inbound trigger hooks (Issue #2281).
                 self._apply_hooks_from_config(new_cfg)
@@ -8531,30 +10772,69 @@ class WebSocketGateway:
         # Execute reload plan
         if plan.full_restart:
             logger.info("Performing full restart due to structural changes")
+            # Issue #5144: validate the candidate (build the new agents) BEFORE
+            # draining the live channels. If the build fails, the previous
+            # config keeps serving — a schema-valid but runtime-invalid edit is
+            # a *rejected* reload, not an outage. The candidate is built into an
+            # isolated registry and is NOT yet live: in-flight turns during the
+            # drain window keep resolving the previous agents until the cutover
+            # commits.
+            report = self._validate_candidate(new_cfg)
+            if not report.ok:
+                error = "; ".join(report.failures) or "candidate validation failed"
+                logger.error(f"Reload rejected — {error}; keeping previous config")
+                self._record_reload_status(
+                    "failed",
+                    changed_paths=tuple(sorted(changed_paths)),
+                    error=error,
+                )
+                return
+
+            # Candidate proved; drain live channels first so ingress is quiesced,
+            # then atomically activate the candidate agents and bring the new
+            # channels up. If channel start raises OR every configured channel
+            # fails to start, restore the previous working config so the gateway
+            # is never left down.
             # Issue #2533: drain in-flight turns before bouncing all channels.
             await self.stop_channels(drain_timeout=self._reload_drain_timeout)
-            
-            # Recreate agents
-            agents_cfg = new_cfg.get("agents", {})
-            provider_cfg = new_cfg.get("provider", {})
-            default_model = provider_cfg.get("model") if provider_cfg else None
-            guardrails_cfg = (new_cfg.get("guardrails") or {}).get("registry")
-            durable_runs = self._durable_runs_from_config(new_cfg)
-            if agents_cfg:
-                self._agents.clear()
-                # Recreating agents invalidates id()-keyed shell clones.
-                self._shell_routed_agents.clear()
-                self._create_agents_from_config(
-                    agents_cfg,
-                    default_model=default_model,
-                    guardrails_cfg=guardrails_cfg,
-                    durable_runs=durable_runs,
-                )
-            
-            # Restart all channels
+
+            # Cutover point: candidate agents become live only now that no
+            # channel is accepting turns (greptile #1 — never expose the
+            # candidate before the cutover commits).
+            self._activate_candidate(report.candidate)
+
             channels_cfg = new_cfg.get("channels", {})
-            if channels_cfg:
-                await self.start_channels(channels_cfg)
+            try:
+                if channels_cfg:
+                    await self.start_channels(channels_cfg)
+            except Exception as e:
+                logger.error(
+                    f"Channel start failed during full restart: {e}; "
+                    "restoring previous config"
+                )
+                await self._restore_previous_config(str(e), changed_paths)
+                return
+
+            # Issue #5144 (greptile #3): start_channels() is per-channel
+            # fault-tolerant — missing credentials / adapter-construction
+            # failures are marked *degraded* and skipped rather than raised. So
+            # a wholly-broken replacement set returns normally, leaving the old
+            # channels stopped while the reload would otherwise commit as ``ok``.
+            # If channels were configured but none came up live, treat the
+            # cutover as failed and restore the previous config.
+            if channels_cfg and not self._channel_bots:
+                degraded = "; ".join(
+                    f"{name}: {reason}"
+                    for name, reason in self._degraded_channels.items()
+                ) or "no channels started"
+                logger.error(
+                    f"All configured channels failed to start ({degraded}); "
+                    "restoring previous config"
+                )
+                await self._restore_previous_config(
+                    f"all channels failed to start ({degraded})", changed_paths
+                )
+                return
         else:
             # Selective reload
             if plan.reload_agents:
@@ -8574,6 +10854,7 @@ class WebSocketGateway:
                         guardrails_cfg=guardrails_cfg,
                         durable_runs=durable_runs,
                     )
+                    self._register_rooms_from_config(new_cfg.get("rooms"))
                 logger.info("Agents reloaded")
             
             # Restart specific channels
@@ -8611,6 +10892,13 @@ class WebSocketGateway:
         # Refresh inbound trigger hooks (Issue #2281) so removed hooks and
         # rotated hook secrets take effect without a full process restart.
         self._apply_hooks_from_config(new_cfg)
+
+        # Issue #4913: reconcile declarative ``schedules:`` on hot-reload so an
+        # added, edited or removed schedule takes effect without a full process
+        # restart — mirroring the boot-time load. The loader upserts on a stable
+        # id and prunes config-owned jobs no longer present, so it is idempotent
+        # and safe to run on every reload. No-op when the block is absent.
+        self._load_declarative_schedules(new_cfg)
 
         # Issue #3021: reconcile opt-in lifecycle policies on reload so enabling
         # / disabling scale-to-zero or changing the drain-marker path takes
@@ -9004,6 +11292,29 @@ class WebSocketGateway:
             self._host = gw_cfg["host"]
         if gw_cfg.get("port"):
             self._port = int(gw_cfg["port"])
+        # Issue #5312: resolve the operator-declared trusted-proxy set. CLI
+        # ``--trusted-proxy`` (``_trusted_proxies_override``) wins over the YAML
+        # ``gateway.trusted_proxies``. Stamp the resolved set onto ``self.config``
+        # so the ingress-attribution seam reads it uniformly. Only overwrite when
+        # a source actually supplies one — YAML that *omits* ``trusted_proxies``
+        # must not wipe a value a Python caller set on ``GatewayConfig`` before
+        # ``start_with_config`` (Greptile P1).
+        _tp_override = getattr(self, "_trusted_proxies_override", None)
+        _trusted = None
+        if _tp_override:
+            _trusted = [str(p).strip() for p in _tp_override if str(p).strip()]
+        elif "trusted_proxies" in gw_cfg:
+            _raw_tp = gw_cfg.get("trusted_proxies")
+            _trusted = (
+                [str(p).strip() for p in _raw_tp if str(p).strip()]
+                if isinstance(_raw_tp, (list, tuple))
+                else []
+            )
+        if _trusted is not None:
+            try:
+                self.config.trusted_proxies = _trusted
+            except Exception:  # pragma: no cover - config is always a GatewayConfig
+                pass
         # Issue #3593: the multi-bot CLI builds this gateway with a *default*
         # session config, so ``__init__`` already picked a store before this
         # YAML loaded. Re-read the ``session:`` block here and re-select the
@@ -9075,6 +11386,9 @@ class WebSocketGateway:
                 self.config.api.openai = bool(api_yaml["openai"])
             if "mcp" in api_yaml:
                 self.config.api.mcp = bool(api_yaml["mcp"])
+            # Opt-in token-level SSE streaming on ``/v1/chat/completions``.
+            if "stream" in api_yaml:
+                self.config.api.stream = bool(api_yaml["stream"])
         _openai_ovr = getattr(self, "_openai_api_override", None)
         if _openai_ovr is not None:
             self.config.api.openai = bool(_openai_ovr)
@@ -9089,6 +11403,13 @@ class WebSocketGateway:
         drain_timeout_cfg = getattr(self, "_drain_timeout_override", None)
         if drain_timeout_cfg is None:
             drain_timeout_cfg = gw_cfg.get("drain_timeout")
+        # Issue #5362: a Python embedder building ``GatewayConfig(drain_timeout=…)``
+        # directly (no YAML key, no CLI flag) must still take effect, closing the
+        # CLI/YAML/Python parity gap for the drain window. Only fall back when
+        # the YAML key is *absent* — an explicit ``drain_timeout: null`` is an
+        # operator choice to disable the drain and must win over the field.
+        if drain_timeout_cfg is None and "drain_timeout" not in gw_cfg:
+            drain_timeout_cfg = getattr(self.config, "drain_timeout", None)
         # YAML/env-substituted values may arrive as strings (e.g. "30");
         # coerce once so later ``> 0`` comparisons never raise TypeError.
         if drain_timeout_cfg is not None:
@@ -9154,6 +11475,17 @@ class WebSocketGateway:
                 f"(max_concurrent_runs/queue_depth must be integers): {e}"
             ) from e
         _overflow = str(_ovr("_overflow_policy_override", "overflow_policy", "reject") or "reject")
+        # Issue #5168: optional per-tenant/per-scope concurrency sub-limit within
+        # the global ceiling (0 = disabled, global-only behaviour).
+        try:
+            _max_runs_per_scope = int(
+                gw_cfg.get("max_concurrent_runs_per_scope", 0) or 0
+            )
+        except (TypeError, ValueError) as e:
+            raise ValueError(
+                f"Invalid gateway admission config "
+                f"(max_concurrent_runs_per_scope must be an integer): {e}"
+            ) from e
 
         # Issue #2531: single reliability posture. A ``reliability`` preset
         # (CLI ``--reliability`` override wins over ``gateway.reliability``)
@@ -9187,12 +11519,14 @@ class WebSocketGateway:
             max_concurrent_runs=_max_runs,
             queue_depth=_queue_depth,
             overflow_policy=_overflow,
+            max_concurrent_runs_per_scope=_max_runs_per_scope,
         )
         if self._admission_gate is not None:
             logger.info(
                 "Gateway admission control enabled "
-                "(max_concurrent_runs=%d queue_depth=%d overflow=%s)",
-                _max_runs, _queue_depth, _overflow,
+                "(max_concurrent_runs=%d queue_depth=%d overflow=%s "
+                "per_scope=%d)",
+                _max_runs, _queue_depth, _overflow, _max_runs_per_scope,
             )
 
         # Parse health monitoring configuration
@@ -9220,6 +11554,7 @@ class WebSocketGateway:
                 guardrails_cfg=guardrails_cfg,
                 durable_runs=durable_runs,
             )
+        self._register_rooms_from_config(cfg.get("rooms"))
 
         # Register inbound trigger hooks (Issue #2281). Hooks may live at the
         # top level (``hooks:``) or nested under ``gateway:`` for grouping.
@@ -9240,8 +11575,26 @@ class WebSocketGateway:
         # ``watchdog:`` block nested under ``gateway:``; a CLI ``--watchdog``
         # override (stamped on the instance) wins over / synthesises the YAML.
         # No-op unless enabled, so always-on gateways are unchanged.
+        # Issue #5362: distinguish an explicit YAML key (block *or* scalar,
+        # including ``watchdog: false``) from an absent one so an explicit
+        # scalar disable is honoured over the Python ``GatewayConfig`` field.
+        watchdog_yaml_present = "watchdog" in gw_cfg
         watchdog_cfg = gw_cfg.get("watchdog")
-        watchdog_cfg = self._merge_watchdog_overrides(watchdog_cfg)
+        # Normalise a scalar (``watchdog: true`` / ``false``) into the block
+        # form ``_configure_watchdog`` expects, so an explicit scalar carries
+        # its enabled decision rather than being ignored as a non-dict.
+        if watchdog_yaml_present and not isinstance(watchdog_cfg, dict):
+            _wd_scalar = watchdog_cfg
+            if isinstance(_wd_scalar, str):
+                _wd_enabled = _wd_scalar.strip().lower() in (
+                    "1", "true", "yes", "on"
+                )
+            else:
+                _wd_enabled = bool(_wd_scalar)
+            watchdog_cfg = {"enabled": _wd_enabled}
+        watchdog_cfg = self._merge_watchdog_overrides(
+            watchdog_cfg, yaml_present=watchdog_yaml_present
+        )
         self._configure_watchdog(watchdog_cfg)
 
         # Start channels + WebSocket server concurrently
@@ -9257,6 +11610,11 @@ class WebSocketGateway:
             self._config_watch_task = asyncio.create_task(
                 self._watch_config(config_path)
             )
+            # Issue #4913: load declarative ``schedules:`` from the config into
+            # the shared store before the tick starts, so a recurring
+            # agent→channel delivery declared in gateway.yaml fires alongside
+            # channels/agents (config-as-code parity). No-op when absent.
+            self._load_declarative_schedules(cfg)
             # Launch scheduler tick to poll for due jobs
             self._start_scheduler_tick()
             # Issue #3021: launch opt-in lifecycle loops. Both are no-op when
@@ -9272,6 +11630,14 @@ class WebSocketGateway:
                 self._drain_marker_task = asyncio.create_task(
                     self._run_drain_marker_watch(drain_timeout_cfg),
                     name="gateway-drain-marker",
+                )
+            # Issue #5170: launch the opt-in idle-session compaction sweep.
+            # No-op when unconfigured; polls on ``_is_running`` after an initial
+            # sleep, so starting it here is safe.
+            if self._idle_compaction_cfg is not None:
+                self._idle_compaction_task = asyncio.create_task(
+                    self._run_idle_compaction_loop(),
+                    name="gateway-idle-compaction",
                 )
             await self.start()
 
@@ -9411,31 +11777,50 @@ class WebSocketGateway:
         try:
             await _run_all()
         finally:
-            if self._config_watch_task:
-                self._config_watch_task.cancel()
-            if self._scheduler_task:
-                self._scheduler_task.cancel()
-            if self._cleanup_task:
-                self._cleanup_task.cancel()
-            # Issue #3021: stop lifecycle loops on shutdown.
-            if self._lifecycle_task:
-                self._lifecycle_task.cancel()
-            if self._drain_marker_task:
-                self._drain_marker_task.cancel()
-            # Issue #2375: drain in-flight agent turns (channel bots) and
-            # websocket sessions before final teardown when a drain timeout
-            # is configured. The configured timeout bounds the *total*
-            # shutdown drain: track elapsed across both phases so channel
-            # bots + websocket sessions don't sum to 2 * drain_timeout.
-            # No-op when unset (today's behaviour).
-            drain_overall_start = time.monotonic()
-            await self.stop_channels(drain_timeout=drain_timeout_cfg)
+            # Issue #5079: this ``finally`` is the *real* supervisor-driven
+            # teardown (SIGINT/SIGTERM flips ``should_exit``; ``serve()``
+            # returns; ``start()`` disarms the liveness watchdog). It never
+            # calls ``stop()``, so without arming the deadline here a wedged
+            # ``stop_channels`` / session drain (adapter ``disconnect()``, WS
+            # drain, ledger/DB close) would hang until the supervisor's
+            # ``SIGKILL`` — the exact gap this feature closes. Arm the same
+            # bounded self-exit around the drain and cancel it on clean
+            # completion. No-op unless a watchdog is configured; fail-open.
+            drain_deadline = self._resolve_shutdown_grace(None)
             if drain_timeout_cfg and drain_timeout_cfg > 0:
-                remaining = drain_timeout_cfg - (time.monotonic() - drain_overall_start)
-                if remaining > 0:
-                    try:
-                        await self._drain_active_sessions(
-                            reason="shutdown", timeout=float(remaining)
-                        )
-                    except Exception as e:
-                        logger.warning("Error draining websocket sessions: %s", e)
+                drain_deadline += float(drain_timeout_cfg)
+            self._arm_shutdown_deadline(drain_deadline)
+            try:
+                if self._config_watch_task:
+                    self._config_watch_task.cancel()
+                if self._scheduler_task:
+                    self._scheduler_task.cancel()
+                if self._cleanup_task:
+                    self._cleanup_task.cancel()
+                # Issue #3021: stop lifecycle loops on shutdown.
+                if self._lifecycle_task:
+                    self._lifecycle_task.cancel()
+                if self._drain_marker_task:
+                    self._drain_marker_task.cancel()
+                # Issue #5170: stop the idle-compaction sweep on shutdown.
+                if self._idle_compaction_task:
+                    self._idle_compaction_task.cancel()
+                # Issue #2375: drain in-flight agent turns (channel bots) and
+                # websocket sessions before final teardown when a drain timeout
+                # is configured. The configured timeout bounds the *total*
+                # shutdown drain: track elapsed across both phases so channel
+                # bots + websocket sessions don't sum to 2 * drain_timeout.
+                # No-op when unset (today's behaviour).
+                drain_overall_start = time.monotonic()
+                await self.stop_channels(drain_timeout=drain_timeout_cfg)
+                if drain_timeout_cfg and drain_timeout_cfg > 0:
+                    remaining = drain_timeout_cfg - (time.monotonic() - drain_overall_start)
+                    if remaining > 0:
+                        try:
+                            await self._drain_active_sessions(
+                                reason="shutdown", timeout=float(remaining)
+                            )
+                        except Exception as e:
+                            logger.warning("Error draining websocket sessions: %s", e)
+            finally:
+                self._cancel_shutdown_deadline()

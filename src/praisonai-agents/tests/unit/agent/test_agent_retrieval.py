@@ -125,6 +125,80 @@ class TestAgentRetrievalConfigProperty:
         assert agent._knowledge_sources is not None or agent.knowledge is not None
 
 
+class TestAgentRetrievalConfigKwarg:
+    """Test Agent(..., retrieval_config=...) kwarg (issue #5599)."""
+
+    def test_agent_accepts_retrieval_config_dict_with_knowledge(self):
+        """retrieval_config= dict is accepted and merged over knowledge= config."""
+        from praisonaiagents import Agent
+
+        agent = Agent(
+            name="TestAgent",
+            instructions="Test",
+            knowledge=["test.txt"],
+            retrieval_config={"top_k": 7},
+        )
+
+        assert agent._retrieval_config is not None
+        assert agent._retrieval_config.top_k == 7
+
+    def test_agent_accepts_retrieval_config_without_knowledge(self):
+        """retrieval_config= dict works even without knowledge= (no TypeError)."""
+        from praisonaiagents import Agent
+
+        agent = Agent(
+            name="TestAgent",
+            instructions="Test",
+            retrieval_config={"top_k": 3},
+        )
+
+        assert agent._retrieval_config is not None
+        assert agent._retrieval_config.top_k == 3
+
+    def test_agent_accepts_retrieval_config_instance(self):
+        """retrieval_config= RetrievalConfig instance is passed through."""
+        from praisonaiagents import Agent
+        from praisonaiagents.rag.retrieval_config import RetrievalConfig
+
+        config = RetrievalConfig(top_k=11)
+        agent = Agent(
+            name="TestAgent",
+            instructions="Test",
+            retrieval_config=config,
+        )
+
+        assert agent._retrieval_config is config
+
+    def test_agent_without_retrieval_config_backward_compat(self):
+        """No retrieval_config= keeps prior behaviour (None without knowledge)."""
+        from praisonaiagents import Agent
+
+        agent = Agent(name="TestAgent", instructions="Test")
+
+        assert agent._retrieval_config is None
+
+    def test_retrieval_config_instance_with_local_model(self):
+        """RetrievalConfig instance + local llm must not raise AttributeError.
+
+        Regression for the local-model embedding setup that assumed
+        retrieval_config was a dict and called ``.get()`` / ``.setdefault()``
+        on it. A RetrievalConfig dataclass instance has no such methods, so
+        construction crashed before this fix.
+        """
+        from praisonaiagents import Agent
+        from praisonaiagents.rag.retrieval_config import RetrievalConfig
+
+        config = RetrievalConfig(top_k=4)
+        agent = Agent(
+            name="TestAgent",
+            instructions="Test",
+            llm="ollama/llama3",
+            retrieval_config=config,
+        )
+
+        assert agent._retrieval_config is config
+
+
 class TestAgentSharedKnowledge:
     """Test Agent with shared Knowledge instances."""
     
@@ -292,6 +366,117 @@ class TestAgentChatRetrieval:
         
         # Verify skip parameter is accepted
         assert hasattr(agent.chat, '__call__')
+
+
+class TestChatInjectsRetrievedContext:
+    """Regression tests: retrieved context must reach the prompt sent to the LLM.
+
+    Guards against the bug where knowledge was appended to `prompt` but the
+    LLM call used a separate `llm_prompt` that omitted the retrieved text
+    (issue #5098).
+    """
+
+    MARKER = "ZEBRA-QUOTA-9917"
+
+    def _build_agent(self):
+        from praisonaiagents import Agent
+
+        agent = Agent(
+            name="TestAgent",
+            instructions="Answer using the knowledge base only.",
+            knowledge=["policy.txt"],
+        )
+        agent._knowledge_processed = True
+        agent.knowledge = Mock()
+        # Return the marker chunk from retrieval, bypassing real vector store.
+        agent._get_knowledge_context = Mock(
+            return_value=(
+                f"Company policy {self.MARKER} limits daily API calls to 42.",
+                [],
+            )
+        )
+        return agent
+
+    def test_chat_forwards_retrieved_context_to_llm(self):
+        """Sync chat() must pass the retrieved marker into the prompt used to build messages.
+
+        `_build_messages` is the seam where the LLM-bound prompt is assembled; the
+        original bug appended knowledge to `prompt` but sent a separate `llm_prompt`
+        that omitted it. We intercept `_build_messages` to capture that prompt and
+        short-circuit the turn before any real network/LLM call.
+        """
+        agent = self._build_agent()
+
+        captured = {}
+
+        class _StopTurn(Exception):
+            pass
+
+        def fake_build_messages(prompt, *args, **kwargs):
+            captured["prompt"] = prompt
+            raise _StopTurn()
+
+        with patch.object(agent, "_build_messages", side_effect=fake_build_messages):
+            with pytest.raises(_StopTurn):
+                agent.chat("What is the daily API limit?", force_retrieval=True)
+
+        assert "prompt" in captured, "_build_messages was not invoked"
+        assert self.MARKER in str(captured["prompt"]), (
+            "Retrieved context missing from prompt sent to LLM"
+        )
+
+    def test_chat_forwards_retrieved_context_into_multimodal_prompt(self):
+        """Sync chat() with attachments must inject retrieved context into the list prompt.
+
+        When attachments are present, `llm_prompt` becomes a multimodal list.
+        The retrieved context must still reach a text part of that list so the
+        model receives the RAG block alongside the attachment(s).
+        """
+        agent = self._build_agent()
+
+        captured = {}
+
+        class _StopTurn(Exception):
+            pass
+
+        def fake_build_messages(prompt, *args, **kwargs):
+            captured["prompt"] = prompt
+            raise _StopTurn()
+
+        multimodal_prompt = [
+            {"type": "text", "text": "What is the daily API limit?"},
+            {"type": "image_url", "image_url": {"url": "https://example.com/x.png"}},
+        ]
+
+        with patch.object(
+            agent, "_build_multimodal_prompt", return_value=multimodal_prompt
+        ):
+            with patch.object(
+                agent, "_build_messages", side_effect=fake_build_messages
+            ):
+                with pytest.raises(_StopTurn):
+                    agent.chat(
+                        "What is the daily API limit?",
+                        force_retrieval=True,
+                        attachments=["x.png"],
+                    )
+
+        assert "prompt" in captured, "_build_messages was not invoked"
+        captured_prompt = captured["prompt"]
+        assert isinstance(captured_prompt, list), "Expected a multimodal list prompt"
+        text_parts = [
+            item.get("text", "")
+            for item in captured_prompt
+            if isinstance(item, dict) and item.get("type") == "text"
+        ]
+        assert any(self.MARKER in text for text in text_parts), (
+            "Retrieved context missing from multimodal prompt sent to LLM"
+        )
+        # Attachment content must be preserved alongside the injected context.
+        assert any(
+            isinstance(item, dict) and item.get("type") == "image_url"
+            for item in captured_prompt
+        ), "Attachment content was dropped from multimodal prompt"
 
 
 class TestLazyLoading:

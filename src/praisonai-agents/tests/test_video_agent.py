@@ -73,8 +73,8 @@ class TestVideoAgentInit:
         """Test initialization with llm parameter."""
         from praisonaiagents import VideoAgent
         
-        agent = VideoAgent(llm="gemini/veo-3.0-generate-preview")
-        assert agent.llm == "gemini/veo-3.0-generate-preview"
+        agent = VideoAgent(llm="gemini/veo-3.1-generate-preview")
+        assert agent.llm == "gemini/veo-3.1-generate-preview"
     
     def test_with_model_alias(self):
         """Test initialization with model= alias for llm=."""
@@ -336,14 +336,14 @@ class TestVideoAgentProviders:
         """Test Gemini Veo configuration."""
         from praisonaiagents import VideoAgent
         
-        agent = VideoAgent(llm="gemini/veo-3.0-generate-preview")
+        agent = VideoAgent(llm="gemini/veo-3.1-generate-preview")
         assert "veo" in agent.llm
     
     def test_vertex_ai_provider(self):
         """Test Vertex AI configuration."""
         from praisonaiagents import VideoAgent
         
-        agent = VideoAgent(llm="vertex_ai/veo-3.0-generate-preview")
+        agent = VideoAgent(llm="vertex_ai/veo-3.1-generate-001")
         assert "vertex_ai" in agent.llm
     
     def test_runwayml_provider(self):
@@ -352,6 +352,167 @@ class TestVideoAgentProviders:
         
         agent = VideoAgent(llm="runwayml/gen4_turbo")
         assert "runwayml" in agent.llm
+
+    def test_openrouter_provider(self):
+        """Test OpenRouter configuration keeps the openrouter/ prefix."""
+        from praisonaiagents import VideoAgent
+
+        agent = VideoAgent(llm="openrouter/google/veo-3.1")
+        assert agent.llm == "openrouter/google/veo-3.1"
+
+
+class TestVideoAgentOpenRouterHeaders:
+    """OpenRouter attribution headers are added only for openrouter/ models."""
+
+    def test_openrouter_default_headers(self, monkeypatch):
+        from praisonaiagents import VideoAgent
+
+        monkeypatch.delenv("OPENROUTER_REFERER", raising=False)
+        monkeypatch.delenv("OPENROUTER_APP_TITLE", raising=False)
+        agent = VideoAgent(llm="openrouter/google/veo-3.1", verbose=False)
+        params = agent._get_model_params()
+        assert params["extra_headers"]["HTTP-Referer"] == "https://praison.ai"
+        assert params["extra_headers"]["X-Title"] == "PraisonAI"
+
+    def test_openrouter_headers_env_override(self, monkeypatch):
+        from praisonaiagents import VideoAgent
+
+        monkeypatch.setenv("OPENROUTER_REFERER", "https://example.com")
+        monkeypatch.setenv("OPENROUTER_APP_TITLE", "MyApp")
+        agent = VideoAgent(llm="openrouter/kling/kling-3.0-std", verbose=False)
+        params = agent._get_model_params()
+        assert params["extra_headers"]["HTTP-Referer"] == "https://example.com"
+        assert params["extra_headers"]["X-Title"] == "MyApp"
+
+    def test_non_openrouter_has_no_headers(self):
+        from praisonaiagents import VideoAgent
+
+        agent = VideoAgent(llm="openai/sora-2", verbose=False)
+        params = agent._get_model_params()
+        assert "extra_headers" not in params
+
+    def test_openrouter_generate_forwards_headers_and_body_fields(self, monkeypatch):
+        """Contract test: generate() forwards the openrouter/ model, attribution
+        headers, and provider body fields straight into LiteLLM's video route."""
+        from praisonaiagents import VideoAgent
+
+        monkeypatch.delenv("OPENROUTER_REFERER", raising=False)
+        monkeypatch.delenv("OPENROUTER_APP_TITLE", raising=False)
+
+        captured = {}
+
+        def fake_video_generation(**kwargs):
+            captured.update(kwargs)
+            return MockVideoObject()
+
+        agent = VideoAgent(llm="openrouter/google/veo-3.1", verbose=False)
+        agent._litellm_video = {"video_generation": fake_video_generation}
+
+        agent.generate(
+            "A serene mountain landscape",
+            duration=6,
+            resolution="720p",
+            generate_audio=False,
+        )
+
+        assert captured["model"] == "openrouter/google/veo-3.1"
+        assert captured["prompt"] == "A serene mountain landscape"
+        assert captured["extra_headers"]["HTTP-Referer"] == "https://praison.ai"
+        assert captured["extra_headers"]["X-Title"] == "PraisonAI"
+        assert captured["duration"] == 6
+        assert captured["resolution"] == "720p"
+        assert captured["generate_audio"] is False
+
+    def test_openrouter_litellm_routes_provider(self):
+        """LiteLLM strips the openrouter/ prefix and routes to the openrouter provider."""
+        litellm = pytest.importorskip("litellm")
+        model, provider, _, _ = litellm.get_llm_provider(model="openrouter/google/veo-3.1")
+        assert provider == "openrouter"
+        assert model == "google/veo-3.1"
+
+
+class TestVideoAgentUnsupportedBackend:
+    """Regression tests for issue #5342.
+
+    Providers such as xAI Grok Imagine are listed in LiteLLM's chat/cost
+    catalogue but have no video-generation backend. generate()/agenerate()
+    must turn LiteLLM's opaque 'not supported' provider error into a clear,
+    actionable ValueError naming models that do have a video route.
+    """
+
+    def _raising_module(self):
+        def raise_unsupported(**kwargs):
+            raise RuntimeError(
+                "XaiException - video generation is not supported for xai"
+            )
+        return {"video_generation": raise_unsupported}
+
+    def test_generate_unsupported_backend_raises_valueerror(self):
+        from praisonaiagents import VideoAgent
+
+        agent = VideoAgent(llm="xai/grok-imagine-video-1.5", verbose=False)
+        agent._litellm_video = self._raising_module()
+
+        with pytest.raises(ValueError, match="no LiteLLM video-generation backend"):
+            agent.generate("short test clip")
+
+    def test_error_message_lists_supported_models(self):
+        from praisonaiagents import VideoAgent
+
+        agent = VideoAgent(llm="xai/grok-imagine-video-1.5", verbose=False)
+        agent._litellm_video = self._raising_module()
+
+        with pytest.raises(ValueError) as exc_info:
+            agent.generate("short test clip")
+        message = str(exc_info.value)
+        assert "xai/grok-imagine-video-1.5" in message
+        assert "openai/sora-2" in message
+
+    def test_unrelated_error_is_not_masked(self):
+        """A normal provider error (e.g. auth) must propagate unchanged."""
+        from praisonaiagents import VideoAgent
+
+        def raise_auth(**kwargs):
+            raise RuntimeError("AuthenticationError: API_KEY_INVALID")
+
+        agent = VideoAgent(llm="gemini/veo-3.1-lite-generate-preview", verbose=False)
+        agent._litellm_video = {"video_generation": raise_auth}
+
+        with pytest.raises(RuntimeError, match="API_KEY_INVALID"):
+            agent.generate("test")
+
+    def test_working_backend_bad_request_is_not_masked(self):
+        """A working backend rejecting a bad request must propagate unchanged.
+
+        Greptile P1: an error like "video size is not supported" from a real
+        video backend must NOT be turned into a "no video-generation backend"
+        ValueError — the caller should fix the request, not switch models.
+        """
+        from praisonaiagents import VideoAgent
+
+        def raise_bad_size(**kwargs):
+            raise RuntimeError("BadRequestError: video size is not supported")
+
+        agent = VideoAgent(llm="openai/sora-2", verbose=False)
+        agent._litellm_video = {"video_generation": raise_bad_size}
+
+        with pytest.raises(RuntimeError, match="video size is not supported"):
+            agent.generate("test")
+
+    @pytest.mark.asyncio
+    async def test_agenerate_unsupported_backend_raises_valueerror(self):
+        from praisonaiagents import VideoAgent
+
+        async def raise_unsupported(**kwargs):
+            raise RuntimeError(
+                "XaiException - video generation is not supported for xai"
+            )
+
+        agent = VideoAgent(llm="xai/grok-imagine-video-1.5", verbose=False)
+        agent._litellm_video = {"avideo_generation": raise_unsupported}
+
+        with pytest.raises(ValueError, match="no LiteLLM video-generation backend"):
+            await agent.agenerate("short test clip")
 
 
 # ─────────────────────────────────────────────────────────────────────────────

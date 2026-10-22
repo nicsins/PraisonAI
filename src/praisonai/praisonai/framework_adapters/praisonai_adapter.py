@@ -10,11 +10,131 @@ and direct integration with PraisonAI's features.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Dict, List, Optional
 
 from .base import BaseFrameworkAdapter
 
 logger = logging.getLogger(__name__)
+
+_DEFAULT_MAX_TOKENS = 16000
+
+
+def _active_correlation_id() -> Optional[str]:
+    """Return the current workflow id for budget diagnostics when available."""
+    try:
+        from praisonaiagents.trace.context_events import get_context_emitter
+
+        session_id = getattr(get_context_emitter(), "_session_id", None)
+        if session_id:
+            return str(session_id)
+    except Exception:
+        pass
+    try:
+        from praisonaiagents.session.context import get_session_context
+
+        context = get_session_context()
+        for field in ("thread_id", "chat_id", "user_id"):
+            value = getattr(context, field, None)
+            if value:
+                return str(value)
+    except Exception:
+        pass
+    return None
+
+
+def _resolve_output_budget(model: str, requested: Any = None) -> Optional[int]:
+    """Resolve a YAML agent budget against LiteLLM's model ceiling."""
+    try:
+        if requested is None:
+            value = _DEFAULT_MAX_TOKENS
+        elif isinstance(requested, bool):
+            raise ValueError("boolean max_tokens is invalid")
+        else:
+            value = int(requested)
+            if not isinstance(requested, str) and requested != value:
+                raise ValueError("fractional max_tokens is invalid")
+    except (TypeError, ValueError, OverflowError):
+        correlation_id = _active_correlation_id()
+        logger.warning(
+            "Ignoring invalid max_tokens=%r for model %r",
+            requested,
+            model,
+            extra={"extra_data": {"correlation_id": correlation_id}}
+            if correlation_id
+            else {},
+        )
+        value = _DEFAULT_MAX_TOKENS
+    if not model or value <= 0:
+        return value
+    try:
+        from praisonaiagents.llm.model_capabilities import max_output_tokens
+
+        ceiling = max_output_tokens(model)
+    except Exception:
+        ceiling = None
+    if not ceiling or ceiling <= 0:
+        return value
+    if value > ceiling:
+        if requested is not None:
+            correlation_id = _active_correlation_id()
+            logger.warning(
+                "max_tokens=%s exceeds %s's output limit (%s); clamping to %s",
+                value, model, ceiling, ceiling,
+                extra={"extra_data": {"correlation_id": correlation_id}}
+                if correlation_id
+                else {},
+            )
+        return ceiling
+    # An omitted YAML budget follows the model's full known ceiling, including
+    # ceilings above the historical 16k default.
+    return ceiling if requested is None else value
+
+
+def _build_agent_llm_spec(
+    raw_llm_spec: Any,
+    model: str,
+    max_tokens: Optional[int],
+) -> Dict[str, Any]:
+    """Overlay resolved model/budget fields without dropping YAML options."""
+    spec = dict(raw_llm_spec) if isinstance(raw_llm_spec, dict) else {}
+    spec["model"] = model
+    spec["max_tokens"] = max_tokens
+    return spec
+
+
+def _requested_output_budget(
+    details: Dict[str, Any], cli_config: Optional[Dict[str, Any]] = None
+) -> Any:
+    """Select the raw per-agent budget before model-ceiling resolution.
+
+    An explicit CLI value wins over YAML. When the CLI option is omitted,
+    preserve the agent-level value and then a nested ``llm.max_tokens`` value;
+    the latter must not be mistaken for an omitted budget and overwritten by
+    the model ceiling. Older callers may pass the parser's historical 16k
+    default without an explicitness marker, so that value is treated as an
+    omission when a YAML value is available.
+    """
+    details = details or {}
+    cli = cli_config or {}
+    marker = cli.get("_max_tokens_explicit")
+    cli_value = cli.get("max_tokens")
+    if marker is None:
+        marker = (
+            "max_tokens" in cli
+            and cli_value is not None
+            and cli_value != _DEFAULT_MAX_TOKENS
+        )
+    if marker:
+        return cli_value
+
+    agent_value = details.get("max_tokens")
+    if agent_value is not None:
+        return agent_value
+    llm_spec = details.get("llm")
+    if isinstance(llm_spec, dict):
+        return llm_spec.get("max_tokens")
+    return None
 
 
 class PraisonAIAdapter(BaseFrameworkAdapter):
@@ -40,6 +160,7 @@ class PraisonAIAdapter(BaseFrameworkAdapter):
     SUPPORTS_RUNTIME_FEATURES = True
     SUPPORTS_SESSION_CONTINUITY = True
     SUPPORTS_STREAM_BRIDGE = True
+    SUPPORTS_CORE_TOOL_TIMEOUT = True
 
     @property
     def name(self) -> str:
@@ -124,25 +245,25 @@ class PraisonAIAdapter(BaseFrameworkAdapter):
                 if isinstance(model_config, dict) and 'runtime' in model_config:
                     return model_config['runtime']
         
-        # 4. Check provider-scoped runtime
+        # 4. Check provider-scoped runtime. Provider inference is data-driven
+        # and entry-point-extensible (core SDK), so any declared vendor —
+        # groq, deepseek, mistral, cohere, ... — resolves, not just three.
         if agent_model and 'providers' in config:
-            # Extract provider from model name
-            provider = None
-            if '/' in agent_model:
-                provider = agent_model.split('/')[0]
-            elif 'claude' in agent_model.lower():
-                provider = 'anthropic'
-            elif 'gpt' in agent_model.lower():
-                provider = 'openai'
-            elif 'gemini' in agent_model.lower():
-                provider = 'google'
-            
+            from praisonaiagents.llm.model_providers import resolve_provider
+
+            provider = resolve_provider(agent_model)
             if provider:
                 providers_config = config['providers']
                 if isinstance(providers_config, dict) and provider in providers_config:
                     provider_config = providers_config[provider]
                     if isinstance(provider_config, dict) and 'runtime_default' in provider_config:
                         return provider_config['runtime_default']
+            else:
+                logger.debug(
+                    "runtime resolution: no provider registered for model %r; "
+                    "provider-scoped 'runtime_default' not consulted",
+                    agent_model,
+                )
         
         # 5. Check global config
         global_config = config.get('config', {})
@@ -178,15 +299,18 @@ class PraisonAIAdapter(BaseFrameworkAdapter):
                 # Check if permissions are specified inline
                 permissions = approval_config.get('permissions')
                 if permissions:
-                    # Create backend with permissions
-                    backend = InteractiveCLIApprovalBackend(
-                        permissions_config=permissions
-                    )
-                    return ApprovalConfig(
-                        backend=backend,
-                        all_tools=approval_config.get('all_tools', False),
-                        timeout=approval_config.get('timeout', 0),
-                        permissions=permissions,
+                    from praisonai_code.cli.features._approval_bridge import resolve_approval_config
+
+                    # Use the same backend/mode precedence as direct CLI runs.
+                    return resolve_approval_config(
+                        approval_config.get('backend') or 'console',
+                        all_tools=approval_config.get('all_tools', approval_config.get('approve_all_tools', False)),
+                        timeout=(
+                            'none'
+                            if 'timeout' in approval_config and approval_config['timeout'] is None
+                            else approval_config.get('timeout')
+                        ),
+                        permissions_config=permissions,
                     )
                 # Otherwise map the wrapper approval dict onto the core
                 # ApprovalConfig fields. The wrapper spec carries extra keys
@@ -316,15 +440,24 @@ class PraisonAIAdapter(BaseFrameworkAdapter):
             logger.warning(f"InteractiveRuntime startup failed: {e}")
             return None
 
-    def _maybe_inject_centric_tools(self, interactive_runtime, tools_dict):
-        """Inject agent-centric tools if runtime is available."""
+    def _maybe_inject_centric_tools(self, interactive_runtime, tools_dict, *, wrap=None):
+        """Inject agent-centric tools, honouring the caller's timeout wrap.
+
+        The generator's ``_build_tools_dict`` wraps every YAML-declared tool with
+        the per-run ``tool_timeout`` guard, but the ACP/LSP centric tools are
+        added here — *after* that wrap — so without applying the same ``wrap``
+        they would silently bypass the timeout (an LSP/ACP call could then hang
+        forever). ``wrap`` is threaded through ``cli_config`` by the generator.
+        """
         if interactive_runtime is None:
             return tools_dict or {}
-            
+
         try:
             from praisonai.cli.features.agent_tools import create_agent_centric_tools
             centric_tools = create_agent_centric_tools(interactive_runtime)
             logger.info(f"Loaded {len(centric_tools)} InteractiveRuntime tools")
+            if callable(wrap):
+                centric_tools = {name: wrap(tool) for name, tool in centric_tools.items()}
             return {**(tools_dict or {}), **centric_tools}
         except Exception as e:
             logger.warning(f"Failed to inject agent-centric tools: {e}")
@@ -336,7 +469,17 @@ class PraisonAIAdapter(BaseFrameworkAdapter):
             return llm_config[0]['model']
         return "gpt-4o-mini"
 
-    def _build_agents_and_tasks(self, config, topic, tools_dict, agent_callback, task_callback, model_name):
+    def _build_agents_and_tasks(
+        self,
+        config,
+        topic,
+        tools_dict,
+        agent_callback,
+        task_callback,
+        model_name,
+        agent_tool_wrap_resolver=None,
+        cli_config: Optional[Dict[str, Any]] = None,
+    ):
         """Build agents and tasks from configuration."""
         from praisonaiagents import Agent as PraisonAgent, Task as PraisonTask
         from ._config_builder import build_agent_specs
@@ -344,8 +487,14 @@ class PraisonAIAdapter(BaseFrameworkAdapter):
         agents = {}
         tasks = []
 
-        # Single canonical YAML -> spec conversion (shared across adapters)
-        specs = build_agent_specs(config, topic, tools_dict, self._format_template)
+        # Single canonical YAML -> spec conversion (shared across adapters).
+        # The optional per-agent tool_timeout wrap resolver (threaded from the
+        # generator via cli_config) is applied inside build_agent_specs so each
+        # agent's tools carry that agent's own budget instead of a shared one.
+        specs = build_agent_specs(
+            config, topic, tools_dict, self._format_template,
+            agent_tool_wrap_resolver=agent_tool_wrap_resolver,
+        )
 
         # Process agents from the normalized specs
         for spec in specs:
@@ -363,6 +512,15 @@ class PraisonAIAdapter(BaseFrameworkAdapter):
             
             # Resolve per-agent LLM model
             agent_model = self._resolve_agent_model(details, model_name)
+
+            # CLI max_tokens is an explicit global override when present;
+            # otherwise honour each YAML agent's own value (including a nested
+            # ``llm.max_tokens``) and resolve an omitted value from that
+            # agent's model ceiling.
+            requested_max_tokens = _requested_output_budget(details, cli_config)
+            resolved_max_tokens = _resolve_output_budget(
+                agent_model, requested_max_tokens
+            )
             
             # Resolve per-agent runtime configuration
             agent_runtime = self._resolve_agent_runtime(details, config)
@@ -370,6 +528,14 @@ class PraisonAIAdapter(BaseFrameworkAdapter):
             # Resolve approval configuration
             agent_approval = self._resolve_agent_approval(details, config)
             
+            # Preserve the complete YAML LLM mapping (endpoint, credentials,
+            # sampling, retries, and provider-specific options) while adding
+            # the resolved model/budget fields. Rebuilding from only ``model``
+            # silently discarded those settings.
+            agent_llm = _build_agent_llm_spec(
+                details.get('llm'), agent_model, resolved_max_tokens
+            )
+
             # Create basic agent (pass both tools and toolsets)
             agent_kwargs = {
                 'name': role_filled,
@@ -377,7 +543,7 @@ class PraisonAIAdapter(BaseFrameworkAdapter):
                 'goal': goal_filled,
                 'backstory': backstory_filled,
                 'instructions': details.get('instructions'),
-                'llm': agent_model,
+                'llm': agent_llm,
                 'allow_delegation': details.get('allow_delegation', False),
                 'tools': agent_tool_list,
                 'toolsets': agent_toolsets,
@@ -435,7 +601,37 @@ class PraisonAIAdapter(BaseFrameworkAdapter):
             # Add approval config if present
             if agent_approval:
                 agent_kwargs['approval'] = agent_approval
-            
+
+            # Forward the resolved per-agent tool_timeout to core so native
+            # tools are enforced by core's own per-tool timeout (#5650) instead
+            # of a duplicate wrapper-side executor. The generator exposes the
+            # resolved budget only on the native framework; framework tool
+            # objects keep wrapper-side wrapping. A user-supplied tool_config in
+            # YAML (details['llm'] etc.) is not overridden here — this only
+            # fills the timeout the wrapper would otherwise have enforced.
+            native_timeout_resolver = (cli_config or {}).get(
+                "_native_tool_timeout_resolver"
+            )
+            if callable(native_timeout_resolver) and 'tool_config' not in agent_kwargs:
+                budget = native_timeout_resolver(role)
+                if isinstance(budget, (int, float)) and not isinstance(budget, bool) and budget > 0:
+                    try:
+                        from praisonaiagents.config.feature_configs import ToolConfig
+                        # Preserve the resolved budget as-is (float seconds).
+                        # Core consumes ToolConfig.timeout directly as seconds in
+                        # both the sync (future.result(timeout=...)) and async
+                        # (asyncio.wait_for(timeout=...)) paths, so fractional
+                        # budgets survive. Rounding to int would collapse a
+                        # subsecond budget (e.g. 0.4 -> 0), and core treats a
+                        # non-positive timeout as "no timeout" — silently dropping
+                        # enforcement for native callables that are now unwrapped.
+                        agent_kwargs['tool_config'] = ToolConfig(timeout=budget)
+                    except Exception as _tc_err:
+                        logger.warning(
+                            "Could not set core tool_config timeout for agent %r: %s",
+                            role_filled, _tc_err,
+                        )
+
             agent = PraisonAgent(**agent_kwargs)
             
             if agent_callback:
@@ -466,6 +662,10 @@ class PraisonAIAdapter(BaseFrameworkAdapter):
                     # consistently with the CrewAI adapter.
                     if task_spec.tools:
                         task_kwargs['tools'] = task_spec.tools
+                    output_file = task_spec.extras.get('output_file')
+                    if output_file:
+                        task_kwargs['output_file'] = output_file
+                        task_kwargs['create_directory'] = bool(os.path.dirname(output_file))
                     task = PraisonTask(**task_kwargs)
                     
                     if task_callback:
@@ -750,12 +950,22 @@ class PraisonAIAdapter(BaseFrameworkAdapter):
             # Initialize InteractiveRuntime for ACP/LSP if enabled
             interactive_runtime = await self._astart_interactive_runtime(config)
 
-            # Inject agent-centric tools if runtime is available
-            tools_dict = self._maybe_inject_centric_tools(interactive_runtime, tools_dict)
+            # Inject agent-centric tools if runtime is available. Thread the
+            # generator's per-run tool_timeout wrap (stashed in cli_config) so the
+            # injected ACP/LSP tools carry the same timeout guard as YAML tools.
+            wrap = (cli_config or {}).get("_tool_timeout_wrap")
+            tools_dict = self._maybe_inject_centric_tools(
+                interactive_runtime, tools_dict, wrap=wrap
+            )
 
-            # Build agents and tasks from config
+            # Build agents and tasks from config. Thread the per-agent
+            # tool_timeout wrap resolver (heterogeneous budgets) from cli_config
+            # so each agent's tools carry its own timeout, not a shared one.
+            agent_tool_wrap_resolver = (cli_config or {}).get("_agent_tool_wrap_resolver")
             agents, tasks = self._build_agents_and_tasks(
-                config, topic, tools_dict, agent_callback, task_callback, model_name
+                config, topic, tools_dict, agent_callback, task_callback, model_name,
+                agent_tool_wrap_resolver=agent_tool_wrap_resolver,
+                cli_config=cli_config,
             )
 
             # Resolve CLI session continuity (--continue/--session/--fork) that the
@@ -788,6 +998,14 @@ class PraisonAIAdapter(BaseFrameworkAdapter):
             # Best-effort and a no-op outside stream-json (the bridge guards on
             # its own `active`), so serve/jobs and non-CLI callers are unaffected.
             bridge, _ = self._attach_stream_bridge(team)
+            cli = cli_config or {}
+            want_metrics = cli.get('metrics') or cli.get('metrics_json')
+            metrics = None
+            if want_metrics:
+                from . import _run_metrics
+                metrics = _run_metrics.RunMetrics(team)
+            # Only --trust runs check output_file writes; skip the read-back otherwise.
+            written = self._track_output_files(team) if cli.get('trust') else set()
             try:
                 # Use native async path
                 response = await team.astart()
@@ -804,9 +1022,15 @@ class PraisonAIAdapter(BaseFrameworkAdapter):
                 raise
             finally:
                 self._detach_stream_bridge(team, bridge)
+                if metrics is not None:
+                    metrics.close()
             result = f"### PraisonAI Output ###\n{response}" if response else "### PraisonAI Output ###\nTask completed."
+            failure = self._run_failure(response, tasks, written, check_files=cli.get('trust'))
             if bridge is not None:
-                bridge.emit_run_result(response, ok=True)
+                if failure:
+                    bridge.emit_run_error(failure)
+                else:
+                    bridge.emit_run_result(response, ok=True)
 
             # Persist team state after kickoff so the run can be resumed later
             # (respects --no-save, which leaves auto_save unset).
@@ -821,6 +1045,18 @@ class PraisonAIAdapter(BaseFrameworkAdapter):
                 except Exception as e:  # never fail a completed run on save
                     logger.warning(f"Failed to save session state '{auto_save}': {e}")
 
+            if metrics is not None:
+                report = metrics.report(model_name)
+                if cli.get('metrics'):
+                    _run_metrics.print_table(report)
+                if cli.get('metrics_json'):
+                    _run_metrics.print_json(report)
+
+            if failure:
+                # Surface failed runs as errors so the CLI exits non-zero
+                # instead of printing the status dict and exiting 0.
+                raise RuntimeError(failure)
+
             logger.info("PraisonAI async execution completed")
             return result
         finally:
@@ -832,6 +1068,61 @@ class PraisonAIAdapter(BaseFrameworkAdapter):
                 except Exception as e:
                     logger.error(f"Error stopping InteractiveRuntime: {e}")
     
+    @staticmethod
+    def _track_output_files(team) -> set:
+        """Record the ``output_file`` paths core actually wrote during this run.
+
+        Core's ``save_output_to_file`` only logs write errors, so wrap it on the
+        instance and verify the file now holds this run's output. A stale file
+        from an earlier run therefore never passes as written.
+        """
+        written: set = set()
+        original = team.save_output_to_file
+
+        def save_output_to_file(task, task_output):
+            original(task, task_output)
+            path = getattr(task, 'output_file', None)
+            if not path:
+                return
+            # Read without newline translation: core writes in text mode, so
+            # only os.linesep translation may differ from str(task_output).
+            expected = str(task_output)
+            try:
+                with open(path, newline='') as f:
+                    if f.read() in (expected, expected.replace('\n', os.linesep)):
+                        written.add(path)
+            except OSError:
+                pass
+
+        team.save_output_to_file = save_output_to_file
+        return written
+
+    @staticmethod
+    def _run_failure(response, tasks, written, *, check_files=False) -> Optional[str]:
+        """Return an error message when the team run failed, else ``None``.
+
+        A task counts as failed when its final status is ``failed`` — this
+        holds even when ``AgentTeam.astart`` returns a later task's text rather
+        than its status dict. With ``check_files`` (headless ``--trust`` runs)
+        a declared ``output_file`` not written this run also counts, since core
+        only logs that write error.
+        """
+        statuses = [getattr(t, 'status', None) for t in tasks]
+        if isinstance(response, dict):
+            statuses = list((response.get('task_status') or {}).values()) or statuses
+        failed = statuses.count('failed')
+        if failed:
+            return f"{failed} of {len(statuses)} task(s) failed"
+        if check_files:
+            # Only completed tasks: skipped workflow branches never write.
+            missing = [
+                t.output_file for t in tasks
+                if t.output_file and t.status == 'completed' and t.output_file not in written
+            ]
+            if missing:
+                return f"output_file not written: {', '.join(missing)}"
+        return None
+
     @staticmethod
     def _attach_stream_bridge(team):
         """Attach the CLI stream-json bridge to a team's aggregate emitter.

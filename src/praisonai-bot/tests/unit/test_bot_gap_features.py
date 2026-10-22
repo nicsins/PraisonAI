@@ -197,6 +197,79 @@ class TestIsConflictError:
         assert is_conflict_error(ValueError("something")) is False
 
 
+class TestTelegramConflictClassification:
+    """Single-instance 409 detection on the real polling path (Issue #5094).
+
+    A standalone getUpdates pre-flight probe is NOT used: the probe would be a
+    competing consumer that terminates the incumbent poller (incumbent gets the
+    409, probe gets 200). Instead the real start_polling() 409 is classified by
+    ``is_conflict_error`` and start() fails fast.
+    """
+
+    def test_ptb_conflict_status_code(self):
+        from praisonai_bot.bots._resilience import is_conflict_error
+
+        class _Conflict(Exception):
+            error_code = 409
+
+        assert is_conflict_error(_Conflict("Conflict")) is True
+
+    def test_ptb_conflict_message(self):
+        from praisonai_bot.bots._resilience import is_conflict_error
+        err = Exception(
+            "Conflict: terminated by other getUpdates request; make sure that "
+            "only one bot instance is running"
+        )
+        assert is_conflict_error(err) is True
+
+    def test_409_conflict_text(self):
+        from praisonai_bot.bots._resilience import is_conflict_error
+        assert is_conflict_error(Exception("409 Conflict")) is True
+
+    def test_non_conflict_not_flagged(self):
+        from praisonai_bot.bots._resilience import is_conflict_error
+        assert is_conflict_error(ValueError("network timeout")) is False
+
+
+class TestTelegramStartFailsFastOnConflict:
+    """start()'s polling loop must fail fast (raise) on a confirmed 409.
+
+    ``python-telegram-bot`` is an optional dependency and is not installed in
+    the base unit-test environment, so the polling loop (embedded in ``start()``)
+    is verified structurally via source inspection — the same pattern used by
+    ``test_bot_wiring.py``. This guarantees no regression silently swallows the
+    single-instance conflict.
+    """
+
+    def _start_source(self):
+        import inspect
+        from praisonai_bot.bots.telegram import TelegramBot
+        return inspect.getsource(TelegramBot.start)
+
+    def test_no_standalone_preflight_probe(self):
+        """The harmful getUpdates pre-flight probe must be gone: the probe is a
+        competing consumer that terminates the incumbent poller."""
+        src = self._start_source()
+        assert "detect_telegram_poll_conflict" not in src
+
+    def test_conflict_captured_from_real_polling(self):
+        src = self._start_source()
+        assert "is_conflict_error(e)" in src
+        assert "poll_conflict = str(e)" in src
+
+    def test_conflict_reraises_runtimeerror(self):
+        """A confirmed conflict must raise (fail fast) so supervisors mark
+        startup as failed — never silently break/return."""
+        src = self._start_source()
+        assert "if poll_conflict is not None:" in src
+        assert "raise RuntimeError(" in src
+        assert "only one instance per token" in src
+
+    def test_helper_removed_from_resilience(self):
+        import praisonai_bot.bots._resilience as resil
+        assert not hasattr(resil, "detect_telegram_poll_conflict")
+
+
 class TestConnectionMonitor:
     def test_record_success_resets(self):
         from praisonai_bot.bots._resilience import ConnectionMonitor
@@ -543,6 +616,42 @@ class TestDaemonService:
         # Only relaunch on failure/crash, never on a clean exit (not <true/>).
         assert "<key>SuccessfulExit</key>" in plist
         assert "<key>KeepAlive</key>\n    <true/>" not in plist
+
+    def test_service_stop_deadline_covers_configured_drain(self, tmp_path):
+        # Issue #5815: the supervisor's stop deadline must cover the gateway's
+        # drain budget, and only the gateway gets the first signal.
+        from praisonai_bot.daemon import stop_timeout_seconds
+        from praisonai_bot.daemon.launchd import _generate_plist
+        from praisonai_bot.daemon.systemd import _generate_unit
+
+        cfg = tmp_path / "bot.yaml"
+        cfg.write_text("gateway:\n  drain_timeout: 120\n  watchdog:\n    shutdown_grace: 8\n")
+        deadline = stop_timeout_seconds(str(cfg))
+        assert deadline > 2 * 120 + 8
+        unit = _generate_unit(str(cfg))
+        assert f"TimeoutStopSec={deadline}" in unit
+        assert "KillMode=mixed" in unit
+        plist = _generate_plist(str(cfg))
+        assert f"<key>ExitTimeOut</key>\n    <integer>{deadline}</integer>" in plist
+        # Missing config still yields a deadline covering the production drain.
+        assert stop_timeout_seconds(str(tmp_path / "missing.yaml")) >= 30
+
+    def test_service_stop_deadline_resolves_env_file_vars(self, tmp_path, monkeypatch):
+        # ``${VAR}`` drain values resolve from ~/.praisonai/.env exactly as the
+        # gateway does at start, so the deadline isn't sized from the default.
+        import os
+        from praisonai_bot.daemon import stop_timeout_seconds
+
+        env_file = tmp_path / ".env"
+        env_file.write_text("PRAISONAI_TEST_DRAIN_5815=120\n")
+        monkeypatch.setenv("PRAISONAI_ENV_FILE", str(env_file))
+        monkeypatch.delenv("PRAISONAI_TEST_DRAIN_5815", raising=False)
+        cfg = tmp_path / "bot.yaml"
+        cfg.write_text('gateway:\n  drain_timeout: "${PRAISONAI_TEST_DRAIN_5815}"\n')
+        try:
+            assert stop_timeout_seconds(str(cfg)) > 2 * 120 + 5
+        finally:
+            os.environ.pop("PRAISONAI_TEST_DRAIN_5815", None)
 
     def test_windows_startup_script_honours_fatal_config_exit(self):
         from praisonai_bot.daemon.windows import _generate_startup_script

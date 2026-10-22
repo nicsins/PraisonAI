@@ -5,6 +5,7 @@ Provides commands for starting messaging bots with full agent capabilities.
 Inspired by moltbot's comprehensive CLI options.
 """
 
+from types import SimpleNamespace
 from typing import List, Optional
 
 import typer
@@ -47,6 +48,9 @@ def _build_capabilities(
     stt_model: Optional[str] = None,
     stream: bool = False,
     stream_edit_interval: int = 700,
+    group_policy: str = "mention_only",
+    allow_silence: bool = False,
+    silence_token: Optional[str] = None,
     session_id: Optional[str] = None,
     user_id: Optional[str] = None,
 ) -> "BotCapabilities":
@@ -83,6 +87,9 @@ def _build_capabilities(
         stt_model=stt_model,
         stream=stream,
         stream_edit_interval=stream_edit_interval,
+        group_policy=group_policy,
+        allow_silence=allow_silence,
+        silence_token=silence_token,
         session_id=session_id,
         user_id=user_id,
     )
@@ -114,6 +121,137 @@ def bot_start(
     resolved = resolve_bot_config_path(config)
     handler = BotHandler()
     handler.start_from_config(resolved)
+
+
+def _channel_field_kwargs(platform: str, args: List[str]) -> dict:
+    """Map ``--field-name value`` flags onto the channel's declared fields.
+
+    Gives ``bot run`` the CLI leg of a plugin channel's ``config_fields`` (the
+    same fields YAML and the onboarding wizard already accept). Only fields
+    the channel's ``ChannelDescriptor`` declares are accepted; anything else
+    fails loudly instead of being silently ignored.
+    """
+    if not args:
+        return {}
+    from praisonai_bot.bots._registry import get_platform_descriptor
+
+    descriptor = get_platform_descriptor(platform)
+    declared = [
+        name for spec in (getattr(descriptor, "config_fields", None) or [])
+        if (name := getattr(spec, "name", None))
+    ]
+    flags = {f"--{name.replace('_', '-')}": name for name in declared}
+    hint = ", ".join(sorted(flags)) or "none"
+
+    values: dict = {}
+    i = 0
+    while i < len(args):
+        flag, sep, value = args[i].partition("=")
+        if flag not in flags:
+            raise typer.BadParameter(
+                f"Unknown option '{flag}' for platform '{platform}'. "
+                f"Channel fields: {hint}"
+            )
+        if not sep:
+            if i + 1 >= len(args) or args[i + 1].startswith("--"):
+                raise typer.BadParameter(f"Option '{flag}' requires a value")
+            i += 1
+            value = args[i]
+        values[flags[flag]] = value
+        i += 1
+    return values
+
+
+@app.command(
+    "run",
+    context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
+)
+def bot_run(
+    ctx: typer.Context,
+    platform: str = typer.Option(..., "--platform", "-P", help="Registered channel platform to run"),
+    token: Optional[str] = typer.Option(None, "--token", "-t", help="Channel token (falls back to the platform's own env var)"),
+    port: Optional[int] = typer.Option(None, "--port", "-p", help="Inbound port for webhook-style channels"),
+    agent: Optional[str] = typer.Option(None, "--agent", "-a", help="Agent YAML configuration file"),
+    model: Optional[str] = typer.Option(None, "--model", "-m", help="LLM model to use"),
+    browser: bool = typer.Option(False, "--browser", help="Enable browser control"),
+    browser_profile: str = typer.Option("default", "--browser-profile", help="Browser profile name"),
+    browser_headless: bool = typer.Option(False, "--browser-headless", help="Run browser headless"),
+    tools: Optional[List[str]] = typer.Option(None, "--tools", help="Tools to enable"),
+    skills: Optional[List[str]] = typer.Option(None, "--skills", help="Skills to enable"),
+    skills_dir: Optional[str] = typer.Option(None, "--skills-dir", help="Custom skills directory"),
+    memory: bool = typer.Option(False, "--memory", help="Enable memory"),
+    memory_provider: str = typer.Option("default", "--memory-provider", help="Memory provider"),
+    knowledge: bool = typer.Option(False, "--knowledge", help="Enable knowledge/RAG"),
+    knowledge_sources: Optional[List[str]] = typer.Option(None, "--knowledge-sources", help="Knowledge sources"),
+    web_search: bool = typer.Option(False, "--web", "--web-search", help="Enable web search"),
+    web_provider: str = typer.Option("duckduckgo", "--web-provider", help="Web search provider"),
+    sandbox: bool = typer.Option(False, "--sandbox", help="Enable sandbox mode"),
+    exec_enabled: bool = typer.Option(False, "--exec", help="Enable exec tool"),
+    auto_approve: bool = typer.Option(False, "--auto-approve", help="Auto-approve all tool executions"),
+    group_policy: str = typer.Option("mention_only", "--group-policy", help="Group behaviour: respond_all, mention_only, command_only"),
+    session_id: Optional[str] = typer.Option(None, "--session-id", help="Session ID"),
+    user_id: Optional[str] = typer.Option(None, "--user-id", help="User ID for memory isolation"),
+    thinking: Optional[str] = typer.Option(None, "--thinking", help="Thinking mode (off, minimal, low, medium, high)"),
+):
+    """Start any registered channel by name — including ones with no verb of their own.
+
+    ``praisonai bot <platform>`` covers the seven platforms with hand-written
+    commands. The registry also carries ``signal``, ``webhook`` and ``local``
+    (adapters shipped, no verb) plus every entry-point and drop-in plugin
+    channel — previously reachable only through ``bot start`` YAML. This is
+    their first-class verb.
+
+    Each field the channel declares in its ``config_fields`` is accepted as
+    ``--field-name value`` (e.g. ``bridge_url`` -> ``--bridge-url``).
+
+    Examples:
+        praisonai bot run --platform local
+        praisonai bot run --platform signal --account +15551234567 --agent agents.yaml
+        praisonai bot run --platform webhook --port 8080
+        praisonai bot run --platform irc --server irc.libera.chat --nickserv-password $NICK_PW
+    """
+    from ..features.bots_cli import BotHandler
+
+    channel_fields = _channel_field_kwargs(platform.lower().strip(), ctx.args)
+
+    capabilities = _build_capabilities(
+        model=model,
+        browser=browser,
+        browser_profile=browser_profile,
+        browser_headless=browser_headless,
+        tools=tools,
+        skills=skills,
+        skills_dir=skills_dir,
+        memory=memory,
+        memory_provider=memory_provider,
+        knowledge=knowledge,
+        knowledge_sources=knowledge_sources,
+        web_search=web_search,
+        web_provider=web_provider,
+        sandbox=sandbox,
+        exec_enabled=exec_enabled,
+        auto_approve=auto_approve,
+        group_policy=group_policy,
+        session_id=session_id,
+        user_id=user_id,
+        thinking=thinking,
+    )
+
+    extra = {} if port is None else {"webhook_port": port}
+    # Route the fields through the same ``channel.model_extra`` path a YAML
+    # channel uses, so a field named like a ``start_generic`` parameter (e.g.
+    # an IRC plugin's ``channel``) still reaches the adapter instead of
+    # colliding with it.
+    channel = SimpleNamespace(model_extra=channel_fields) if channel_fields else None
+    handler = BotHandler()
+    handler.start_generic(
+        platform=platform,
+        token=token,
+        agent_file=agent,
+        capabilities=capabilities,
+        channel=channel,
+        **extra,
+    )
 
 
 @app.command("telegram")

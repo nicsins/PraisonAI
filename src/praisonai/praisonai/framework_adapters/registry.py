@@ -12,11 +12,18 @@ from typing import Type, Optional
 import inspect
 import logging
 import threading
+import time
 
 from .base import FrameworkAdapter
 from .._registry import PluginRegistry
 
 logger = logging.getLogger(__name__)
+
+# Cool-down for transient availability-probe failures. A durable "not installed"
+# result is cached for the whole process, but a probe that raises for a transient
+# reason (racing entry-point scan, network healthcheck timeout at boot, config
+# write in flight) is only cached this long before the next call reprobes.
+_NEG_CACHE_TTL = 60.0
 
 
 def _praisonai_loader():
@@ -60,8 +67,14 @@ class FrameworkAdapterRegistry(PluginRegistry[FrameworkAdapter]):
         # in tests), and protocol validation runs once per adapter class rather
         # than on every create()/run()/arun(). Both are guarded by a lock so
         # multi-tenant/threaded callers don't race.
-        self._avail_cache: dict[str, bool] = {}
+        # Value is (available, transient_ts): transient_ts is None for positive
+        # results and structural failures (cached for the process lifetime) and
+        # a monotonic timestamp for transient (ImportError) negatives, which
+        # expire after _avail_retry_cooldown so a mid-life `pip install` of an
+        # optional framework dep is picked up without a restart.
+        self._avail_cache: dict[str, tuple[bool, Optional[float]]] = {}
         self._avail_lock = threading.Lock()
+        self._avail_retry_cooldown: float = 30.0
         self._validated_classes: set[type] = set()
         # Capability probes (SUPPORTS_WORKFLOW / SUPPORTS_RUNTIME_FEATURES / ...)
         # are memoised PER REGISTRY, not process-globally: two registries can
@@ -109,7 +122,29 @@ class FrameworkAdapterRegistry(PluginRegistry[FrameworkAdapter]):
             "No supported framework installed. Available adapters: "
             f"{self.list_all_names()}"
         )
-    
+
+    def resolve_or_default(self, name: Optional[str]) -> str:
+        """Resolve an explicit framework name, or fall back to the default.
+
+        Single source of truth for the ``name or 'praisonai'`` fallbacks that
+        were previously scattered across the wrapper (agents_generator, jobs,
+        scheduler, workflow_framework). Callers pass whatever the user gave —
+        typically ``self.framework or config.get('framework')`` — and get back
+        either that name (stripped) or the registry-selected default.
+
+        When ``pick_default()`` cannot resolve (no adapter installed), fall back
+        to ``DEFAULT_PRIORITY[0]`` so downstream availability validation can
+        raise its own actionable error instead of this helper masking it.
+        """
+        if name:
+            resolved = str(name).strip()
+            if resolved:
+                return resolved
+        try:
+            return self.pick_default()
+        except RuntimeError:
+            return self.DEFAULT_PRIORITY[0]
+
     def _validate_adapter(self, name: str, adapter) -> None:
         """Validate that adapter implements the required protocol signature.
 
@@ -126,37 +161,63 @@ class FrameworkAdapterRegistry(PluginRegistry[FrameworkAdapter]):
 
         _REQUIRED_KW = {"tools_dict", "agent_callback", "task_callback", "cli_config"}
 
-        def _accepts_required(fn) -> Optional[str]:
+        def _inspect(fn):
+            """Return (error_or_None, unnamed_required_when_only_var_kwargs)."""
             params = inspect.signature(fn).parameters.values()
-            # A **kwargs catch-all accepts every required keyword by definition,
-            # so entry-point plugins that forward **kwargs to a delegate (the
-            # advertised extension surface) validate instead of being silently
-            # dropped from pick_default()/list_available_frameworks().
-            if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params):
-                return None
             named = {
                 p.name for p in params
                 if p.kind in (inspect.Parameter.KEYWORD_ONLY,
                               inspect.Parameter.POSITIONAL_OR_KEYWORD)
             }
+            has_var_kwargs = any(
+                p.kind == inspect.Parameter.VAR_KEYWORD for p in params
+            )
             missing = _REQUIRED_KW - named
-            return f"missing keyword parameters {sorted(missing)}" if missing else None
+            # A **kwargs catch-all accepts every required keyword by definition,
+            # so entry-point plugins that forward **kwargs to a delegate (the
+            # advertised extension surface) still validate. But a signature that
+            # names NONE of the required kwargs and relies solely on **kwargs can
+            # silently discard tool_timeout wraps, callbacks and cli_config
+            # safety knobs — surface that instead of failing silently.
+            if missing and not has_var_kwargs:
+                return f"missing keyword parameters {sorted(missing)}", None
+            unnamed = missing if (missing and has_var_kwargs) else None
+            return None, unnamed
 
         for method_name in ("run", "arun"):
             fn = getattr(cls, method_name, None)
             if fn is None:
                 continue  # arun is optional; sync-only adapters keep working
-            err = _accepts_required(fn)
+            err, unnamed = _inspect(fn)
             if err:
                 raise TypeError(
                     f"FrameworkAdapter {name!r}.{method_name} does not implement "
                     f"the protocol: {err}"
                 )
+            if unnamed:
+                logger.warning(
+                    "FrameworkAdapter %r.%s names none of the adapter kwargs %s "
+                    "explicitly and relies on **kwargs; if these are not "
+                    "forwarded, their safety guarantees (tool_timeout, "
+                    "callbacks, approval/guardrails via cli_config) will be "
+                    "silently dropped.",
+                    name, method_name, sorted(unnamed),
+                )
         self._validated_classes.add(cls)
 
     def create(self, name: str, *args, **kwargs):
-        """Create an adapter instance with protocol validation."""
+        """Create an adapter instance with protocol validation.
+
+        Post-attaches this registry onto the created adapter so router adapters
+        (e.g. the AutoGen family router) resolve concrete variants through the
+        *owning* registry rather than reaching into the process-default one,
+        honouring the ``adapter_registry`` DI seam for multi-tenant/test setups.
+        """
         adapter = super().create(name, *args, **kwargs)
+        try:
+            adapter._owning_registry = self
+        except AttributeError:
+            pass  # frozen/slotted adapters keep the default-registry fallback
         self._validate_adapter(name, adapter)
         return adapter
 
@@ -197,26 +258,71 @@ class FrameworkAdapterRegistry(PluginRegistry[FrameworkAdapter]):
         # is_available("CrewAI") and invalidate_availability("crewai") would key
         # different cache entries, leaving the documented escape hatch inert.
         key = name.lower()
+        now = time.monotonic()
         with self._avail_lock:
             cached = self._avail_cache.get(key)
-        if cached is not None:
-            return cached
+            if cached is not None:
+                ok, ts = cached
+                # A cached negative caused by a *transient* failure (a missing
+                # optional dep the operator may `pip install` mid-life) expires
+                # after a cool-down so long-lived hosts (`praisonai serve`)
+                # recover without a restart. Positive results and structural
+                # negatives are memoised for the process lifetime.
+                if ok or ts is None or (now - ts) < self._avail_retry_cooldown:
+                    return ok
+
+        # About to (re-)probe a transient negative. Built-in adapters delegate to
+        # the process-global ``_framework_availability`` memo, which caches a
+        # missing dep's ``False`` permanently — so without dropping it here the
+        # re-probe would keep reading the stale ``False`` and a mid-life
+        # ``pip install`` would never be observed. Best-effort: never let a
+        # missing/renamed helper break availability checking.
+        try:
+            from .._framework_availability import invalidate as _invalidate_availability
+            _invalidate_availability(key)
+        except Exception:  # noqa: BLE001 -- availability recovery must not crash the probe
+            pass
 
         try:
             adapter = self.create(name)
-            # ImportError covers ModuleNotFoundError raised when an adapter's
-            # constructor touches a missing optional dependency; treat the
-            # framework as simply unavailable rather than leaking a raw import
-            # error to callers (CLI validation, doctor checks, pick_default).
             ok = bool(adapter.is_available())
-        except (ValueError, TypeError, ImportError):
+            # A NEGATIVE result is transient by default. Built-in optional
+            # adapters (crewai/autogen/…) report absence by returning ``False``
+            # from ``is_available()`` (a ``find_spec`` probe) rather than raising
+            # ``ImportError``, so if only ``ImportError`` were treated as
+            # transient the mid-life ``pip install`` recovery would never fire
+            # for the very frameworks it targets. Any negative therefore expires
+            # after the cool-down; only a POSITIVE result is memoised for the
+            # process lifetime (an installed framework does not vanish).
+            transient = not ok
+        except (ValueError, TypeError):
+            # Structural failure (bad name / bad adapter shape): permanent —
+            # re-probing cannot change a mis-registered adapter.
             ok = False
+            transient = False
+        except ImportError:
+            # A missing optional dependency is transient: the operator can
+            # install it after boot, so this negative expires after the
+            # cool-down instead of being memoised permanently.
+            ok = False
+            transient = True
         except Exception:
-            logger.warning("is_available() raised for adapter %r", name, exc_info=True)
+            # Transient — the probe raised on something that isn't a durable
+            # "unavailable" signal (a racing entry-point scan, a network probe
+            # that timed out at boot, a config write still in flight). Cache
+            # briefly so the next call reprobes instead of pinning it forever.
+            logger.warning(
+                "is_available() raised for adapter %r; will retry after %.0fs",
+                name, self._avail_retry_cooldown, exc_info=True,
+            )
             ok = False
+            transient = True
 
         with self._avail_lock:
-            self._avail_cache[key] = ok
+            # Anchor the cooldown to *now* (post-probe), not the pre-probe
+            # timestamp: a probe that itself blocks for >= the cooldown would
+            # otherwise write an already-expired timestamp and defeat it.
+            self._avail_cache[key] = (ok, time.monotonic() if transient else None)
         return ok
 
     def invalidate_availability(self, name: Optional[str] = None) -> None:

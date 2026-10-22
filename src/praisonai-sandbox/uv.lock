@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.10, <3.15"
 resolution-markers = [
     "python_full_version >= '3.14'",
@@ -533,6 +533,18 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/d8/53/6f443c9a4a8358a93a6792e2acffb9d9d5cb0a5cfd8802644b7b1c9a02e4/colorama-0.4.6.tar.gz", hash = "sha256:08695f5cb7ed6e0531a20572697297273c47b8cae5a63ffc6d6ed5c201be6e44", size = 27697, upload-time = "2022-10-25T02:36:22.414Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/d1/d6/3965ed04c63042e047cb6a3e6ed1a63a35087b6a609aa3a15ed8ac56c221/colorama-0.4.6-py2.py3-none-any.whl", hash = "sha256:4f1d9991f5acc0ca119f9d443620b77f9d6b33703e51011c16baf57afb285fc6", size = 25335, upload-time = "2022-10-25T02:36:20.889Z" },
+]
+
+[[package]]
+name = "croniter"
+version = "6.2.4"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "python-dateutil" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/37/57/2e2a65aee2a70483cb28e2b7e15a072d00a523207593b44400d4717bb100/croniter-6.2.4.tar.gz", hash = "sha256:fc124f751b1b04805c2a04b061898b436b45ab2320b045e1e052ea895de65189", size = 166267, upload-time = "2026-07-10T09:52:59.955Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/cd/ba/d678e5bd329646ca51d3c92addbc77804e86d21f4b6b6a027218e6abb010/croniter-6.2.4-py3-none-any.whl", hash = "sha256:8ef3d544107a5c05a150a2d78f8bf5a8eb9c5c4d93405a736b824109574e3f4d", size = 46677, upload-time = "2026-07-10T09:52:58.425Z" },
 ]
 
 [[package]]
@@ -1667,7 +1679,7 @@ wheels = [
 
 [[package]]
 name = "praisonai-sandbox"
-version = "0.1.1"
+version = "0.1.13"
 source = { editable = "." }
 dependencies = [
     { name = "click" },
@@ -1725,17 +1737,18 @@ requires-dist = [
     { name = "praisonaiagents", directory = "../praisonai-agents" },
     { name = "rich", specifier = ">=13.7" },
     { name = "sandlock", marker = "extra == 'sandlock'", specifier = ">=0.1.0" },
-    { name = "tenki", marker = "extra == 'tenki'", specifier = ">=0.5.4" },
+    { name = "tenki", marker = "extra == 'tenki'", specifier = ">=1.4.0" },
     { name = "typer", specifier = ">=0.12.0" },
 ]
 provides-extras = ["docker", "e2b", "sandlock", "ssh", "tenki", "flyio", "modal", "daytona", "novita", "all"]
 
 [[package]]
 name = "praisonaiagents"
-version = "1.7.1"
+version = "1.7.14"
 source = { directory = "../praisonai-agents" }
 dependencies = [
     { name = "aiohttp" },
+    { name = "croniter" },
     { name = "openai" },
     { name = "posthog" },
     { name = "pydantic" },
@@ -1754,6 +1767,7 @@ requires-dist = [
     { name = "chromadb", marker = "extra == 'knowledge'", specifier = ">=1.0.0" },
     { name = "chromadb", marker = "extra == 'memory'", specifier = ">=1.0.0" },
     { name = "crawl4ai", marker = "extra == 'crawl'", specifier = ">=0.4.0" },
+    { name = "croniter", specifier = ">=6.0" },
     { name = "dakera", marker = "extra == 'dakera'", specifier = ">=0.12.8" },
     { name = "ddgs", marker = "extra == 'search'", specifier = ">=9.0.0" },
     { name = "fastapi", marker = "extra == 'api'", specifier = ">=0.115.0" },
@@ -1762,7 +1776,8 @@ requires-dist = [
     { name = "litellm", marker = "extra == 'llm'", specifier = ">=1.83.14" },
     { name = "litellm", marker = "extra == 'memory'", specifier = ">=1.83.14" },
     { name = "markitdown", extras = ["all"], marker = "extra == 'knowledge'", specifier = ">=0.1.0" },
-    { name = "mcp", marker = "extra == 'mcp'", specifier = ">=1.20.0" },
+    { name = "mcp", marker = "extra == 'mcp'", specifier = ">=1.20.0,<2" },
+    { name = "mcp", marker = "extra == 'parallel-search'", specifier = ">=1.30.0,<2" },
     { name = "mem0ai", marker = "extra == 'knowledge'", specifier = ">=0.1.0" },
     { name = "mem0ai", extras = ["graph"], marker = "extra == 'graph'", specifier = ">=0.1.0" },
     { name = "motor", marker = "extra == 'mongodb'", specifier = ">=3.4.0" },
@@ -1777,6 +1792,7 @@ requires-dist = [
     { name = "praisonaiagents", extras = ["auth"], marker = "extra == 'all'" },
     { name = "praisonaiagents", extras = ["autonomy"], marker = "extra == 'all'" },
     { name = "praisonaiagents", extras = ["crawl"], marker = "extra == 'all'" },
+    { name = "praisonaiagents", extras = ["decisions"], marker = "extra == 'all'" },
     { name = "praisonaiagents", extras = ["graph"], marker = "extra == 'all'" },
     { name = "praisonaiagents", extras = ["knowledge"], marker = "extra == 'all'" },
     { name = "praisonaiagents", extras = ["llm"], marker = "extra == 'all'" },
@@ -1796,12 +1812,13 @@ requires-dist = [
     { name = "python-multipart", marker = "extra == 'auth'", specifier = ">=0.0.6" },
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "rich" },
+    { name = "typesafe-sdk", marker = "extra == 'decisions'", specifier = ">=0.7.0" },
     { name = "uvicorn", marker = "extra == 'api'", specifier = ">=0.34.0" },
     { name = "uvicorn", marker = "extra == 'mcp'", specifier = ">=0.34.0" },
     { name = "uvicorn", marker = "extra == 'os'", specifier = ">=0.34.0" },
     { name = "websockets", marker = "extra == 'mcp'", specifier = ">=12.0" },
 ]
-provides-extras = ["sandbox", "mcp", "memory", "knowledge", "graph", "llm", "api", "os", "telemetry", "mongodb", "dakera", "auth", "autonomy", "search", "crawl", "a2ui", "all"]
+provides-extras = ["sandbox", "mcp", "parallel-search", "memory", "knowledge", "graph", "llm", "decisions", "api", "os", "telemetry", "mongodb", "dakera", "auth", "autonomy", "search", "crawl", "a2ui", "all"]
 
 [[package]]
 name = "propcache"
@@ -2345,16 +2362,16 @@ wheels = [
 
 [[package]]
 name = "tenki"
-version = "1.0.0"
+version = "1.4.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "grpcio" },
     { name = "protobuf" },
     { name = "websocket-client" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/10/68/69da5f5bb552fa5899a75be6dfe2da75f116e401bd0540297f5212466ba8/tenki-1.0.0.tar.gz", hash = "sha256:e7210795712a80c7b5700e2cfc534f72e3a7feb88466cfcd2e648739161c1922", size = 230454, upload-time = "2026-08-16T10:45:31.371Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/62/64/232ea63ec1473c8ee8050881cb547e4176ea63fe1c1591a3bf19e111e379/tenki-1.4.0.tar.gz", hash = "sha256:eec11071341c2da5c439ad4316896c04bf29abe92e8ab4fd229011dd5499930e", size = 288846, upload-time = "2026-09-30T04:51:36.806Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/4e/12/97d2edbabeffe64425fe1e86273b0da74f517bed4f2ab59b7b6a51ace5fa/tenki-1.0.0-py3-none-any.whl", hash = "sha256:63fe85aa1fa7347972e915bd83e71aea1e7feed67b1308ff71e2eb68e7130432", size = 159594, upload-time = "2026-08-16T10:45:29.767Z" },
+    { url = "https://files.pythonhosted.org/packages/28/5b/c435195220f11ee46cb0a585f4abc4770f69a32626211523acb9b1a43798/tenki-1.4.0-py3-none-any.whl", hash = "sha256:8a2c4da58d807313d6f4da7d0bc0aa7c3db4001bbd751f84aac0130437624b2f", size = 198601, upload-time = "2026-09-30T04:51:35.24Z" },
 ]
 
 [[package]]

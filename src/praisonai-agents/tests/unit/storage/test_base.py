@@ -5,6 +5,7 @@ TDD: Tests for the DRY storage base implementation.
 """
 
 import json
+import os
 import tempfile
 from pathlib import Path
 from datetime import datetime
@@ -132,6 +133,70 @@ class TestFileLock:
         finally:
             temp_path.unlink()
 
+    def test_live_lock_survives_beyond_timeout(self):
+        """A lock held longer than ``timeout`` must NOT be reclaimed.
+
+        Regression for the mtime-staleness bug: a live holder refreshes the
+        lock file's mtime via a heartbeat, so a legitimately long critical
+        section stays exclusive and a waiter cannot bust the live lock.
+        """
+        import time
+
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            temp_path = Path(f.name)
+        lock_path = Path(str(temp_path) + ".lock")
+
+        try:
+            with FileLock(temp_path, timeout=0.1):
+                acquired_mtime = lock_path.stat().st_mtime
+                # Hold well past the timeout; heartbeat should keep it fresh.
+                time.sleep(0.5)
+                # The heartbeat (every timeout/3) must have refreshed the mtime
+                # several times by now. Asserting that it moved forward checks
+                # the regression (a holder that never refreshes) without
+                # sampling one instant's age against a 0.1 s budget, which a
+                # descheduled heartbeat thread on a busy CI runner can exceed.
+                assert lock_path.stat().st_mtime > acquired_mtime, (
+                    "heartbeat not refreshing the live lock's mtime"
+                )
+                # A waiter polling for a while must observe the lock as live
+                # (age within timeout) at least once.
+                waiter = FileLock(temp_path, timeout=0.1)
+                deadline = time.time() + 2.0
+                fresh = False
+                while time.time() < deadline and not fresh:
+                    fresh = time.time() - lock_path.stat().st_mtime <= waiter.timeout
+                    if not fresh:
+                        time.sleep(0.01)
+                assert fresh, "live lock aged past timeout; heartbeat not refreshing mtime"
+                assert lock_path.exists()
+        finally:
+            temp_path.unlink()
+
+    def test_abandoned_lock_is_reclaimed(self):
+        """A stale lock (crashed holder, no heartbeat) is reclaimable."""
+        import time
+
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            temp_path = Path(f.name)
+        lock_path = Path(str(temp_path) + ".lock")
+
+        try:
+            # Simulate a crashed holder: a bare lock file with no heartbeat,
+            # aged past the timeout.
+            lock_path.touch()
+            old = time.time() - 100
+            os.utime(lock_path, (old, old))
+
+            # Acquisition should reclaim the abandoned lock without hanging.
+            with FileLock(temp_path, timeout=0.1):
+                assert lock_path.exists()
+            assert not lock_path.exists()
+        finally:
+            if lock_path.exists():
+                lock_path.unlink()
+            temp_path.unlink()
+
 
 class TestBaseJSONStore:
     """Tests for BaseJSONStore."""
@@ -233,6 +298,71 @@ class TestBaseJSONStore:
             store = CustomStore(store_path)
             
             assert store._data == {"items": [], "version": 1}
+
+
+class TestInvalidUtf8Recovery:
+    """Regression tests for invalid-UTF-8 recovery (Issue #5577)."""
+
+    def test_load_recovers_from_invalid_utf8_unlocked(self):
+        """Invalid UTF-8 bytes recover to defaults without a rewrite."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store_path = Path(tmpdir) / "test.json"
+            store_path.write_bytes(b"\xff\xfe\xfa")
+
+            store = BaseJSONStore(store_path, use_file_lock=False)
+            assert store.load() == {}
+            # Original bytes preserved on disk (no corruption rewrite on load).
+            assert store_path.read_bytes() == b"\xff\xfe\xfa"
+
+    def test_load_recovers_from_invalid_utf8_locked(self):
+        """Invalid UTF-8 recovers with file locking enabled too."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store_path = Path(tmpdir) / "test.json"
+            store_path.write_bytes(b"\xff")
+
+            store = BaseJSONStore(store_path, use_file_lock=True)
+            assert store.load() == {}
+            assert store_path.read_bytes() == b"\xff"
+
+    def test_file_backend_recovers_from_invalid_utf8(self):
+        """FileBackend.load() returns None (not raise) on invalid UTF-8."""
+        from praisonaiagents.storage.backends import FileBackend
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            backend = FileBackend(storage_dir=Path(tmpdir))
+            key = "session"
+            (Path(tmpdir) / f"{key}.json").write_bytes(b"\xff")
+
+            assert backend.load(key) is None
+
+    def test_store_with_file_backend_recovers_from_invalid_utf8(self):
+        """BaseJSONStore over a FileBackend recovers to defaults on bad bytes."""
+        from praisonaiagents.storage.backends import FileBackend
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store_path = Path(tmpdir) / "session.json"
+            backend = FileBackend(storage_dir=Path(tmpdir))
+            (Path(tmpdir) / "session.json").write_bytes(b"\xff")
+
+            store = BaseJSONStore(store_path, backend=backend)
+            assert store.load() == {}
+
+    def test_async_load_recovers_from_invalid_utf8(self):
+        """AsyncBaseJSONStore.load_async() recovers from invalid UTF-8."""
+        import asyncio
+        import pytest
+
+        pytest.importorskip("aiofiles")
+        from praisonaiagents.storage.base import AsyncBaseJSONStore
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store_path = Path(tmpdir) / "test.json"
+            store_path.write_bytes(b"\xff")
+
+            store = AsyncBaseJSONStore(store_path)
+            result = asyncio.run(store.load_async())
+            assert result == {}
+            assert store_path.read_bytes() == b"\xff"
 
 
 class TestListJsonSessions:

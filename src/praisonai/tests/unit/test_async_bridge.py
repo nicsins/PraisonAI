@@ -19,16 +19,72 @@ parameter and would fail fixture resolution.
 """
 
 import asyncio
+import logging
 import threading
+import time
 import unittest
+import weakref
 
-from praisonai._async_bridge import _BG, run_sync
+from praisonai._async_bridge import (
+    _BG,
+    AsyncBridge,
+    DispatchKind,
+    async_scoped_bridge,
+    current_bridge,
+    dispatch_maybe_awaitable,
+    run_cli_coro,
+    run_sync,
+)
 
 
 async def _coro(value: int) -> int:
     """Helper coroutine used by the tests below."""
     await asyncio.sleep(0)  # yield to the loop at least once
     return value * 2
+
+
+class TestRunCliCoro(unittest.TestCase):
+    """``run_cli_coro`` is the CLI-leaf replacement for ``asyncio.run``."""
+
+    def test_runs_on_shared_bridge_from_sync_context(self):
+        # No fresh event loop is spawned; result comes back off the bridge.
+        self.assertEqual(run_cli_coro(_coro(21)), 42)
+
+    def test_reuses_shared_loop_across_calls(self):
+        self.assertEqual(run_cli_coro(_coro(1)), 2)
+        self.assertEqual(run_cli_coro(_coro(2)), 4)
+
+    def test_raises_from_inside_running_loop(self):
+        async def outer() -> str:
+            try:
+                run_cli_coro(_coro(1))
+                return "no-raise"
+            except RuntimeError:
+                return "raised"
+
+        self.assertEqual(run_sync(outer()), "raised")
+
+    def test_defaults_to_unbounded_timeout(self):
+        # CLI leaves replaced bare asyncio.run(...) (no whole-command deadline);
+        # a long-running interactive shell / standardise / background job must
+        # not be aborted by run_sync's 300s default. Assert the omitted timeout
+        # forwards None (unbounded), not the default.
+        import praisonai._async_bridge as bridge
+
+        captured = {}
+
+        def _fake_run_sync(coro, *, timeout):
+            captured["timeout"] = timeout
+            coro.close()
+            return "ok"
+
+        original = bridge.run_sync
+        bridge.run_sync = _fake_run_sync
+        try:
+            self.assertEqual(run_cli_coro(_coro(1)), "ok")
+        finally:
+            bridge.run_sync = original
+        self.assertIsNone(captured["timeout"])
 
 
 class TestRunSync(unittest.TestCase):
@@ -140,6 +196,236 @@ class TestBackgroundThread(unittest.TestCase):
         finally:
             release.set()
             t.join(timeout=2.0)
+
+
+class TestDispatchMaybeAwaitable(unittest.TestCase):
+    """Contract of the shared sync→async dispatch helper.
+
+    ``dispatch_maybe_awaitable`` is the single owner of the submit/track/
+    done-callback policy the db adapter's ``_call_store``/``_merge_and_set``/
+    ``on_agent_end`` paths route through, so its four branches are pinned here.
+    """
+
+    def test_non_awaitable_passthrough(self):
+        """A plain (non-awaitable) value is returned as-is, unchanged."""
+        sentinel = object()
+        self.assertIs(
+            dispatch_maybe_awaitable(sentinel, kind=DispatchKind.READ),
+            sentinel,
+        )
+        self.assertEqual(
+            dispatch_maybe_awaitable(123, kind=DispatchKind.WRITE),
+            123,
+        )
+
+    def test_no_loop_read_blocks_and_returns_value(self):
+        """No running loop + READ blocks on the bridge and returns the value."""
+        self.assertEqual(
+            dispatch_maybe_awaitable(_coro(21), kind=DispatchKind.READ),
+            42,
+        )
+
+    def test_no_loop_write_blocks_and_returns_value(self):
+        """No running loop + WRITE also blocks and returns the value.
+
+        Outside a loop there is no reason to defer, so a write is run to
+        completion just like a read (fire-and-forget is a running-loop concern).
+        """
+        self.assertEqual(
+            dispatch_maybe_awaitable(_coro(5), kind=DispatchKind.WRITE),
+            10,
+        )
+
+    def test_running_loop_write_is_tracked_fire_and_forget(self):
+        """Running loop + WRITE submits to the bridge, tracks the future, and
+        returns ``None`` while the write still completes in the background."""
+        tracker: "weakref.WeakSet" = weakref.WeakSet()
+        lock = threading.Lock()
+        gate = threading.Event()
+        done = threading.Event()
+
+        async def _write() -> int:
+            # Park until the test has observed the tracked future so the
+            # WeakSet cannot GC a completed future before we assert on it.
+            await asyncio.get_running_loop().run_in_executor(None, gate.wait, 2.0)
+            done.set()
+            return 99
+
+        async def _outer():
+            return dispatch_maybe_awaitable(
+                _write(),
+                kind=DispatchKind.WRITE,
+                tracker=tracker,
+                tracker_lock=lock,
+                op_name="unit-write",
+            )
+
+        # Run the dispatch from *inside* a running loop (the bridge loop).
+        result = run_sync(_outer())
+        self.assertIsNone(result, "running-loop WRITE must return None")
+        # The in-flight (still-parked) future must be tracked at this point.
+        with lock:
+            self.assertEqual(len(tracker), 1, "the in-flight future must be tracked")
+        # Release the write and confirm it still runs to completion.
+        gate.set()
+        self.assertTrue(
+            done.wait(timeout=2.0),
+            "deferred write coroutine should still run to completion",
+        )
+
+    def test_running_loop_failed_write_logs_and_does_not_raise(self):
+        """A failed deferred write is swallowed (logged) via the done-callback,
+        never surfacing to the returning sync caller."""
+        tracker: "weakref.WeakSet" = weakref.WeakSet()
+        lock = threading.Lock()
+
+        async def _boom() -> None:
+            await asyncio.sleep(0)
+            raise ValueError("deferred failure")
+
+        async def _outer():
+            return dispatch_maybe_awaitable(
+                _boom(),
+                kind=DispatchKind.WRITE,
+                tracker=tracker,
+                tracker_lock=lock,
+                op_name="unit-fail",
+            )
+
+        # Must not raise even though the deferred coroutine fails. The helper's
+        # done-callback logs a warning; silence it so the expected traceback
+        # does not clutter the test output.
+        logging.getLogger("praisonai._async_bridge").setLevel(logging.CRITICAL)
+        try:
+            self.assertIsNone(run_sync(_outer()))
+            with lock:
+                futures = list(tracker)
+            for f in futures:
+                # Give the callback-bearing future a moment to settle.
+                try:
+                    f.exception(timeout=2.0)
+                except Exception:
+                    pass
+        finally:
+            logging.getLogger("praisonai._async_bridge").setLevel(logging.NOTSET)
+        # The failure was logged, not propagated to the caller — reaching here
+        # without an exception is the assertion.
+
+
+class TestAsyncScopedBridge(unittest.TestCase):
+    """Contract of the async-safe scoped bridge used by the async generator.
+
+    The async twin of ``scoped_bridge`` must (1) bind a per-scope bridge that
+    ``current_bridge()`` resolves to, (2) tear a scope-owned bridge down on exit
+    without blocking the caller's event loop, and (3) poison the bridge so a
+    leaked context cannot resurrect it.
+    """
+
+    def test_binds_scoped_bridge_in_context(self):
+        async def _outer():
+            outside = current_bridge()
+            async with async_scoped_bridge() as scoped:
+                inside = current_bridge()
+                return outside, scoped, inside
+
+        outside, scoped, inside = asyncio.run(_outer())
+        self.assertIs(inside, scoped, "scope must bind its own bridge")
+        self.assertIsNot(inside, outside, "scope must override the default")
+
+    def test_teardown_does_not_block_event_loop(self):
+        """A slow ``shutdown`` must not park the loop; other loop work proceeds.
+
+        We bind a scope whose owned bridge has a deliberately slow ``shutdown``
+        and confirm the event loop keeps ticking a concurrent task while the
+        (off-loop) teardown runs, i.e. the loop is never pinned by the join.
+        """
+        ticks = []
+
+        class _SlowBridge(AsyncBridge):
+            def shutdown(self, timeout: float = 5.0, *, permanent: bool = False):
+                # Simulate the blocking cancel+join teardown.
+                time.sleep(0.3)
+                super().shutdown(timeout=timeout, permanent=permanent)
+
+        async def _ticker():
+            # If the loop were parked by teardown, these ticks would not
+            # advance while the scope exits.
+            for _ in range(30):
+                ticks.append(time.monotonic())
+                await asyncio.sleep(0.01)
+
+        async def _outer():
+            t = asyncio.ensure_future(_ticker())
+            async with async_scoped_bridge(_SlowBridge()):
+                await asyncio.sleep(0.01)
+            # Exiting the scope triggers the off-loop teardown. Give the ticker
+            # room to keep advancing across the teardown window.
+            await asyncio.sleep(0.3)
+            await t
+            return ticks
+
+        result = asyncio.run(_outer())
+        # The ticker must have advanced through the teardown window; a pinned
+        # loop would produce a large gap around scope exit.
+        gaps = [b - a for a, b in zip(result, result[1:])]
+        self.assertTrue(gaps, "ticker must have produced ticks")
+        self.assertLess(
+            max(gaps),
+            0.25,
+            "event loop was parked during off-loop teardown (max tick gap too large)",
+        )
+
+    def test_owned_bridge_is_poisoned_on_exit(self):
+        """A scope-owned bridge must be permanently shut down on exit."""
+        captured = {}
+
+        async def _outer():
+            async with async_scoped_bridge() as scoped:
+                captured["bridge"] = scoped
+
+        asyncio.run(_outer())
+        self.assertTrue(
+            captured["bridge"]._closed,
+            "scope-owned bridge must be poisoned (permanent shutdown) on exit",
+        )
+
+    def test_caller_provided_bridge_not_shut_down(self):
+        """A caller-provided bridge is left untouched (caller owns lifecycle)."""
+        owned = AsyncBridge()
+
+        async def _outer():
+            async with async_scoped_bridge(owned) as scoped:
+                self.assertIs(scoped, owned)
+
+        asyncio.run(_outer())
+        self.assertFalse(
+            owned._closed,
+            "caller-provided bridge must not be poisoned by the scope",
+        )
+
+
+
+class TestShutdownWithStubbornTask(unittest.TestCase):
+    """Regression for #5773: a task ignoring cancellation must not make
+    ``shutdown()`` raise (it runs from scope ``__exit__`` and would mask the
+    caller's real exception)."""
+
+    def test_shutdown_does_not_raise_when_task_ignores_cancel(self):
+        bridge = AsyncBridge()
+        release = threading.Event()
+
+        async def _stubborn():
+            while not release.is_set():
+                try:
+                    await asyncio.sleep(0.05)
+                except asyncio.CancelledError:
+                    pass
+
+        bridge.submit(_stubborn())
+        try:
+            bridge.shutdown(timeout=0.2, permanent=True)  # must not raise
+        finally:
+            release.set()
 
 
 if __name__ == "__main__":

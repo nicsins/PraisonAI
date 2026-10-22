@@ -65,6 +65,8 @@ TOOL_MAPPINGS = {
     'execute_command': ('.shell_tools', None),
     'list_processes': ('.shell_tools', None),
     'kill_process': ('.shell_tools', None),
+    'get_command_output': ('.shell_tools', None),
+    'stop_command': ('.shell_tools', None),
     'get_system_info': ('.shell_tools', None),
     'shell_tools': ('.shell_tools', None),
 
@@ -246,6 +248,9 @@ TOOL_MAPPINGS = {
     'lsp_hover': ('.lsp_tools', None),
     'lsp_document_symbols': ('.lsp_tools', None),
     'lsp_workspace_symbols': ('.lsp_tools', None),
+    'lsp_implementations': ('.lsp_tools', None),
+    'lsp_incoming_calls': ('.lsp_tools', None),
+    'lsp_outgoing_calls': ('.lsp_tools', None),
     
     # Memory Tools (active memory store/search for agents)
     'store_memory': ('.memory', None),
@@ -301,6 +306,7 @@ _PROFILE_EXPORTS = frozenset({
 # default path; only resolved when the opt-in code mode is used).
 _TOOL_PROXY_EXPORTS = frozenset({
     'ToolProxy', 'build_tool_namespace', 'CodeToolBridge', 'serve_tool_call',
+    'LocalProcessBridge',
 })
 
 def __getattr__(name: str) -> Any:
@@ -312,12 +318,14 @@ def __getattr__(name: str) -> Any:
             build_tool_namespace,
             CodeToolBridge,
             serve_tool_call,
+            LocalProcessBridge,
         )
         return {
             'ToolProxy': ToolProxy,
             'build_tool_namespace': build_tool_namespace,
             'CodeToolBridge': CodeToolBridge,
             'serve_tool_call': serve_tool_call,
+            'LocalProcessBridge': LocalProcessBridge,
         }[name]
 
     # Handle circuit breaker imports first
@@ -435,7 +443,7 @@ __all__ = list(TOOL_MAPPINGS.keys()) + [
     'list_tools', 'list_available_tools', 'list_tools_with_allowed_filter', 'list_tools_with_hermes_filter', 'ToolRegistry',
     'resolve_tool_name', 'resolve_tool_names', 'ToolResolutionError',
     'ToolProxy', 'build_tool_namespace', 'CodeToolBridge', 'serve_tool_call',
-    'Tools',
+    'LocalProcessBridge', 'Tools',
     # Validation and retry protocols
     'ValidationResult', 'ToolValidatorProtocol', 'AsyncToolValidatorProtocol', 'PassthroughValidator',
     'RetryPolicy', 'FallbackChain', 'ToolExecutionConfig',
@@ -452,4 +460,11 @@ __all__ = list(TOOL_MAPPINGS.keys()) + [
     # Tool profiles (DRY tool sets for autonomy/interactive modes)
     'ToolProfile', 'AUTONOMY_PROFILE', 'BUILTIN_PROFILES',
     'register_profile', 'get_profile', 'resolve_profiles', 'list_profiles',
+    # Provider-hosted tools (run on the provider, usable on any Agent)
+    'WebSearchTool', 'CodeInterpreterTool', 'FileSearchTool', 'HostedMCPTool',
+    'is_hosted_tool',
 ]
+
+from .hosted import (  # noqa: E402
+    WebSearchTool, CodeInterpreterTool, FileSearchTool, HostedMCPTool, is_hosted_tool,
+)

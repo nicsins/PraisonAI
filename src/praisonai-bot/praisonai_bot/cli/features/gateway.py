@@ -10,7 +10,7 @@ import asyncio
 import logging
 import os
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -109,7 +109,7 @@ _START_FLAG_KEYS = (
     "agent_file", "config_file", "drain_timeout", "max_concurrent_runs",
     "queue_depth", "overflow_policy", "reliability", "openai_api", "mcp",
     "identity_store", "scale_to_zero", "idle_minutes", "drain_marker",
-    "watchdog", "watchdog_timeout",
+    "watchdog", "watchdog_timeout", "trusted_proxies", "safe_mode",
 )
 
 
@@ -163,6 +163,131 @@ def load_start_flags(host: str, port: int) -> Dict:
     return {k: v for k, v in data.items() if k in _START_FLAG_KEYS}
 
 
+def resolve_effective_config(
+    host: str, port: int, config_file: Optional[str] = None
+) -> Dict:
+    """Resolve the effective gateway configuration actually in force (#5646).
+
+    Merges the declared config (``gateway.yaml`` / ``bot.yaml``) with the
+    CLI-only runtime posture persisted at ``start`` time (the hidden
+    ``gateway.start.<host>.<port>.json`` side file) so a single document
+    describes how the gateway is really running — not a partial YAML plus an
+    opaque, operator-invisible side file.
+
+    Precedence (lowest → highest): declared YAML < persisted CLI start-flags.
+    ``None`` persisted values mean "fall back to YAML" and are already dropped
+    on persist, so they never clobber a declared value here.
+
+    The persisted ``config_file`` key resolves which YAML to read when
+    ``config_file`` is not passed explicitly, so the snapshot reflects the file
+    the running process was launched against.
+
+    Returns a plain dict (NOT yet redacted): the ``declared`` YAML mapping, the
+    ``cli_overrides`` that were replayed over it, the ``resolved`` merge, plus
+    the ``host``/``port`` the snapshot was keyed by. Use
+    :func:`export_effective_config` for a secret-redacted, serialisable view.
+    """
+    import yaml
+
+    overrides = load_start_flags(host, port)
+
+    resolved_config_file = config_file or overrides.get("config_file")
+    declared: Dict = {}
+    declared_path: Optional[str] = None
+    if resolved_config_file and os.path.exists(resolved_config_file):
+        try:
+            with open(resolved_config_file) as fh:
+                loaded = yaml.safe_load(fh) or {}
+            if isinstance(loaded, dict):
+                declared = loaded
+                declared_path = resolved_config_file
+        except (OSError, yaml.YAMLError) as exc:  # pragma: no cover — advisory
+            logger.warning(
+                "Could not read gateway config %s: %s", resolved_config_file, exc
+            )
+
+    # The posture knobs ``start`` persists map onto the ``gateway.*`` block in
+    # YAML; surface them under one ``gateway`` mapping in the merge so the
+    # resolved document reads back exactly like a gateway.yaml an operator could
+    # promote into version control.
+    resolved: Dict = dict(declared)
+    gateway_section = dict(resolved.get("gateway") or {})
+    cli_overrides: Dict = {}
+    for key, value in overrides.items():
+        if key == "config_file":
+            continue
+        cli_overrides[key] = value
+        if key == "agent_file":
+            # agent_file is a top-level launch input, not a gateway.* knob.
+            resolved["agent_file"] = value
+        else:
+            gateway_section[key] = value
+    if gateway_section:
+        resolved["gateway"] = gateway_section
+
+    return {
+        "host": host,
+        "port": port,
+        "config_file": declared_path,
+        "declared": declared,
+        "cli_overrides": cli_overrides,
+        "resolved": resolved,
+    }
+
+
+def _redact_secret_values(value):
+    """Mask only secret-bearing keys, preserving every other value (#5646).
+
+    Unlike the diagnostics bundle's shape-only sanitiser (which reduces *every*
+    scalar to its type so nothing leaks), a promotable config must keep its
+    real, non-secret values — drain windows, policies, channel platforms — so an
+    operator can diff it against ``gateway.yaml`` and commit it. Only values
+    under a credential-named key (reusing the diagnostics ``_SECRET_KEYS`` set)
+    are replaced with a ``<set>``/``<empty>`` presence marker.
+    """
+    try:
+        from praisonai_bot.gateway.diagnostics import _SECRET_KEYS
+    except Exception:  # pragma: no cover — defensive
+        _SECRET_KEYS = frozenset()
+
+    if isinstance(value, dict):
+        out = {}
+        for key, val in value.items():
+            if str(key).lower() in _SECRET_KEYS:
+                out[key] = "<set>" if val not in (None, "") else "<empty>"
+            else:
+                out[key] = _redact_secret_values(val)
+        return out
+    if isinstance(value, list):
+        return [_redact_secret_values(v) for v in value]
+    return value
+
+
+def export_effective_config(
+    host: str,
+    port: int,
+    config_file: Optional[str] = None,
+    redact: bool = True,
+) -> str:
+    """Serialise the resolved effective config to YAML for diff / commit (#5646).
+
+    Produces the ``resolved`` document from :func:`resolve_effective_config`
+    as YAML so an operator can diff it against their declared ``gateway.yaml``
+    and promote the running posture back into version control. When ``redact``
+    is ``True`` (the default) only secret-bearing values are reduced to presence
+    markers (reusing the diagnostics ``_SECRET_KEYS`` set) while every other
+    value is kept, so the output stays a usable, promotable config. Pass
+    ``redact=False`` for a local, un-redacted snapshot.
+    """
+    import yaml
+
+    snapshot = resolve_effective_config(host, port, config_file=config_file)
+    resolved = snapshot["resolved"]
+    if redact:
+        resolved = _redact_secret_values(resolved)
+    return yaml.safe_dump(resolved, default_flow_style=False, sort_keys=False)
+
+
 class GatewayHandler:
     """Handler for gateway CLI commands."""
     
@@ -188,6 +313,8 @@ class GatewayHandler:
         drain_marker: Optional[str] = None,
         watchdog: Optional[bool] = None,
         watchdog_timeout: Optional[float] = None,
+        trusted_proxies: Optional[list] = None,
+        safe_mode: Optional[bool] = None,
     ) -> int:
         """Start the gateway server.
 
@@ -225,6 +352,9 @@ class GatewayHandler:
                 link-map JSON (#3020). Enables one continuous session + memory
                 per paired/linked user across channels. Overrides the
                 ``identity:`` block in the YAML; ``None`` falls back to it.
+            safe_mode: Skip external plugins and inbound YAML hooks (#5747)
+                by setting ``PRAISONAI_NO_PLUGINS`` for this process. Persisted
+                so a direct ``restart`` stays in safe mode.
         """
         # Ensure INFO-level logs surface to bot-stdout.log / bot-stderr.log
         # when running under launchd / systemd. Many key lifecycle events
@@ -244,6 +374,13 @@ class GatewayHandler:
         # Load ~/.praisonai/.env BEFORE any config parsing or ${VAR}
         # substitution — daemons don't inherit shell env.
         _load_praisonai_env_file()
+
+        # --pure / --no-plugins / --safe-mode: the gateway is one long-lived
+        # process, so set PRAISONAI_NO_PLUGINS for its lifetime. The core
+        # PluginManager and the gateway's inbound-hook loader both honour it.
+        # Set here too so a replayed ``restart`` stays in safe mode (#5747).
+        if safe_mode:
+            os.environ["PRAISONAI_NO_PLUGINS"] = "1"
 
         # Snapshot the CLI-only runtime flags this process was launched with so a
         # later direct ``gateway restart`` can replay the exact posture (durable
@@ -269,6 +406,8 @@ class GatewayHandler:
             "drain_marker": drain_marker,
             "watchdog": watchdog,
             "watchdog_timeout": watchdog_timeout,
+            "trusted_proxies": trusted_proxies,
+            "safe_mode": safe_mode,
         }
 
         def _commit_start_flags() -> None:
@@ -303,6 +442,9 @@ class GatewayHandler:
                 self._gateway._queue_depth_override = queue_depth
             if overflow_policy is not None:
                 self._gateway._overflow_policy_override = overflow_policy
+            # CLI --trusted-proxy overrides gateway.trusted_proxies in YAML (#5312)
+            if trusted_proxies:
+                self._gateway._trusted_proxies_override = list(trusted_proxies)
             # CLI --reliability preset overrides gateway.reliability in YAML (#2531)
             if reliability is not None:
                 self._gateway._reliability_override = reliability
@@ -378,6 +520,12 @@ class GatewayHandler:
 
         # Standard WebSocket-only mode
         config = GatewayConfig(host=host, port=port)
+        # CLI --trusted-proxy applies in no-config mode too (#5312): stamp it on
+        # the config directly since start_with_config's YAML wiring is skipped.
+        if trusted_proxies:
+            config.trusted_proxies = [
+                str(p).strip() for p in trusted_proxies if str(p).strip()
+            ]
         self._gateway = WebSocketGateway(
             config=config, openai_api=openai_api, mcp=mcp
         )
@@ -777,6 +925,155 @@ class GatewayHandler:
             return 0
 
         print("Usage: praisonai gateway hooks {add|list|remove} ...")
+        return 1
+
+    def schedules(self, args) -> int:
+        """Manage declarative recurring schedules in gateway.yaml (Issue #4913).
+
+        Sub-actions: ``add``, ``list``, ``remove``. Edits the ``schedules:``
+        section of ``gateway.yaml`` so a recurring agent→channel delivery is
+        declarable from the CLI, consistent with the YAML and Python surfaces —
+        the missing CLI arm that brings scheduling to full CLI+YAML+Python
+        parity. The gateway loads this same block into the shared schedule
+        store at boot, so the job fires through the existing tick + delivery
+        loop.
+        """
+        import yaml
+
+        action = getattr(args, "schedules_command", None)
+        config_path = getattr(args, "config_file", None) or "gateway.yaml"
+
+        def _load() -> Tuple[Dict, bool]:
+            """Return ``(config, ok)``.
+
+            ``ok`` is ``False`` when an existing file could not be read/parsed
+            or is not a YAML mapping. A mutating action MUST refuse to write in
+            that case, otherwise it would clobber agents/channels/hooks with a
+            schedule-only document. A genuinely missing file returns
+            ``({}, True)`` so the first ``add`` can create it.
+            """
+            if os.path.exists(config_path):
+                try:
+                    with open(config_path, "r") as f:
+                        data = yaml.safe_load(f) or {}
+                except Exception as e:
+                    print(f"Error reading {config_path}: {e}")
+                    return {}, False
+                if not isinstance(data, dict):
+                    print(
+                        f"Error: {config_path} must contain a YAML mapping at the root."
+                    )
+                    return {}, False
+                return data, True
+            return {}, True
+
+        def _save(cfg: Dict) -> None:
+            with open(config_path, "w") as f:
+                yaml.safe_dump(cfg, f, default_flow_style=False, sort_keys=False)
+
+        cfg, load_ok = _load()
+        schedules = cfg.get("schedules") or {}
+        if not isinstance(schedules, dict):
+            schedules = {}
+
+        if action == "list":
+            if not schedules:
+                print(f"No schedules configured in {config_path}")
+                return 0
+            print(f"Schedules in {config_path}:")
+            for name, spec in schedules.items():
+                if not isinstance(spec, dict):
+                    continue
+                when = (
+                    (f"cron={spec['cron']}" if spec.get("cron") else None)
+                    or (f"every={spec['every']}" if spec.get("every") else None)
+                    or (f"at={spec['at']}" if spec.get("at") else None)
+                    or "-"
+                )
+                deliver = spec.get("deliver") or {}
+                target = "-"
+                if isinstance(deliver, dict) and deliver.get("channel"):
+                    target = deliver["channel"]
+                    if deliver.get("channel_id"):
+                        target = f"{target}:{deliver['channel_id']}"
+                print(
+                    f"  {name}  agent={spec.get('agent') or '<default>'} "
+                    f"{when}  deliver={target}"
+                )
+            return 0
+
+        if action == "remove":
+            if not load_ok:
+                print(
+                    f"Refusing to modify {config_path}: it could not be read. "
+                    "Fix the file first to avoid overwriting your configuration."
+                )
+                return 1
+            name = getattr(args, "name", None)
+            if not name:
+                print("Error: schedule name required")
+                return 1
+            if name not in schedules:
+                print(f"No schedule '{name}' found in {config_path}")
+                return 1
+            del schedules[name]
+            cfg["schedules"] = schedules
+            _save(cfg)
+            print(f"Removed schedule '{name}' from {config_path}")
+            return 0
+
+        if action == "add":
+            if not load_ok:
+                print(
+                    f"Refusing to modify {config_path}: it could not be read. "
+                    "Fix the file first to avoid overwriting your configuration."
+                )
+                return 1
+            name = getattr(args, "name", None)
+            if not name:
+                print("Error: schedule name required (e.g. 'morning-brief')")
+                return 1
+            agent = getattr(args, "agent", None)
+            prompt = getattr(args, "prompt", None)
+            if not agent:
+                print("Error: --agent is required")
+                return 1
+            if not prompt:
+                print("Error: --prompt is required")
+                return 1
+            triggers = [
+                t for t in ("cron", "every", "at")
+                if getattr(args, t, None)
+            ]
+            if len(triggers) != 1:
+                print(
+                    "Error: pass exactly one of --cron / --every / --at"
+                )
+                return 1
+
+            entry: Dict = {"agent": agent, "prompt": prompt}
+            for t in ("cron", "every", "at"):
+                val = getattr(args, t, None)
+                if val:
+                    entry[t] = val
+            channel = getattr(args, "channel", None)
+            if channel:
+                deliver: Dict = {"channel": channel}
+                channel_id = getattr(args, "channel_id", None)
+                if channel_id:
+                    deliver["channel_id"] = channel_id
+                entry["deliver"] = deliver
+            pre_run = getattr(args, "pre_run", None)
+            if pre_run:
+                entry["pre_run"] = pre_run
+
+            schedules[name] = entry
+            cfg["schedules"] = schedules
+            _save(cfg)
+            print(f"Added schedule '{name}' to {config_path}")
+            return 0
+
+        print("Usage: praisonai gateway schedule {add|list|remove} ...")
         return 1
 
     def status(self, host: str = "127.0.0.1", port: int = 8765, deep: bool = False) -> None:

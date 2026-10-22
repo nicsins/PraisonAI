@@ -63,6 +63,9 @@ class EventBus:
         self._lock = threading.RLock()
         self._event_history: List[Event] = []
         self._max_history = 1000
+        # Durable sinks (e.g. SqliteEventLog). Opt-in: a bare Agent() attaches
+        # none, preserving the zero-overhead in-memory path.
+        self._sinks: List[Any] = []
     
     def subscribe(
         self,
@@ -169,17 +172,16 @@ class EventBus:
         Returns:
             The published Event object
         """
-        # Fast path: if no subscribers, return a minimal event without expensive operations
-        if not self._subscribers:
-            # Convert EventType enum to string
-            type_str = event_type.value if isinstance(event_type, EventType) else event_type
-            return Event(
-                type=type_str,
-                data=data or {},
-                source=source,
-                metadata=metadata or {},
-            )
-        
+        # There is no separate no-subscriber shortcut here. It built the same
+        # Event and returned it, so the only work it saved was the sink
+        # dispatch and the history append below -- and skipping the append
+        # meant an event published with nobody listening vanished from
+        # get_history(). History is a debugging record of what was published;
+        # whether anyone happened to be subscribed at the time is not something
+        # it should silently depend on. The append is O(1) under a lock already
+        # held and the list is capped at _max_history, so the saving was not
+        # worth the hole it left.
+
         # Convert EventType enum to string
         type_str = event_type.value if isinstance(event_type, EventType) else event_type
         
@@ -204,16 +206,23 @@ class EventBus:
         """
         logger.debug(f"Publishing event: {event.type}")
         
-        # Fast path: if no subscribers, skip expensive work
-        if not self._subscribers:
-            return event
+        # Durable persistence first (best-effort): a durable sink must receive
+        # the event even when there are no in-memory subscribers.
+        self._dispatch_to_sinks(event)
         
-        # Store in history
+        # Record the event before considering subscribers, for the same reason
+        # _dispatch_to_sinks runs above: an event that was published happened,
+        # whether or not anyone was listening for it.
         with self._lock:
             self._event_history.append(event)
             if len(self._event_history) > self._max_history:
                 self._event_history = self._event_history[-self._max_history:]
-            
+
+        # Fast path: with nothing subscribed there is no dispatch to do.
+        if not self._subscribers:
+            return event
+
+        with self._lock:
             # Get matching subscribers
             subscribers = [
                 sub for sub in self._subscribers
@@ -258,16 +267,13 @@ class EventBus:
             The published Event object
         """
         type_str = event_type.value if isinstance(event_type, EventType) else event_type
-        
-        # Fast path: if no subscribers, return a minimal event without expensive operations
-        if not self._subscribers:
-            return Event(
-                type=type_str,
-                data=data or {},
-                source=source,
-                metadata=metadata or {},
-            )
-        
+
+        # No pre-history no-subscriber shortcut here, matching publish_event's
+        # already-fixed shape: an event that was published happened, whether or
+        # not anyone was listening, and skipping the history append below would
+        # make it vanish from get_history(). The append is O(1) under a lock and
+        # the list is capped, so the only work worth skipping is subscriber
+        # matching/dispatch -- which the guard after the append still skips.
         event = Event(
             type=type_str,
             data=data or {},
@@ -277,11 +283,24 @@ class EventBus:
         
         logger.debug(f"Publishing async event: {event.type}")
         
-        # Store in history
+        # Durable persistence first (best-effort).
+        self._dispatch_to_sinks(event)
+        
+        # History is recorded BEFORE the no-subscriber fast path. Appending to a
+        # capped list is not the "expensive work" that path exists to skip --
+        # that is subscriber matching and dispatch. Returning first meant
+        # get_history() stayed empty unless something happened to be subscribed,
+        # so the record of what the system did depended on who was watching.
         with self._lock:
             self._event_history.append(event)
             if len(self._event_history) > self._max_history:
                 self._event_history = self._event_history[-self._max_history:]
+
+        # Fast path: if no subscribers, skip subscriber matching and dispatch.
+        if not self._subscribers:
+            return event
+
+        with self._lock:
             
             subscribers = [
                 sub for sub in self._subscribers
@@ -312,13 +331,21 @@ class EventBus:
     ) -> List[Event]:
         """
         Get recent event history.
-        
+
+        Every event passed to ``publish``/``publish_event``/``publish_async`` is
+        recorded here (capped at ``_max_history``), regardless of whether any
+        subscriber was registered at publish time. History is a debugging record
+        of what the system did; it does not silently depend on who was watching.
+        Both the sync and async publish paths append before any no-subscriber
+        fast path runs, so publishing to a bus with nothing subscribed still
+        shows up here.
+
         Args:
             event_type: Optional filter by event type
             limit: Maximum number of events to return
-            
+
         Returns:
-            List of recent events
+            List of recent events published (subscribed or not)
         """
         with self._lock:
             events = self._event_history.copy()
@@ -337,6 +364,54 @@ class EventBus:
         """Remove all subscribers."""
         with self._lock:
             self._subscribers.clear()
+    
+    def attach_sink(self, sink: Any) -> None:
+        """Attach a durable sink that persists every published event.
+        
+        A sink is any object with an ``append(event)`` method (e.g.
+        :class:`~praisonaiagents.bus.event_log.SqliteEventLog`). Sinks receive
+        every event regardless of subscriber filters, and their failures are
+        swallowed so a full/slow log never breaks the originating turn.
+        
+        Args:
+            sink: Object exposing ``append(event: Event) -> None``.
+        """
+        with self._lock:
+            if sink not in self._sinks:
+                self._sinks.append(sink)
+    
+    def detach_sink(self, sink: Any) -> bool:
+        """Detach a previously attached sink.
+        
+        Args:
+            sink: The sink object to remove.
+        
+        Returns:
+            True if the sink was attached and removed, False otherwise.
+        """
+        with self._lock:
+            try:
+                self._sinks.remove(sink)
+                return True
+            except ValueError:
+                return False
+    
+    @property
+    def has_sinks(self) -> bool:
+        """Check if there are any durable sinks (lock-free for performance)."""
+        return bool(self._sinks)
+    
+    def _dispatch_to_sinks(self, event: Event) -> None:
+        """Best-effort durable persistence: never raises into the caller."""
+        if not self._sinks:
+            return
+        with self._lock:
+            sinks = list(self._sinks)
+        for sink in sinks:
+            try:
+                sink.append(event)
+            except Exception as e:  # pragma: no cover - defensive
+                logger.debug(f"Error in event sink: {e}")
     
     @property
     def subscriber_count(self) -> int:

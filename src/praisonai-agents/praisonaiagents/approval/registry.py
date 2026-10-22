@@ -17,10 +17,12 @@ Usage (no Agent param needed)::
 from __future__ import annotations
 
 import asyncio
+import collections
 import contextvars
+import threading
 from praisonaiagents._logging import get_logger
 import os
-from typing import Dict, List, Optional, Set
+from typing import Callable, Dict, List, Optional, Set
 
 from .protocols import ApprovalDecision, ApprovalRequest
 
@@ -97,6 +99,9 @@ class ApprovalRegistry:
     :func:`get_approval_registry`.
     """
 
+    # Upper bound on per-context approval-cache entries (see ``mark_approved``).
+    _MAX_CONTEXT_APPROVALS = 1024
+
     def __init__(self) -> None:
         # Backends
         self._global_backend = None  # type: ignore[assignment]
@@ -115,6 +120,24 @@ class ApprovalRegistry:
         self._agent_required_tools: Dict[str, Set[str]] = {}
         self._agent_risk_levels: Dict[tuple[str, str], str] = {}
 
+        # Guards the process-global scoped grant collections
+        # (``_agent_tool_auto_approve`` and ``_session_scoped_targets``) so a
+        # concurrent ``release_scope`` (Agent shutdown) cannot drop another
+        # agent's grant that is being written at the same time. Only wraps these
+        # small in-memory mutations, so it adds no hot-path cost.
+        self._scope_lock = threading.Lock()
+        # Scope ids whose release a GC finalizer could not apply because
+        # ``_scope_lock`` was held (possibly by the very frame the collector
+        # interrupted). Drained by the next ``release_scope``.
+        self._pending_scope_releases: List[str] = []
+        # Scope ids of agents that have been closed or collected. A finalizer
+        # appends here (deque.append is atomic, so no lock); the next ordinary
+        # ``mark_approved`` drains it and prunes those agents' keys from the
+        # per-context cache it is already copying. Bounded: if a dead scope
+        # falls off the end its keys are still bounded by the cache cap below.
+        self._dead_scope_ids: collections.deque = collections.deque(maxlen=4096)
+        self._dead_scopes: Dict[str, None] = {}
+
         # Per-agent, per-tool auto-approval (G-A fix)
         self._agent_tool_auto_approve: Dict[tuple[str, str], bool] = {}
 
@@ -125,8 +148,10 @@ class ApprovalRegistry:
         self._session_scoped_targets: Set[tuple[Optional[str], str]] = set()
 
         # Context variables (per-coroutine / per-thread)
-        self._approved_context: contextvars.ContextVar[Set[str]] = contextvars.ContextVar(
-            "approved_context", default=set()
+        # Per-context approval cache: an insertion-ordered ``{cache_key: scope}``
+        # mapping, replaced (never mutated) on every write. ``None`` = empty.
+        self._approved_context: contextvars.ContextVar[Optional[Dict[str, str]]] = contextvars.ContextVar(
+            "approved_context", default=None
         )
         self._yaml_approved_tools: contextvars.ContextVar[Set[str]] = contextvars.ContextVar(
             "yaml_approved_tools", default=set()
@@ -227,13 +252,38 @@ class ApprovalRegistry:
                 return level
         return self._risk_levels.get(tool_name)
 
+    def list_requirements(self) -> List[Dict[str, Optional[str]]]:
+        """Public, stable view of every approval requirement.
+
+        Returns one entry per (tool, agent) pair -- ``agent`` is ``None`` for a
+        global requirement -- so callers (e.g. an HTTP ``/approvals`` surface)
+        can enumerate requirements without reaching into private fields. Keeps
+        the internal storage shape free to change without breaking consumers.
+        """
+        requirements: List[Dict[str, Optional[str]]] = []
+        for tool_name in sorted(self._required_tools):
+            requirements.append({
+                "tool": tool_name,
+                "agent": None,
+                "risk_level": self.get_risk_level(tool_name),
+            })
+        for agent_name, tools in self._agent_required_tools.items():
+            for tool_name in sorted(tools):
+                requirements.append({
+                    "tool": tool_name,
+                    "agent": agent_name,
+                    "risk_level": self.get_risk_level(tool_name, agent_name),
+                })
+        return requirements
+
     # ── Per-tool auto-approval (G-A fix) ─────────────────────────────────
 
     def auto_approve_tool(self, tool_name: str, agent_name: str) -> None:
         """Pre-approve a single tool for a specific agent."""
         if not agent_name:
             raise ValueError("Skill auto-approval requires a stable agent/session scope")
-        self._agent_tool_auto_approve[(agent_name, tool_name)] = True
+        with self._scope_lock:
+            self._agent_tool_auto_approve[(agent_name, tool_name)] = True
 
     def is_auto_approved(self, tool_name: str, agent_name: str) -> bool:
         """Check if a tool is auto-approved for a specific agent."""
@@ -245,45 +295,105 @@ class ApprovalRegistry:
 
     @staticmethod
     def _approval_cache_key(
-        tool_name: str, arguments: Dict, agent_name: Optional[str] = None
+        tool_name: str,
+        arguments: Dict,
+        agent_name: Optional[str] = None,
+        scope_id: Optional[str] = None,
     ) -> str:
         # Scope the key to the requesting agent so one agent's approval never
         # silently pre-authorizes an identical call from a different, stricter
-        # agent in the same context. ``*`` is the sentinel for calls made
-        # outside any Agent (e.g. bare module-level tool calls).
+        # agent in the same context. Prefer the per-instance ``scope_id`` (e.g.
+        # ``Agent._approval_scope_id``) when supplied: the display ``agent_name``
+        # defaults to ``"Agent"`` for every unnamed agent, so keying the
+        # context cache by name alone lets two same-named instances sharing an
+        # execution context pre-authorize each other before the per-instance
+        # session lookup runs. Falls back to ``agent_name`` for backward compat.
+        # ``*`` is the sentinel for calls made outside any Agent (e.g. bare
+        # module-level tool calls).
         from .utils import hash_tool_args
-        return f"{agent_name or '*'}:{tool_name}:{hash_tool_args(arguments)}"
+        scope = scope_id or agent_name or '*'
+        return f"{scope}:{tool_name}:{hash_tool_args(arguments)}"
 
     def mark_approved(
         self,
         tool_name: str,
         arguments: Optional[Dict] = None,
         agent_name: Optional[str] = None,
+        scope_id: Optional[str] = None,
     ) -> None:
-        approved = self._approved_context.get(set())
-        approved.add(self._approval_cache_key(tool_name, arguments or {}, agent_name))
-        self._approved_context.set(approved)
+        # Copy-on-write: ``contextvars.copy_context()`` copies the mapping, not
+        # the cache object, so mutating it in place would leak an approval
+        # granted in a child context (worker thread, task) into its parent and
+        # siblings. The copy also prunes keys of agents that have since died
+        # and keeps at most ``_MAX_CONTEXT_APPROVALS`` (oldest dropped first;
+        # a dropped entry only means a human may be asked again).
+        key = self._approval_cache_key(tool_name, arguments or {}, agent_name, scope_id)
+        scope = scope_id or agent_name or '*'
+        dead = self._drain_dead_scopes()
+        current = self._approved_context.get(None) or {}
+        if key in current and not dead:
+            return
+        if isinstance(current, dict):
+            fresh = {k: s for k, s in current.items() if s not in dead} if dead else dict(current)
+        else:  # tolerate a plain set written by older code or tests
+            # Keys are "{scope}:{tool}:{hash}" and scope ids themselves contain
+            # a colon ("{name}:{uuid}"), so strip the last two fields.
+            fresh = {k: k.rsplit(":", 2)[0] for k in current}
+        fresh.pop(key, None)
+        fresh[key] = scope
+        overflow = len(fresh) - self._MAX_CONTEXT_APPROVALS
+        if overflow > 0:
+            for old in list(fresh)[:overflow]:
+                del fresh[old]
+        self._approved_context.set(fresh)
+
+    def _drain_dead_scopes(self) -> Dict[str, None]:
+        """Move finalizer-reported dead scopes into the bounded lookup map.
+
+        Called only from ordinary (non-finalizer) code. Returns the map so the
+        caller can prune with an O(1) membership test per cached key.
+        """
+        if self._dead_scope_ids:
+            with self._scope_lock:
+                while self._dead_scope_ids:
+                    self._dead_scopes[self._dead_scope_ids.popleft()] = None
+                overflow = len(self._dead_scopes) - self._dead_scope_ids.maxlen
+                if overflow > 0:
+                    for old in list(self._dead_scopes)[:overflow]:
+                        del self._dead_scopes[old]
+        return self._dead_scopes
 
     def is_already_approved(
         self,
         tool_name: str,
         arguments: Optional[Dict] = None,
         agent_name: Optional[str] = None,
+        scope_id: Optional[str] = None,
     ) -> bool:
         # Honour an explicit mark_approved() from the agent approval path even
         # for critical tools (e.g. execute_command after AutoApproveBackend).
-        if self._approval_cache_key(tool_name, arguments or {}, agent_name) in self._approved_context.get(set()):
+        if self._approval_cache_key(tool_name, arguments or {}, agent_name, scope_id) in (self._approved_context.get(None) or ()):
             return True
         return False
 
     def _is_session_scoped(
-        self, agent_name: Optional[str], tool_name: str, arguments: Optional[Dict]
+        self,
+        agent_name: Optional[str],
+        tool_name: str,
+        arguments: Optional[Dict],
+        scope_id: Optional[str] = None,
     ) -> bool:
         """Return True if a "this session" grant covers this call for the run.
 
         Checks the in-memory session store by the reusable permission target so
         a single ``session`` approval covers matching calls (e.g. the same
         ``bash:git status *`` prefix) without persisting anything to disk.
+
+        ``scope_id`` is a per-Agent-instance key (e.g. ``Agent._approval_scope_id``).
+        When provided it is used as the store key instead of the display name so
+        two same-named agents (every unnamed ``Agent()`` defaults to ``"Agent"``)
+        can't inherit each other's human-granted session approval. Falls back to
+        ``agent_name`` for backward compatibility when no id is supplied.
         """
         if not self._session_scoped_targets:
             return False
@@ -293,7 +403,8 @@ class ApprovalRegistry:
             target = build_permission_target(tool_name, arguments)
         except Exception:  # noqa: BLE001 — never block on target derivation
             return False
-        return (agent_name, target) in self._session_scoped_targets
+        key = scope_id if scope_id is not None else agent_name
+        return (key, target) in self._session_scoped_targets
 
     def _persist_scoped_decision(
         self,
@@ -301,6 +412,7 @@ class ApprovalRegistry:
         tool_name: str,
         arguments: Optional[Dict],
         decision: ApprovalDecision,
+        scope_id: Optional[str] = None,
     ) -> None:
         """Record a ``session``/``always`` decision for reuse this run (or beyond).
 
@@ -326,12 +438,18 @@ class ApprovalRegistry:
         if not decision.approved:
             return
 
+        # In-memory "this session" grants are keyed per Agent instance
+        # (scope_id) when available, so a session approval granted on one worker
+        # cannot silently unlock the same tool for a distinct same-named worker.
+        session_key = scope_id if scope_id is not None else agent_name
+
         if scope == "session":
             try:
                 from .utils import build_permission_target
 
                 target = build_permission_target(tool_name, arguments)
-                self._session_scoped_targets.add((agent_name, target))
+                with self._scope_lock:
+                    self._session_scoped_targets.add((session_key, target))
             except Exception as e:  # noqa: BLE001 — best-effort, in-memory only
                 logger.debug(
                     "Could not record session approval for tool '%s': %s",
@@ -350,9 +468,9 @@ class ApprovalRegistry:
             try:
                 from .utils import build_permission_target
 
-                self._session_scoped_targets.add(
-                    (agent_name, build_permission_target(tool_name, arguments))
-                )
+                target = build_permission_target(tool_name, arguments)
+                with self._scope_lock:
+                    self._session_scoped_targets.add((session_key, target))
             except Exception:  # noqa: BLE001
                 pass
             return
@@ -376,8 +494,77 @@ class ApprovalRegistry:
             )
 
     def clear_approved(self) -> None:
-        self._approved_context.set(set())
-        self._session_scoped_targets.clear()
+        self._approved_context.set(None)
+        with self._scope_lock:
+            self._session_scoped_targets.clear()
+
+    def release_scope(self, scope_id: str, *, from_finalizer: bool = False) -> None:
+        """Drop all grants recorded under a per-instance approval scope id.
+
+        ``auto_approve_tool`` (skill ``allowed-tools`` pre-approval),
+        ``_persist_scoped_decision`` ("this session" human approvals) and
+        ``mark_approved`` (per-context approval cache) all write entries keyed by
+        an Agent's globally-unique ``_approval_scope_id``. Those ids never repeat,
+        so without eviction a long-running process that creates one Agent per
+        request/session grows these dicts/sets without bound. Called from
+        ``Agent.close()``/``aclose()``/``__del__`` to reclaim a dead agent's
+        entries without touching any other agent's grants.
+
+        ``from_finalizer=True`` must be used from a garbage-collection
+        finalizer, which runs in whichever thread and context the collector
+        fires in, possibly in the middle of a ContextVar update or while this
+        thread already holds ``_scope_lock``. It therefore never writes the
+        ContextVar (the "current" context there is not the agent's anyway) and
+        never blocks on the lock: if the lock is busy the release is queued and
+        applied by the next ``release_scope`` call.
+
+        Mutates the shared collections **in place under ``_scope_lock``** (rather
+        than rebuilding-and-replacing) so a concurrent writer's grant for a
+        *different* scope can never be lost to a read-modify-write race, and
+        iteration can't observe a half-swapped collection.
+        """
+        if not scope_id:
+            return
+        # Lets every context prune this agent's cache keys on its next write.
+        self._dead_scope_ids.append(scope_id)
+        if from_finalizer:
+            if not self._scope_lock.acquire(blocking=False):
+                self._pending_scope_releases.append(scope_id)
+                return
+        else:
+            self._scope_lock.acquire()
+        try:
+            scopes = {scope_id}
+            while self._pending_scope_releases:
+                scopes.add(self._pending_scope_releases.pop())
+            for key in [k for k in self._agent_tool_auto_approve if k[0] in scopes]:
+                self._agent_tool_auto_approve.pop(key, None)
+            for entry in [t for t in self._session_scoped_targets if t[0] in scopes]:
+                self._session_scoped_targets.discard(entry)
+        finally:
+            self._scope_lock.release()
+
+        # Evict this scope's per-context approval-cache keys. ``mark_approved``
+        # stores ``"{scope_id}:{tool}:{hash}"`` entries in the ``_approved_context``
+        # ContextVar; a long-lived context that creates/closes many short-lived
+        # agents would otherwise retain one key per approved call forever. This
+        # only touches the *current* context's set (ContextVars are per
+        # coroutine/thread), which is the context the closing agent ran in.
+        if from_finalizer:
+            return
+        try:
+            approved = self._approved_context.get(None)
+            if isinstance(approved, dict) and approved:
+                remaining = {k: s for k, s in approved.items() if s != scope_id}
+                if len(remaining) != len(approved):
+                    self._approved_context.set(remaining)
+            elif approved:  # a plain set written by older code or tests
+                prefix = f"{scope_id}:"
+                remaining = {k for k in approved if not k.startswith(prefix)}
+                if len(remaining) != len(approved):
+                    self._approved_context.set(remaining)
+        except Exception:  # noqa: BLE001 — cache eviction is best-effort
+            pass
 
     def set_yaml_approved_tools(self, tools: List[str]) -> contextvars.Token:
         return self._yaml_approved_tools.set(set(tools))
@@ -423,6 +610,8 @@ class ApprovalRegistry:
         arguments: Dict,
         force: bool = False,
         auto_approve_scope: Optional[str] = None,
+        scope_id: Optional[str] = None,
+        liveness: Optional[Callable[[], bool]] = None,
     ) -> ApprovalDecision:
         """Synchronous approval — used by ``Agent._execute_tool_impl``.
 
@@ -436,6 +625,12 @@ class ApprovalRegistry:
         that don't pass it keep the old behaviour; passing a per-instance id
         (e.g. ``Agent._approval_scope_id``) prevents skill grants from leaking
         across unrelated agents that share the same display name.
+
+        ``scope_id`` is the same per-instance key applied to the in-memory
+        "this session" grant store, so a human "[s] this session" approval on
+        one agent can't silently unlock the tool for a distinct same-named
+        agent. ``agent_name`` is still used for name-keyed lookups (per-agent
+        backend, risk level, ``ask`` rules, durable ``always`` persistence).
         """
         auto_scope = auto_approve_scope or agent_name
         # Fast-path: not required (checks both global and this agent's scope)
@@ -443,27 +638,27 @@ class ApprovalRegistry:
             return ApprovalDecision(approved=True, reason="No approval required")
 
         # Already approved in this context
-        if self.is_already_approved(tool_name, arguments, agent_name):
+        if self.is_already_approved(tool_name, arguments, agent_name, scope_id):
             return ApprovalDecision(approved=True, reason="Already approved in context")
 
         # "This session" scoped grant covers matching calls for the run
-        if self._is_session_scoped(agent_name, tool_name, arguments):
-            self.mark_approved(tool_name, arguments, agent_name)
+        if self._is_session_scoped(agent_name, tool_name, arguments, scope_id):
+            self.mark_approved(tool_name, arguments, agent_name, scope_id)
             return ApprovalDecision(approved=True, reason="Approved (session)", approver="session")
 
         # Check per-tool auto-approval (G-A fix)
         if self.is_auto_approved(tool_name, auto_scope):
-            self.mark_approved(tool_name, arguments, agent_name)
+            self.mark_approved(tool_name, arguments, agent_name, scope_id)
             return ApprovalDecision(approved=True, reason="Auto-approved (skill)", approver="skill")
 
         # Env auto-approve
         if self.is_env_auto_approve():
-            self.mark_approved(tool_name, arguments, agent_name)
+            self.mark_approved(tool_name, arguments, agent_name, scope_id)
             return ApprovalDecision(approved=True, reason="Auto-approved (env)", approver="env")
 
         # YAML auto-approve
         if self.is_yaml_approved(tool_name):
-            self.mark_approved(tool_name, arguments, agent_name)
+            self.mark_approved(tool_name, arguments, agent_name, scope_id)
             return ApprovalDecision(approved=True, reason="Auto-approved (yaml)", approver="yaml")
 
         # Delegate to backend
@@ -473,6 +668,7 @@ class ApprovalRegistry:
             arguments=arguments,
             risk_level=self.get_risk_level(tool_name, agent_name) or "medium",
             agent_name=agent_name,
+            liveness=liveness,
         )
 
         # Prefer sync method if available
@@ -486,9 +682,16 @@ class ApprovalRegistry:
                 timeout=self.timeout
             )
 
+        # Live-authority gate: a resolution that lands after the originating
+        # turn was stopped/superseded is dropped fail-closed — the tool does not
+        # run and no durable session/always grant is persisted.
+        stale = self._reject_if_stale(request)
+        if stale is not None:
+            return stale
+
         if decision.approved:
-            self.mark_approved(tool_name, arguments, agent_name)
-        self._persist_scoped_decision(agent_name, tool_name, arguments, decision)
+            self.mark_approved(tool_name, arguments, agent_name, scope_id)
+        self._persist_scoped_decision(agent_name, tool_name, arguments, decision, scope_id)
         return decision
 
     async def approve_async(
@@ -498,36 +701,39 @@ class ApprovalRegistry:
         arguments: Dict,
         force: bool = False,
         auto_approve_scope: Optional[str] = None,
+        scope_id: Optional[str] = None,
+        liveness: Optional[Callable[[], bool]] = None,
     ) -> ApprovalDecision:
         """Asynchronous approval — used by async tool execution path.
 
-        See :meth:`approve_sync` for the ``force`` and ``auto_approve_scope``
-        semantics (per-call gate, no shared-state mutation).
+        See :meth:`approve_sync` for the ``force``, ``auto_approve_scope`` and
+        ``scope_id`` semantics (per-call gate, no shared-state mutation,
+        per-instance session-grant keying).
         """
         auto_scope = auto_approve_scope or agent_name
         # Fast-path: not required (checks both global and this agent's scope)
         if not force and not self.is_required(tool_name, agent_name):
             return ApprovalDecision(approved=True, reason="No approval required")
 
-        if self.is_already_approved(tool_name, arguments, agent_name):
+        if self.is_already_approved(tool_name, arguments, agent_name, scope_id):
             return ApprovalDecision(approved=True, reason="Already approved in context")
 
         # "This session" scoped grant covers matching calls for the run
-        if self._is_session_scoped(agent_name, tool_name, arguments):
-            self.mark_approved(tool_name, arguments, agent_name)
+        if self._is_session_scoped(agent_name, tool_name, arguments, scope_id):
+            self.mark_approved(tool_name, arguments, agent_name, scope_id)
             return ApprovalDecision(approved=True, reason="Approved (session)", approver="session")
 
         # Check per-tool auto-approval (G-A fix)
         if self.is_auto_approved(tool_name, auto_scope):
-            self.mark_approved(tool_name, arguments, agent_name)
+            self.mark_approved(tool_name, arguments, agent_name, scope_id)
             return ApprovalDecision(approved=True, reason="Auto-approved (skill)", approver="skill")
 
         if self.is_env_auto_approve():
-            self.mark_approved(tool_name, arguments, agent_name)
+            self.mark_approved(tool_name, arguments, agent_name, scope_id)
             return ApprovalDecision(approved=True, reason="Auto-approved (env)", approver="env")
 
         if self.is_yaml_approved(tool_name):
-            self.mark_approved(tool_name, arguments, agent_name)
+            self.mark_approved(tool_name, arguments, agent_name, scope_id)
             return ApprovalDecision(approved=True, reason="Auto-approved (yaml)", approver="yaml")
 
         backend = self.get_backend(agent_name)
@@ -536,6 +742,7 @@ class ApprovalRegistry:
             arguments=arguments,
             risk_level=self.get_risk_level(tool_name, agent_name) or "medium",
             agent_name=agent_name,
+            liveness=liveness,
         )
 
         try:
@@ -546,7 +753,38 @@ class ApprovalRegistry:
         except asyncio.TimeoutError:
             decision = ApprovalDecision(approved=False, reason="Approval timed out")
 
+        # Live-authority gate: a resolution that lands after the originating
+        # turn was stopped/superseded is dropped fail-closed — the tool does not
+        # run and no durable session/always grant is persisted.
+        stale = self._reject_if_stale(request)
+        if stale is not None:
+            return stale
+
         if decision.approved:
-            self.mark_approved(tool_name, arguments, agent_name)
-        self._persist_scoped_decision(agent_name, tool_name, arguments, decision)
+            self.mark_approved(tool_name, arguments, agent_name, scope_id)
+        self._persist_scoped_decision(agent_name, tool_name, arguments, decision, scope_id)
         return decision
+
+    @staticmethod
+    def _reject_if_stale(request: ApprovalRequest) -> Optional[ApprovalDecision]:
+        """Return a fail-closed denial when ``request.liveness`` reports stale.
+
+        A ``None`` liveness (the default) keeps today's behaviour by returning
+        ``None`` (no rejection). A liveness probe that raises is treated as live
+        (fail-open on the *probe*, not the decision) so a buggy predicate can
+        never wedge the approval path. When the predicate returns falsy the
+        originating turn was stopped or superseded while awaiting the human, so
+        the decision is dropped and no grant is persisted.
+        """
+        live = getattr(request, "liveness", None)
+        if live is None:
+            return None
+        try:
+            if live():
+                return None
+        except Exception:  # noqa: BLE001 - a liveness probe must never crash
+            return None
+        return ApprovalDecision(
+            approved=False,
+            reason="Turn no longer live (stopped or superseded)",
+        )

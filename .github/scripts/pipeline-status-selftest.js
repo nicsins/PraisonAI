@@ -55,6 +55,27 @@ const blockers = ps.deriveBlockerLabels({
 });
 assert('maps ci blocker', blockers.includes('pipeline/blocked:ci'));
 assert('maps manual blocker', blockers.includes('pipeline/blocked:manual-review'));
+assert(
+  'maps vendor tool to wrong-repo blocker',
+  ps.deriveBlockerLabels({
+    ready: false,
+    reasons: ['new vendor tool module in core (src/.../fxmacrodata_tools.py) — belongs in PraisonAI-Tools'],
+  }).includes('pipeline/blocked:wrong-repo')
+);
+assert(
+  'maps wrong FINAL vendor approval to wrong-repo',
+  ps.deriveBlockerLabels({
+    ready: false,
+    reasons: ['FINAL approved vendor tool in core (wrong verdict) — re-trigger FINAL'],
+  }).includes('pipeline/blocked:wrong-repo')
+);
+assert(
+  'core vendor tag when added *_tools.py',
+  mg.shouldTagCoreVendorToolMisroute(
+    [{ status: 'added', filename: 'src/praisonai-agents/praisonaiagents/tools/fxmacrodata_tools.py' }],
+    []
+  )
+);
 
 assert(
   'internal link matches upstream base',
@@ -68,6 +89,35 @@ assert(
   'fork sync link rejected',
   !mg.isInternalPullRequestLink(
     { number: 21, base: { repo: { full_name: 'Milkmange/PraisonAI' } } },
+    'MervinPraison',
+    'PraisonAI'
+  )
+);
+
+assert(
+  'external example only path',
+  mg.isExternalExampleOnlyChange([{ filename: 'examples/tools/external/arxiv/tool.py' }])
+);
+assert(
+  'mixed paths not external-example only',
+  !mg.isExternalExampleOnlyChange([
+    { filename: 'examples/tools/external/foo.py' },
+    { filename: 'src/praisonai-agents/foo.py' },
+  ])
+);
+
+assert(
+  'upstream head repo',
+  ps.isUpstreamHeadRepo(
+    { head: { repo: { full_name: 'MervinPraison/PraisonAI' } } },
+    'MervinPraison',
+    'PraisonAI'
+  )
+);
+assert(
+  'fork head repo still synced (not upstream)',
+  !ps.isUpstreamHeadRepo(
+    { head: { repo: { full_name: 'ai-mrscraper/PraisonAI' } } },
     'MervinPraison',
     'PraisonAI'
   )

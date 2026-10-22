@@ -44,12 +44,46 @@ class FileLock:
         self.lock_path = Path(str(path) + ".lock")
         self.timeout = timeout
         self._fd = None
-    
+        self._heartbeat_stop: Optional[threading.Event] = None
+        self._heartbeat_thread: Optional[threading.Thread] = None
+
+    def _start_heartbeat(self) -> None:
+        """Refresh the lock file's mtime while the lock is held.
+
+        Staleness is judged by the lock *file's* age (see ``__enter__``), but a
+        legitimately long critical section would otherwise let the file age past
+        ``timeout`` and be reclaimed out from under its live holder — admitting
+        two writers into the read-modify-write save. A live holder therefore
+        keeps its lock "fresh" by touching the mtime well within ``timeout``;
+        only a crashed holder (heartbeat gone) ages out and is reclaimed.
+        """
+        self._heartbeat_stop = threading.Event()
+        interval = max(self.timeout / 3.0, 0.001)
+
+        def _beat() -> None:
+            while not self._heartbeat_stop.wait(interval):
+                try:
+                    os.utime(self.lock_path, None)
+                except OSError:
+                    # Lock file gone (released/reclaimed); stop heartbeating.
+                    break
+
+        self._heartbeat_thread = threading.Thread(target=_beat, daemon=True)
+        self._heartbeat_thread.start()
+
+    def _stop_heartbeat(self) -> None:
+        """Stop the mtime-refresh heartbeat thread if running."""
+        if self._heartbeat_stop is not None:
+            self._heartbeat_stop.set()
+        if self._heartbeat_thread is not None:
+            self._heartbeat_thread.join(timeout=1.0)
+        self._heartbeat_stop = None
+        self._heartbeat_thread = None
+
     def __enter__(self):
         """Acquire the lock."""
         import time
-        start = time.time()
-        
+
         while True:
             try:
                 # Try to create lock file exclusively
@@ -59,19 +93,35 @@ class FileLock:
                 )
                 break
             except FileExistsError:
-                if time.time() - start > self.timeout:
-                    # Force remove stale lock
+                # Staleness is judged by the lock *file's* own age, not by how
+                # long this waiter has been queued. A live holder refreshes the
+                # mtime via a heartbeat (see _start_heartbeat), so a lock held
+                # for a legitimately long critical section stays fresh and is
+                # NOT busted out from under its holder (which would let two
+                # writers corrupt the read-modify-write save). Only a truly
+                # abandoned lock — its file older than ``timeout`` because the
+                # holder crashed without running __exit__ or heartbeating — is
+                # reclaimed.
+                try:
+                    age = time.time() - self.lock_path.stat().st_mtime
+                except OSError:
+                    # Lock file vanished between the failed open and stat();
+                    # just retry the exclusive create.
+                    age = 0.0
+                if age > self.timeout:
                     try:
                         self.lock_path.unlink()
                     except Exception:
                         pass
                     continue
                 time.sleep(0.01)
-        
+
+        self._start_heartbeat()
         return self
     
     def __exit__(self, exc_type, exc_val, exc_tb):
         """Release the lock."""
+        self._stop_heartbeat()
         if self._fd is not None:
             try:
                 os.close(self._fd)
@@ -141,6 +191,7 @@ class BaseJSONStore:
         self._lock = threading.Lock()
         self._data: Dict[str, Any] = {}
         self._backend = backend
+        self._read_failed = False
         
         if backend is None:
             # File-based storage (default)
@@ -168,7 +219,7 @@ class BaseJSONStore:
         """
         return {}
     
-    def _load(self) -> None:
+    def _load(self, *, strict: bool = False) -> None:
         """Load data from storage file or backend."""
         if self._backend is not None:
             loaded = self._backend.load(self._storage_key)
@@ -186,9 +237,19 @@ class BaseJSONStore:
             else:
                 with open(self.storage_path, "r", encoding="utf-8") as f:
                     self._data = json.load(f)
-        except (json.JSONDecodeError, IOError) as e:
+            self._read_failed = False
+        except (UnicodeDecodeError, json.JSONDecodeError, IOError) as e:
+            self._read_failed = not isinstance(e, FileNotFoundError)
+            if strict and not isinstance(e, FileNotFoundError):
+                raise
             logger.warning(f"Failed to load {self.storage_path}: {e}")
             self._data = self._default_data()
+
+    def _load_strict(self) -> Dict[str, Any]:
+        """Load for runtime mutations; preserve failed-read errors and cache."""
+        with self._lock:
+            self._load(strict=True)
+            return self._data.copy()
     
     def _save(self) -> None:
         """Save data to storage file or backend with atomic write."""
@@ -200,6 +261,13 @@ class BaseJSONStore:
                 raise
             return
         
+        # Defaults from a failed read must not replace their unreadable source.
+        # A successful reload or explicit reset/deletion permits writes again.
+        if self._read_failed:
+            if self.storage_path.exists():
+                raise OSError(f"Refusing to overwrite unreadable record: {self.storage_path}")
+            self._read_failed = False
+
         try:
             dir_path = self.storage_path.parent
             dir_path.mkdir(parents=True, exist_ok=True)
@@ -212,8 +280,8 @@ class BaseJSONStore:
                 delete=False,
                 suffix=".tmp"
             ) as f:
-                json.dump(self._data, f, indent=2, default=str, ensure_ascii=False)
                 temp_path = f.name
+                json.dump(self._data, f, indent=2, default=str, ensure_ascii=False)
             
             # Atomic rename
             if self.use_file_lock:
@@ -262,9 +330,18 @@ class BaseJSONStore:
     
     def clear(self) -> None:
         """Clear all stored data."""
+        self._reset(self._default_data())
+
+    def _reset(self, data: Dict[str, Any]) -> None:
+        """Atomically replace data for an explicit clear, restoring guards on failure."""
         with self._lock:
-            self._data = self._default_data()
-            self._save()
+            previous_data, previous_failed = self._data, self._read_failed
+            self._data, self._read_failed = data, False
+            try:
+                self._save()
+            except BaseException:
+                self._data, self._read_failed = previous_data, previous_failed
+                raise
     
     def delete(self) -> bool:
         """
@@ -284,6 +361,7 @@ class BaseJSONStore:
                 if self.storage_path.exists():
                     self.storage_path.unlink()
                     self._data = self._default_data()
+                    self._read_failed = False
                     return True
                 return False
             except Exception as e:
@@ -293,7 +371,7 @@ class BaseJSONStore:
 def list_json_sessions(
     storage_dir: Path,
     suffix: str = ".json",
-    limit: int = 50,
+    limit: Optional[int] = 50,
 ) -> List[BaseSessionInfo]:
     """
     List all sessions in a directory.
@@ -303,7 +381,7 @@ def list_json_sessions(
     Args:
         storage_dir: Directory to search
         suffix: File suffix to filter by
-        limit: Maximum number of sessions to return
+        limit: Maximum number of sessions to return, or None for all sessions
         
     Returns:
         List of BaseSessionInfo, sorted by modification time (newest first)
@@ -320,7 +398,7 @@ def list_json_sessions(
                 # Try to get item count from file
                 if suffix == ".json":
                     try:
-                        with open(file_path, "r") as f:
+                        with open(file_path, "r", encoding="utf-8") as f:
                             data = json.load(f)
                             # Common patterns for item count
                             if "iterations" in data:
@@ -333,7 +411,7 @@ def list_json_sessions(
                         pass
                 elif suffix == ".jsonl":
                     try:
-                        with open(file_path, "r") as f:
+                        with open(file_path, "r", encoding="utf-8") as f:
                             info.item_count = sum(1 for _ in f)
                     except Exception:
                         pass
@@ -374,7 +452,7 @@ def cleanup_old_sessions(
     now = datetime.now()
     
     # Get all sessions sorted by age (oldest first)
-    sessions = list_json_sessions(storage_dir, suffix, limit=10000)
+    sessions = list_json_sessions(storage_dir, suffix, limit=None)
     sessions.sort(key=lambda s: s.modified_at)
     
     # Delete old sessions
@@ -434,6 +512,7 @@ class AsyncBaseJSONStore:
         self.storage_path = Path(storage_path)
         self._backend = backend
         self._data: Dict[str, Any] = {}
+        self._read_failed = False
         self._async_lock: Optional[Any] = None  # Lazy init asyncio.Lock
         self._async_lock_init: threading.Lock = threading.Lock()  # Thread-safe initialization
         
@@ -474,7 +553,12 @@ class AsyncBaseJSONStore:
                     async with aiofiles.open(self.storage_path, "r", encoding="utf-8") as f:
                         content = await f.read()
                         self._data = json.loads(content)
-                except (FileNotFoundError, json.JSONDecodeError):
+                    self._read_failed = False
+                except FileNotFoundError:
+                    self._read_failed = False
+                    self._data = self._default_data()
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    self._read_failed = True
                     self._data = self._default_data()
             
             return self._data.copy()
@@ -491,11 +575,34 @@ class AsyncBaseJSONStore:
                 else:
                     self._backend.save(self._storage_key, self._data)
             else:
-                # File-based async write
+                if self._read_failed:
+                    if self.storage_path.exists():
+                        raise OSError(f"Refusing to overwrite unreadable record: {self.storage_path}")
+                    self._read_failed = False
+                # File-based async write. Serialise to a string FIRST, write it
+                # to a temp file, then os.replace it into place so a crash/kill
+                # mid-write cannot truncate the previous good file (writing
+                # directly to the target truncates it before any bytes land).
                 import aiofiles
                 self.storage_path.parent.mkdir(parents=True, exist_ok=True)
-                async with aiofiles.open(self.storage_path, "w", encoding="utf-8") as f:
-                    await f.write(json.dumps(self._data, indent=2, default=str, ensure_ascii=False))
+                payload = json.dumps(self._data, indent=2, default=str, ensure_ascii=False)
+                dir_path = self.storage_path.parent
+                fd, temp_path = tempfile.mkstemp(
+                    dir=str(dir_path),
+                    prefix=self.storage_path.name + ".",
+                    suffix=".tmp",
+                )
+                os.close(fd)
+                try:
+                    async with aiofiles.open(temp_path, "w", encoding="utf-8") as f:
+                        await f.write(payload)
+                    os.replace(temp_path, self.storage_path)
+                except BaseException:
+                    try:
+                        os.remove(temp_path)
+                    except OSError:
+                        pass
+                    raise
     
     async def exists_async(self) -> bool:
         """Check if storage exists asynchronously."""
@@ -522,6 +629,7 @@ class AsyncBaseJSONStore:
             if self.storage_path.exists():
                 self.storage_path.unlink()
                 self._data = self._default_data()
+                self._read_failed = False
                 return True
             return False
 

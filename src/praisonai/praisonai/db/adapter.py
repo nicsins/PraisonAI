@@ -16,6 +16,8 @@ import inspect
 import time
 import logging
 import threading
+import weakref
+import concurrent.futures
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -52,23 +54,72 @@ class PraisonAIDB:
         database_url: Optional[str] = None,
         state_url: Optional[str] = None,
         knowledge_url: Optional[str] = None,
+        *,
+        conversation_options: Optional[Dict[str, Any]] = None,
+        state_options: Optional[Dict[str, Any]] = None,
+        knowledge_options: Optional[Dict[str, Any]] = None,
+        database_backend: Optional[str] = None,
+        state_backend: Optional[str] = None,
+        knowledge_backend: Optional[str] = None,
         **options
     ):
         """
         Initialize PraisonDB adapter.
-        
+
         Args:
             database_url: URL for conversation storage (postgres, mysql, sqlite)
             state_url: URL for state storage (redis, etc.)
             knowledge_url: URL for knowledge/vector storage (qdrant, etc.)
-            **options: Additional backend-specific options
+            conversation_options: Backend-specific kwargs for the conversation store
+            state_options: Backend-specific kwargs for the state store
+            knowledge_options: Backend-specific kwargs for the knowledge store
+            database_backend: Explicit conversation backend name. Wins over URL
+                scheme detection — use it to reach a registered backend whose URL
+                scheme is not auto-inferable (e.g. a custom driver).
+            state_backend: Explicit state backend name (e.g. ``"mongodb"``,
+                ``"dynamodb"``, ``"firestore"``, ``"gcs"``, ``"memory"``). Wins
+                over URL scheme detection.
+            knowledge_backend: Explicit knowledge/vector backend name (e.g.
+                ``"chroma"``, ``"pinecone"``, ``"lancedb"``, ``"pgvector"``).
+                Wins over URL scheme detection.
+            **options: Deprecated. Backend-specific options broadcast to EVERY
+                configured store. This corrupts multi-backend setups because one
+                backend's kwarg (e.g. Postgres ``ssl_mode``) is also handed to an
+                unrelated store (e.g. Redis). Prefer the per-store dicts above.
         """
         self._database_url = database_url
         self._state_url = state_url
         self._knowledge_url = knowledge_url
+        self._database_backend = database_backend
+        self._state_backend = state_backend
+        self._knowledge_backend = knowledge_backend
         # Pop adapter-level options before forwarding the rest to the backend
         # store factories, so they are never passed through as backend kwargs.
         init_retry_cooldown = options.pop("init_retry_cooldown", 30.0)
+
+        # Per-store options keep backend-specific kwargs from colliding across
+        # unrelated stores (mirrors persistence.config.PersistenceConfig).
+        self._conversation_options: Dict[str, Any] = dict(conversation_options or {})
+        self._state_options: Dict[str, Any] = dict(state_options or {})
+        self._knowledge_options: Dict[str, Any] = dict(knowledge_options or {})
+
+        if options:
+            # Legacy broadcast path: kept for back-compat but warns, because
+            # sharing one dict across three factories cross-contaminates backends.
+            import warnings
+            warnings.warn(
+                "PraisonAIDB(**options) applies the same kwargs to every backend, "
+                "which corrupts multi-backend setups. Pass per-store dicts instead: "
+                "conversation_options=..., state_options=..., knowledge_options=...",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            for key, value in options.items():
+                self._conversation_options.setdefault(key, value)
+                self._state_options.setdefault(key, value)
+                self._knowledge_options.setdefault(key, value)
+
+        # Retained for back-compat with any external references to ._options.
         self._options = options
         
         # Lazy-loaded stores
@@ -77,9 +128,12 @@ class PraisonAIDB:
         self._knowledge_store = None
         self._initialized = False
         self._init_lock = threading.Lock()          # guards the sync init path
-        # Async callers use a dedicated asyncio.Lock (created lazily per loop) so
-        # the event loop is never blocked on a threading.Lock, and the blocking
-        # store construction runs off-loop via asyncio.to_thread.
+        # Async callers do NOT cache an asyncio.Lock on the instance: such a lock
+        # binds to the loop that created it and raises when awaited from another
+        # (e.g. per-session scoped_bridge loops sharing one adapter). Instead the
+        # blocking store construction runs off-loop via asyncio.to_thread, where
+        # the sync _init_lock already serialises init. Kept as None for backward
+        # compatibility with any external references.
         self._ainit_lock: Optional["asyncio.Lock"] = None
         # Remember the last init failure so a soft error (bad config / missing
         # dep / cloud auth failure) is surfaced cleanly instead of being re-tried
@@ -92,6 +146,12 @@ class PraisonAIDB:
         self._init_failed_at: float = 0.0
         # Seconds to suppress retries after an init failure before re-attempting.
         self._init_retry_cooldown: float = float(init_retry_cooldown)
+        # Per-instance fire-and-forget write tracking so a tenant's close()
+        # flushes only ITS OWN in-flight writes: a process-global set would make
+        # one tenant's close() wait on (and spend its flush budget on) another
+        # tenant's stuck writes. A WeakSet lets completed futures be GC'd.
+        self._bg_writes: "weakref.WeakSet[concurrent.futures.Future]" = weakref.WeakSet()
+        self._bg_writes_lock = threading.Lock()
 
     @classmethod
     def _from_stores(
@@ -111,7 +171,13 @@ class PraisonAIDB:
         self._database_url = None
         self._state_url = None
         self._knowledge_url = None
+        self._database_backend = None
+        self._state_backend = None
+        self._knowledge_backend = None
         self._options = {}
+        self._conversation_options = {}
+        self._state_options = {}
+        self._knowledge_options = {}
         self._conversation_store = conversation_store
         self._state_store = state_store
         self._knowledge_store = knowledge_store
@@ -121,6 +187,8 @@ class PraisonAIDB:
         self._init_failed = None
         self._init_failed_at = 0.0
         self._init_retry_cooldown = 30.0
+        self._bg_writes = weakref.WeakSet()
+        self._bg_writes_lock = threading.Lock()
         return self
 
     def _build_stores(self):
@@ -132,25 +200,42 @@ class PraisonAIDB:
             create_knowledge_store,
         )
 
-        # Initialize conversation store
-        if self._database_url:
-            backend = self._detect_backend(self._database_url)
+        # Initialize conversation store. An explicit *_backend override always
+        # wins over URL-scheme detection so callers can reach a registered
+        # backend whose scheme isn't auto-inferable. A backend is also built when
+        # only the override is given (no URL): URL-less stores (e.g. ``memory``,
+        # ``dynamodb``, ``firestore``) read their config from ``**options``, so
+        # gating solely on the URL would make the override unreachable.
+        if self._database_url or self._database_backend:
+            backend = self._database_backend or self._detect_backend(
+                self._database_url, kind="conversation"
+            )
             self._conversation_store = create_conversation_store(
-                backend, url=self._database_url, **self._options
+                backend,
+                url=self._normalize_store_url(self._database_url, backend),
+                **self._conversation_options,
             )
 
         # Initialize state store
-        if self._state_url:
-            backend = self._detect_backend(self._state_url)
+        if self._state_url or self._state_backend:
+            backend = self._state_backend or self._detect_backend(
+                self._state_url, kind="state"
+            )
             self._state_store = create_state_store(
-                backend, url=self._state_url, **self._options
+                backend,
+                url=self._normalize_store_url(self._state_url, backend),
+                **self._state_options,
             )
 
         # Initialize knowledge store
-        if self._knowledge_url:
-            backend = self._detect_backend(self._knowledge_url)
+        if self._knowledge_url or self._knowledge_backend:
+            backend = self._knowledge_backend or self._detect_backend(
+                self._knowledge_url, kind="knowledge"
+            )
             self._knowledge_store = create_knowledge_store(
-                backend, url=self._knowledge_url, **self._options
+                backend,
+                url=self._normalize_store_url(self._knowledge_url, backend),
+                **self._knowledge_options,
             )
 
     # DBAPI/driver exception class names that indicate a *transient* connection
@@ -263,23 +348,85 @@ class PraisonAIDB:
         if cached is not None:
             raise cached
 
-        # Create the asyncio.Lock lazily so it binds to the running loop. This
-        # serialises async callers; the off-loop _init_stores serialises against
-        # sync callers via the shared threading _init_lock.
-        if self._ainit_lock is None:
-            self._ainit_lock = asyncio.Lock()
-
-        async with self._ainit_lock:
-            if self._initialized:
-                return
-            cached = self._init_failure_active()
-            if cached is not None:
-                raise cached
-            await asyncio.to_thread(self._init_stores)
+        # Do not cache an asyncio.Lock on the instance: a lock created on one
+        # loop raises RuntimeError when awaited from another (e.g. per-session
+        # scoped_bridge loops sharing one PraisonAIDB). Blocking store
+        # construction is already serialised on the sync _init_lock inside
+        # _init_stores, which runs off the loop via asyncio.to_thread, so async
+        # callers on any loop can never construct stores concurrently.
+        await asyncio.to_thread(self._init_stores)
     
-    def _detect_backend(self, url: str) -> str:
-        """Detect backend type from URL.
-        
+    # Per-kind URL scheme -> registered backend name. These map the schemes a
+    # user naturally writes for a state/knowledge URL onto the names the
+    # persistence registry actually registers, so PraisonAIDB(state_url=...) /
+    # PraisonAIDB(knowledge_url=...) can reach backends beyond the handful the
+    # generic http(s) sniffing covered. An explicit *_backend override still
+    # wins over this table (see _build_stores).
+    #
+    # Only schemes whose backend factory can actually construct a working store
+    # from the URL alone are listed. Backends that need out-of-band config the
+    # URL cannot carry — GCS (``bucket_name``), Cosmos DB (``connection_string``
+    # + database/collection) — are intentionally omitted: they raise a helpful
+    # error pointing the caller at the explicit ``state_backend=``/
+    # ``knowledge_backend=`` override (plus options) instead of failing with an
+    # opaque TypeError/ValueError deep inside the driver.
+    _STATE_URL_SCHEMES = {
+        "redis": "redis",
+        "rediss": "redis",
+        "valkey": "valkey",
+        "dynamodb": "dynamodb",
+        "firestore": "firestore",
+        "mongodb": "mongodb",
+        "mongodb+srv": "mongodb",
+        "upstash": "upstash",
+        "memory": "memory",
+    }
+    _KNOWLEDGE_URL_SCHEMES = {
+        "chroma": "chroma",
+        "chromadb": "chroma",
+        "qdrant": "qdrant",
+        "weaviate": "weaviate",
+        "lancedb": "lancedb",
+        "milvus": "milvus",
+        "pgvector": "pgvector",
+        "surrealdb": "surrealdb_vector",
+        "redis": "redis",
+        "valkey": "valkey",
+    }
+    # A handful of backends consume the connection URL directly (their factory
+    # forwards ``url=`` to a driver), so the friendly scheme a user writes must be
+    # rewritten to the driver's expected scheme before the URL is forwarded.
+    # pgvector runs over PostgreSQL: ``pgvector://host/db`` -> ``postgresql://…``
+    # so psycopg2's connection pool accepts it. Backends that ignore ``url`` (the
+    # SDK factory pops it) are unaffected.
+    _URL_SCHEME_REWRITE = {
+        "pgvector": "postgresql",
+    }
+
+    def _normalize_store_url(self, url: Optional[str], backend: str) -> Optional[str]:
+        """Rewrite a friendly scheme to the driver scheme the backend expects.
+
+        Only applies when the backend's factory forwards ``url=`` to a driver
+        that would reject the friendly scheme (see ``_URL_SCHEME_REWRITE``);
+        every other URL is returned unchanged.
+        """
+        if not url or "://" not in url:
+            return url
+        scheme, rest = url.split("://", 1)
+        target = self._URL_SCHEME_REWRITE.get(scheme.lower())
+        if target is not None:
+            return f"{target}://{rest}"
+        return url
+
+    def _detect_backend(self, url: str, *, kind: Optional[str] = None) -> str:
+        """Detect backend type from URL, optionally scoped to a store ``kind``.
+
+        ``kind`` is one of ``"conversation"``, ``"state"`` or ``"knowledge"``.
+        When given a state/knowledge URL, kind-specific schemes (e.g.
+        ``mongodb://`` for state, ``chroma://`` for knowledge) are matched so the
+        URL resolves to a backend that store kind actually registers. ``kind``
+        defaults to ``None`` (conversation-style detection) for backward compat.
+
         Supports cloud-native serverless providers:
         - Neon (*.neon.tech) -> postgres
         - CockroachDB (*.cockroachlabs.cloud) -> postgres
@@ -289,7 +436,16 @@ class PraisonAIDB:
         - Turso/libSQL (libsql://) -> turso
         """
         url_lower = url.lower()
-        
+        scheme = url_lower.split("://", 1)[0] if "://" in url_lower else ""
+
+        # Kind-specific schemes take priority so e.g. state_url="mongodb://…"
+        # resolves to a state backend rather than falling through the generic
+        # http(s) path or raising.
+        if kind == "state" and scheme in self._STATE_URL_SCHEMES:
+            return self._STATE_URL_SCHEMES[scheme]
+        if kind == "knowledge" and scheme in self._KNOWLEDGE_URL_SCHEMES:
+            return self._KNOWLEDGE_URL_SCHEMES[scheme]
+
         # Turso/libSQL — unique scheme
         if url_lower.startswith("libsql://"):
             return "turso"
@@ -316,12 +472,24 @@ class PraisonAIDB:
             raise ValueError(
                 f"Unable to infer DB backend from URL {url!r}; "
                 "use a recognised scheme (sqlite://, postgres://, redis://, etc.)"
+                + (
+                    "; or pass an explicit "
+                    f"{kind}_backend= to select a registered {kind} backend"
+                    if kind in ("state", "knowledge")
+                    else ""
+                )
             )
         
         # Unknown scheme - fail loudly
         raise ValueError(
             f"Unable to infer DB backend from URL {url!r}; "
             "supported schemes: postgres://, mysql://, sqlite://, redis://, libsql://, http(s)://"
+            + (
+                "; or pass an explicit "
+                f"{kind}_backend= to select a registered {kind} backend"
+                if kind in ("state", "knowledge")
+                else ""
+            )
         )
     
     def on_agent_start(
@@ -366,7 +534,9 @@ class PraisonAIDB:
         if messages is None:
             return []
         
-        # Convert to DbMessage format
+        # Convert to DbMessage format. Carry the structured tool fields so a
+        # resumed tool-using session rebuilds the same transcript the model saw
+        # before (Issue #5075 — parity with the JSON store fix in #3089).
         from praisonaiagents.db.protocol import DbMessage
         return [
             DbMessage(
@@ -374,7 +544,9 @@ class PraisonAIDB:
                 content=msg.content,
                 metadata=msg.metadata or {},
                 timestamp=msg.created_at or time.time(),
-                id=msg.id
+                id=msg.id,
+                tool_calls=getattr(msg, "tool_calls", None),
+                tool_call_id=getattr(msg, "tool_call_id", None),
             )
             for msg in messages
         ]
@@ -439,6 +611,81 @@ class PraisonAIDB:
             msg,
         )
     
+    def on_assistant_message(
+        self,
+        session_id: str,
+        content: str,
+        tool_calls: Optional[List[Any]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Persist an assistant turn that requested tools (Issue #5075).
+
+        Stores the structured ``tool_calls`` verbatim on the
+        ``ConversationMessage`` so a resumed session replays the same
+        assistant turn the model produced. Falls back to a plain assistant
+        message when no tool calls are present.
+        """
+        self._init_stores()
+        if not self._conversation_store:
+            return
+
+        from ..persistence.conversation.base import ConversationMessage
+        import uuid
+
+        msg = ConversationMessage(
+            id=f"msg-{uuid.uuid4().hex[:12]}",
+            session_id=session_id,
+            role="assistant",
+            content=content,
+            tool_calls=tool_calls,
+            metadata=metadata or {},
+            created_at=time.time(),
+        )
+        self._call_store(
+            self._conversation_store,
+            "add_message",
+            "async_add_message",
+            session_id,
+            msg,
+        )
+
+    def on_tool_message(
+        self,
+        session_id: str,
+        content: str,
+        tool_call_id: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Persist a tool result turn linked to its call id (Issue #5075).
+
+        Keeps the ``role="tool"`` result and its ``tool_call_id`` so the
+        resumed message list interleaves results in order, matching the JSON
+        store behaviour from #3089.
+        """
+        self._init_stores()
+        if not self._conversation_store:
+            return
+
+        from ..persistence.conversation.base import ConversationMessage
+        import uuid
+
+        msg = ConversationMessage(
+            id=f"tool-{uuid.uuid4().hex[:12]}",
+            session_id=session_id,
+            role="tool",
+            content=content,
+            tool_call_id=tool_call_id,
+            metadata=metadata or {},
+            created_at=time.time(),
+        )
+        self._call_store(
+            self._conversation_store,
+            "add_message",
+            "async_add_message",
+            session_id,
+            msg,
+        )
+
     @staticmethod
     def _serialize_tool_call(tool_name: str, args: Any, result: Any) -> str:
         """Serialise a tool call for persistence without dropping data.
@@ -497,22 +744,34 @@ class PraisonAIDB:
         self._init_stores()
         if not self._conversation_store:
             return
-        
-        # Update session metadata
-        session = self._call_store(
-            self._conversation_store,
-            "get_session",
-            "async_get_session",
-            session_id,
-        )
-        if session:
-            session.metadata = {**(session.metadata or {}), "ended_at": time.time()}
-            self._call_store(
-                self._conversation_store,
-                "update_session",
-                "async_update_session",
-                session,
+
+        store = self._conversation_store
+
+        # Read-modify-write the session's ``ended_at`` as one coroutine so the
+        # ``get_session`` read never has to cross the loop boundary (which raises
+        # from inside a running loop and would silently drop the update). See
+        # #4945 — same failure mode as the state-store completion hooks.
+        async def _do():
+            session = await self._dispatch_async(
+                store, "get_session", "async_get_session", session_id
             )
+            if not session:
+                return None
+            session.metadata = {**(session.metadata or {}), "ended_at": time.time()}
+            await self._dispatch_async(
+                store, "update_session", "async_update_session", session
+            )
+            return session
+
+        from .._async_bridge import DispatchKind, dispatch_maybe_awaitable
+
+        dispatch_maybe_awaitable(
+            _do(),
+            kind=DispatchKind.WRITE,
+            tracker=self._bg_writes,
+            tracker_lock=self._bg_writes_lock,
+            op_name="on_agent_end",
+        )
     
     def on_run_start(
         self,
@@ -548,19 +807,13 @@ class PraisonAIDB:
         self._init_stores()
         if self._state_store:
             run_key = f"run:{session_id}:{run_id}"
-            run_data = self._call_store(
-                self._state_store, "get", "async_get", run_key
-            ) or {}
-            run_data.update({
+            self._merge_and_set(self._state_store, run_key, {
                 "ended_at": time.time(),
                 "output_content": output_content,
                 "status": status,
                 "metrics": metrics or {},
-                "metadata": {**run_data.get("metadata", {}), **(metadata or {})}
+                "metadata": metadata or {},
             })
-            self._call_store(
-                self._state_store, "set", "async_set", run_key, run_data
-            )
     
     def get_runs(
         self,
@@ -595,22 +848,9 @@ class PraisonAIDB:
             return runs[: max(limit, 0)]
         return runs
     
-    def export_session(
-        self,
-        session_id: str,
-    ) -> Dict[str, Any]:
-        """Export a session as a dictionary."""
-        self._init_stores()
-        
-        if not self._conversation_store:
-            return {}
-        
-        session = self._conversation_store.get_session(session_id)
-        if not session:
-            return {}
-        
-        messages = self._conversation_store.get_messages(session_id)
-        
+    @staticmethod
+    def _session_to_dict(session: Any, messages: Any) -> Dict[str, Any]:
+        """Serialise a conversation session + its messages to a plain dict."""
         return {
             "session_id": session.session_id,
             "user_id": session.user_id,
@@ -626,26 +866,16 @@ class PraisonAIDB:
                     "metadata": msg.metadata,
                     "created_at": msg.created_at
                 }
-                for msg in messages
+                for msg in (messages or [])
             ]
         }
-    
-    def import_session(
-        self,
-        data: Dict[str, Any],
-    ) -> str:
-        """Import a session from a dictionary."""
-        self._init_stores()
-        
-        if not self._conversation_store:
-            raise ValueError("No conversation store configured")
-        
+
+    def _build_import(self, data: Dict[str, Any]):
+        """Build the session + messages to import; returns (session_id, session, messages)."""
         from ..persistence.conversation.base import ConversationSession, ConversationMessage
         import uuid
-        
+
         session_id = data.get("session_id") or f"imported-{uuid.uuid4().hex[:8]}"
-        
-        # Create session
         session = ConversationSession(
             session_id=session_id,
             user_id=data.get("user_id", "default"),
@@ -653,16 +883,8 @@ class PraisonAIDB:
             name=data.get("name", f"Imported Session {session_id}"),
             metadata=data.get("metadata", {})
         )
-        self._call_store(
-            self._conversation_store,
-            "create_session",
-            "async_create_session",
-            session,
-        )
-        
-        # Import messages with new IDs to avoid conflicts
-        for msg_data in data.get("messages", []):
-            msg = ConversationMessage(
+        messages = [
+            ConversationMessage(
                 id=f"msg-{uuid.uuid4().hex[:12]}",  # Always generate new ID
                 session_id=session_id,
                 role=msg_data.get("role", "user"),
@@ -670,14 +892,83 @@ class PraisonAIDB:
                 metadata=msg_data.get("metadata", {}),
                 created_at=msg_data.get("created_at", time.time())
             )
-            self._call_store(
-                self._conversation_store,
-                "add_message",
-                "async_add_message",
-                session_id,
-                msg,
-            )
-        
+            for msg_data in data.get("messages", [])
+        ]
+        return session_id, session, messages
+
+    def export_session(
+        self,
+        session_id: str,
+    ) -> Dict[str, Any]:
+        """Export a session as a dictionary.
+
+        Routes through :meth:`_call_store` so it works on async conversation
+        stores (``mode="async"``) from a sync caller instead of leaking
+        un-awaited coroutines.
+        """
+        self._init_stores()
+        store = self._conversation_store
+        if not store:
+            return {}
+
+        session = self._call_store(store, "get_session", "async_get_session", session_id)
+        if not session:
+            return {}
+
+        messages = self._call_store(store, "get_messages", "async_get_messages", session_id)
+        return self._session_to_dict(session, messages)
+
+    async def aexport_session(
+        self,
+        session_id: str,
+    ) -> Dict[str, Any]:
+        """Async: export a session as a dictionary."""
+        await self._ainit_stores()
+        store = self._conversation_store
+        if not store:
+            return {}
+
+        session = await self._dispatch_async(
+            store, "get_session", "async_get_session", session_id
+        )
+        if not session:
+            return {}
+
+        messages = await self._dispatch_async(
+            store, "get_messages", "async_get_messages", session_id
+        )
+        return self._session_to_dict(session, messages)
+
+    def import_session(
+        self,
+        data: Dict[str, Any],
+    ) -> str:
+        """Import a session from a dictionary."""
+        self._init_stores()
+        store = self._conversation_store
+        if not store:
+            raise ValueError("No conversation store configured")
+
+        session_id, session, messages = self._build_import(data)
+        self._call_store(store, "create_session", "async_create_session", session)
+        for msg in messages:
+            self._call_store(store, "add_message", "async_add_message", session_id, msg)
+        return session_id
+
+    async def aimport_session(
+        self,
+        data: Dict[str, Any],
+    ) -> str:
+        """Async: import a session from a dictionary."""
+        await self._ainit_stores()
+        store = self._conversation_store
+        if not store:
+            raise ValueError("No conversation store configured")
+
+        session_id, session, messages = self._build_import(data)
+        await self._dispatch_async(store, "create_session", "async_create_session", session)
+        for msg in messages:
+            await self._dispatch_async(store, "add_message", "async_add_message", session_id, msg)
         return session_id
     
     # --- Tracing/Observability ---
@@ -717,17 +1008,11 @@ class PraisonAIDB:
         self._init_stores()
         if self._state_store:
             trace_key = f"trace:{trace_id}"
-            trace_data = self._call_store(
-                self._state_store, "get", "async_get", trace_key
-            ) or {}
-            trace_data.update({
+            self._merge_and_set(self._state_store, trace_key, {
                 "ended_at": time.time(),
                 "status": status,
-                "metadata": {**trace_data.get("metadata", {}), **(metadata or {})}
+                "metadata": metadata or {},
             })
-            self._call_store(
-                self._state_store, "set", "async_set", trace_key, trace_data
-            )
     
     def on_span_start(
         self,
@@ -762,17 +1047,11 @@ class PraisonAIDB:
         self._init_stores()
         if self._state_store:
             span_key = f"span:{span_id}"
-            span_data = self._call_store(
-                self._state_store, "get", "async_get", span_key
-            ) or {}
-            span_data.update({
+            self._merge_and_set(self._state_store, span_key, {
                 "ended_at": time.time(),
                 "status": status,
-                "attributes": {**span_data.get("attributes", {}), **(attributes or {})}
-            })
-            self._call_store(
-                self._state_store, "set", "async_set", span_key, span_data
-            )
+                "attributes": attributes or {},
+            }, merge_keys=("attributes",))
     
     def get_traces(
         self,
@@ -831,18 +1110,119 @@ class PraisonAIDB:
             async_fn = getattr(store, async_name, None)
         return async_fn or getattr(store, sync_name, None)
 
-    @staticmethod
-    def _call_store(store, sync_name, async_name, *args, **kwargs):
-        """Call a store from a sync hook without creating per-call event loops."""
+    #: Store ops whose result the caller *reads back* before writing again.
+    #: These MUST return their real value — fire-and-forget would silently drop
+    #: the read: a resumed session would look empty (``get_session`` /
+    #: ``get_messages`` / ``list_sessions``), and the run/trace/span completion
+    #: hooks — which read-modify-write state via ``get`` then ``set`` — would
+    #: merge into an empty ``{}`` and overwrite the persisted record, losing
+    #: identifiers, start timestamps, input, spans, and events. Everything else
+    #: is a write, which is uuid-keyed and idempotent and safe to defer.
+    _READ_OPS = frozenset({"get", "get_session", "get_messages", "list_sessions"})
+
+    def _merge_and_set(self, store, key, patch, merge_keys=("metadata",)):
+        """Atomic read-modify-write of a state-store record from a sync hook.
+
+        The completion hooks (``on_run_end``/``on_agent_end``/``on_trace_end``/
+        ``on_span_end``) previously did ``get`` then ``set`` through two separate
+        :meth:`_call_store` calls. Inside a running event loop the ``get`` half
+        hits ``_READ_OPS`` and raises (``run_sync_or_offload`` refuses to block a
+        loop), the exception is swallowed by the core caller, and the ``set``
+        never runs — the record stays ``status="running"`` forever. See #4945.
+
+        Running the whole get+merge+set as ONE coroutine keeps the read off the
+        loop boundary, so the write half always executes. The merge is uuid-keyed
+        and idempotent, so deferring it as a tracked fire-and-forget write inside
+        a loop is safe by construction — identical to every other completion
+        write in :meth:`_call_store`.
+        """
+
+        async def _do():
+            current = await self._dispatch_async(store, "get", "async_get", key) or {}
+            merged = dict(current)
+            for mk in merge_keys:
+                if mk in patch:
+                    merged[mk] = {**(current.get(mk) or {}), **(patch[mk] or {})}
+            for pk, pv in patch.items():
+                if pk in merge_keys:
+                    continue
+                merged[pk] = pv
+            await self._dispatch_async(store, "set", "async_set", key, merged)
+            return merged
+
+        from .._async_bridge import DispatchKind, dispatch_maybe_awaitable
+
+        return dispatch_maybe_awaitable(
+            _do(),
+            kind=DispatchKind.WRITE,
+            tracker=self._bg_writes,
+            tracker_lock=self._bg_writes_lock,
+            op_name=f"merge_and_set:{key}",
+        )
+
+    def _call_store(self, store, sync_name, async_name, *args, **kwargs):
+        """Call a store from a sync hook without ever blocking or losing data.
+
+        A sync hook can be reached from a plain sync caller *or* from inside a
+        running event loop (several async chat paths still route through the
+        sync ``_persist_message``). When the resolved store method returns a
+        coroutine we must handle both:
+
+        - No running loop: block on the shared bridge via ``run_sync``.
+        - Running loop:
+
+          * **Writes** (default): submitting-then-blocking would park the loop
+            (the pathology ``run_sync_or_offload`` forbids), so we submit to the
+            shared bridge as tracked fire-and-forget. Store writes are uuid-keyed
+            and idempotent per message, so completing them slightly later is safe
+            by construction and strictly better than losing them.
+          * **Reads** (``get``/``get_session``/``get_messages``/…): the caller
+            consumes the return value — either directly (session/message loads)
+            or as the base of a read-modify-write (the run/trace/span completion
+            hooks ``get`` then ``set``). Fire-and-forget would silently drop the
+            read: a resumed session would look empty, and a completion hook would
+            merge into ``{}`` and overwrite the persisted record. We route these
+            through ``run_sync_or_offload``, which returns the value on a sync
+            path and, inside a running loop, fails loudly (steering callers to
+            the ``aon_*`` hooks) instead of corrupting state with a silent
+            ``None``.
+        """
         fn = PraisonAIDB._store_callable(store, sync_name, async_name)
         if fn is None:
             return None
-        result = fn(*args, **kwargs)
-        if inspect.isawaitable(result):
-            from .._async_bridge import run_sync_or_offload
 
-            return run_sync_or_offload(result)
-        return result
+        from .._async_bridge import DispatchKind, dispatch_maybe_awaitable
+
+        kind = (
+            DispatchKind.READ
+            if sync_name in PraisonAIDB._READ_OPS
+            else DispatchKind.WRITE
+        )
+        return dispatch_maybe_awaitable(
+            fn(*args, **kwargs),
+            kind=kind,
+            tracker=self._bg_writes,
+            tracker_lock=self._bg_writes_lock,
+            op_name=sync_name,
+        )
+
+    def flush_pending_writes(self, timeout: Optional[float] = 5.0) -> None:
+        """Give this adapter's in-flight fire-and-forget writes a chance to complete.
+
+        Called from :meth:`close`/:meth:`aclose` so a shutting-down worker does
+        not exit mid-write. Tracking is per-instance, so one tenant's close()
+        waits only on ITS OWN writes and never spends its flush budget on
+        another tenant's stuck future. Best-effort: never raises on a
+        slow/failed write.
+        """
+        with self._bg_writes_lock:
+            pending = [f for f in self._bg_writes if not f.done()]
+        if not pending:
+            return
+        try:
+            concurrent.futures.wait(pending, timeout=timeout)
+        except Exception:  # pragma: no cover - defensive
+            logger.debug("flush_pending_writes wait interrupted", exc_info=True)
 
     @staticmethod
     async def _dispatch_async(store, sync_name, async_name, *args, **kwargs):
@@ -914,6 +1294,8 @@ class PraisonAIDB:
                         metadata=m.metadata or {},
                         timestamp=m.created_at or time.time(),
                         id=m.id,
+                        tool_calls=getattr(m, "tool_calls", None),
+                        tool_call_id=getattr(m, "tool_call_id", None),
                     )
                     for m in (raw or [])
                 ]
@@ -1144,31 +1526,33 @@ class PraisonAIDB:
     async def aclose(self) -> None:
         """Async version of close; idempotent and lock-safe.
 
-        Serialises against concurrent async init callers via ``_ainit_lock`` and
-        resets lifecycle state under the shared sync ``_init_lock`` (off the event
-        loop) so init/close can never race and leave a half-closed adapter that
-        reports ``_initialized`` while its stores are shut.
+        Resets lifecycle state under the shared sync ``_init_lock`` (off the
+        event loop) so init/close can never race and leave a half-closed adapter
+        that reports ``_initialized`` while its stores are shut. No instance-
+        cached asyncio.Lock is used, so a shared adapter is safe to close from a
+        different loop than the one that initialised it (e.g. scoped_bridge).
         """
-        if self._ainit_lock is None:
-            self._ainit_lock = asyncio.Lock()
+        # Flush any fire-and-forget writes submitted from a running loop before
+        # tearing stores down, so a shutting-down worker does not drop in-flight
+        # persistence. Runs off the event loop to avoid blocking it.
+        await asyncio.to_thread(self.flush_pending_writes)
 
-        async with self._ainit_lock:
-            def _snapshot_and_reset():
-                with self._init_lock:
-                    snapshot = (
-                        self._conversation_store,
-                        self._state_store,
-                        self._knowledge_store,
-                    )
-                    self._conversation_store = None
-                    self._state_store = None
-                    self._knowledge_store = None
-                    self._initialized = False
-                    self._init_failed = None
-                    self._init_failed_at = 0.0
-                    return snapshot
+        def _snapshot_and_reset():
+            with self._init_lock:
+                snapshot = (
+                    self._conversation_store,
+                    self._state_store,
+                    self._knowledge_store,
+                )
+                self._conversation_store = None
+                self._state_store = None
+                self._knowledge_store = None
+                self._initialized = False
+                self._init_failed = None
+                self._init_failed_at = 0.0
+                return snapshot
 
-            stores = await asyncio.to_thread(_snapshot_and_reset)
+        stores = await asyncio.to_thread(_snapshot_and_reset)
 
         for store in stores:
             if store is None:
@@ -1209,6 +1593,9 @@ class PraisonAIDB:
         reused ``with db: ...`` block) triggers a clean re-initialisation via
         ``_init_stores()`` instead of dispatching to a closed store.
         """
+        # Flush fire-and-forget writes submitted from a running loop before
+        # tearing stores down so shutdown does not drop in-flight persistence.
+        self.flush_pending_writes()
         with self._init_lock:
             stores = (
                 self._conversation_store,
@@ -1258,7 +1645,7 @@ class SQLiteDB(PraisonAIDB):
         url = database_url or path
         super().__init__(database_url=url, **options)
     
-    def _detect_backend(self, url: str) -> str:
+    def _detect_backend(self, url: str, *, kind: Optional[str] = None) -> str:
         return "sqlite"
 
 
@@ -1357,8 +1744,21 @@ class TursoDB(PraisonAIDB):
             raise ValueError(
                 "Turso database URL required. Provide database_url or set TURSO_DATABASE_URL."
             )
-        options["auth_token"] = token
-        super().__init__(database_url=url, **options)
+        # Scope the auth token to the conversation store only. Stuffing it into
+        # the shared **options bag would leak it into an unrelated state/knowledge
+        # store factory as an unexpected kwarg.
+        conversation_options = dict(options.pop("conversation_options", None) or {})
+        # Only override when we actually resolved a token, and never clobber a
+        # token the caller already placed in conversation_options — otherwise a
+        # None from the (turso_auth_token / TURSO_AUTH_TOKEN) lookup would wipe
+        # an explicitly-supplied credential.
+        if token is not None:
+            conversation_options["auth_token"] = token
+        super().__init__(
+            database_url=url,
+            conversation_options=conversation_options,
+            **options,
+        )
 
 
 # Backward-compatible aliases

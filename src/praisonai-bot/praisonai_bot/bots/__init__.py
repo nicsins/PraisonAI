@@ -16,9 +16,11 @@ if TYPE_CHECKING:
     from .email import EmailBot
     from .agentmail import AgentMailBot
     from .signal import SignalBot
+    from .local import LocalBot
     from .webhook import WebhookBot, WebhookRoute
     from .bot import Bot
-    from .botos import BotOS
+    from .botos import BotOS, ThreadRef
+    from ._room import GatewayRoom
     from ._session import BotSessionManager
     from ._identity import StoreBackedIdentityResolver
     from ._agent_registry import AgentRegistry, normalize_number
@@ -33,7 +35,11 @@ if TYPE_CHECKING:
     from ._presentation_approval_backend import PresentationApprovalBackend
     from ._streaming import StreamingConfig, StreamingMode, DraftStreamer
     from ._outbox import OutboundQueue, OutboundEntry
-    from ._idempotency import SqliteIdempotencyStore, build_idempotency_store
+    from ._idempotency import (
+        RedisIdempotencyStore,
+        SqliteIdempotencyStore,
+        build_idempotency_store,
+    )
     from ._approval_store import ApprovalStore
     from ._delivery_control_store import DeliveryControlStore
     from ._delivery import DurableDelivery, deliver_with_retry
@@ -74,6 +80,9 @@ def __getattr__(name: str):
     if name == "SignalBot":
         from .signal import SignalBot
         return SignalBot
+    if name == "LocalBot":
+        from .local import LocalBot
+        return LocalBot
     if name == "WebhookBot":
         from .webhook import WebhookBot
         return WebhookBot
@@ -86,6 +95,12 @@ def __getattr__(name: str):
     if name == "BotOS":
         from .botos import BotOS
         return BotOS
+    if name == "GatewayRoom":
+        from ._room import GatewayRoom
+        return GatewayRoom
+    if name == "ThreadRef":
+        from .botos import ThreadRef
+        return ThreadRef
     if name == "SlackApproval":
         from ._slack_approval import SlackApproval
         return SlackApproval
@@ -162,6 +177,9 @@ def __getattr__(name: str):
     if name == "SqliteIdempotencyStore":
         from ._idempotency import SqliteIdempotencyStore
         return SqliteIdempotencyStore
+    if name == "RedisIdempotencyStore":
+        from ._idempotency import RedisIdempotencyStore
+        return RedisIdempotencyStore
     if name == "build_idempotency_store":
         from ._idempotency import build_idempotency_store
         return build_idempotency_store
@@ -211,8 +229,9 @@ def __getattr__(name: str):
 __all__ = [
     "TelegramBot", "DiscordBot", "SlackBot", "WhatsAppBot", "LinearBot", "EmailBot", "AgentMailBot",
     "SignalBot",
+    "LocalBot",
     "WebhookBot", "WebhookRoute",
-    "Bot", "BotOS",
+    "Bot", "BotOS", "ThreadRef", "GatewayRoom",
     "BotSessionManager",
     "StoreBackedIdentityResolver",
     "AgentRegistry", "normalize_number",
@@ -220,7 +239,7 @@ __all__ = [
     "DeadTargetRegistry", "DeadTarget",
     "InboundJournal", "JournalEntry",
     "OutboundQueue", "OutboundEntry",
-    "SqliteIdempotencyStore", "build_idempotency_store",
+    "SqliteIdempotencyStore", "RedisIdempotencyStore", "build_idempotency_store",
     "ApprovalStore",
     "DeliveryControlStore",
     "DurableDelivery", "deliver_with_retry", "deliver_chunked",

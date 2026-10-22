@@ -167,6 +167,110 @@ class TestEditDelete:
         bot = RecordingBot()
         assert run(bot.delete_message("c1", "m1")) is False
 
+    def test_delete_declared_but_unbacked_raises_at_call(self):
+        class ClaimsDelete(RecordingBot):
+            capabilities = PlatformCapabilities(supports_delete=True)
+
+        with pytest.raises(NotImplementedError):
+            run(ClaimsDelete().delete_message("c1", "m1"))
+
+
+class TestCapabilityContract:
+    def test_backing_map_covers_declared_flags(self):
+        from praisonaiagents.bots import CAPABILITY_BACKING
+
+        assert CAPABILITY_BACKING["supports_edit"] == "edit_message"
+        assert CAPABILITY_BACKING["supports_delete"] == "delete_message"
+
+    def test_declared_and_backed_passes(self):
+        from praisonaiagents.bots import (
+            verify_capability_contract,
+            enforce_capability_contract,
+        )
+
+        class Backed(RecordingBot):
+            capabilities = PlatformCapabilities(supports_edit=True)
+
+            async def edit_message(self, chat_id, message_id, content):
+                return SendResult(ok=True, chat_id=chat_id)
+
+        bot = Backed()
+        assert verify_capability_contract(bot) == []
+        enforce_capability_contract(bot)  # does not raise
+
+    def test_declared_but_unbacked_is_reported(self):
+        from praisonaiagents.bots import verify_capability_contract
+
+        class Unbacked(RecordingBot):
+            capabilities = PlatformCapabilities(
+                supports_edit=True, supports_delete=True
+            )
+
+        violations = verify_capability_contract(Unbacked())
+        assert any("supports_edit" in v for v in violations)
+        assert any("supports_delete" in v for v in violations)
+
+    def test_enforce_raises_capability_contract_error(self):
+        from praisonaiagents.bots import (
+            CapabilityContractError,
+            enforce_capability_contract,
+        )
+
+        class Unbacked(RecordingBot):
+            capabilities = PlatformCapabilities(supports_edit=True)
+
+        with pytest.raises(CapabilityContractError):
+            enforce_capability_contract(Unbacked())
+
+    def test_unset_flags_do_not_require_backing(self):
+        from praisonaiagents.bots import enforce_capability_contract
+
+        class NoClaims(RecordingBot):
+            capabilities = PlatformCapabilities()
+
+        enforce_capability_contract(NoClaims())  # does not raise
+
+    def test_platform_capabilities_property_is_used(self):
+        from praisonaiagents.bots import verify_capability_contract
+
+        class DictCaps(RecordingBot):
+            capabilities = {"live_edit": True}  # legacy dict, ignored
+
+            @property
+            def platform_capabilities(self):
+                return PlatformCapabilities(supports_edit=True)
+
+        violations = verify_capability_contract(DictCaps())
+        assert any("supports_edit" in v for v in violations)
+
+    def test_non_callable_backing_is_reported(self):
+        from praisonaiagents.bots import verify_capability_contract
+
+        class NoneBacked(RecordingBot):
+            capabilities = PlatformCapabilities(
+                supports_edit=True, supports_delete=True
+            )
+            edit_message = None
+            delete_message = None
+
+        violations = verify_capability_contract(NoneBacked())
+        assert any("supports_edit" in v for v in violations)
+        assert any("supports_delete" in v for v in violations)
+
+    def test_supports_delete_is_appended_positionally(self):
+        # ``supports_delete`` must be the LAST field so external callers using
+        # the previous positional constructor order keep binding each value to
+        # its original meaning (regression for the field-reorder concern).
+        prior_order = PlatformCapabilities(
+            4096,          # max_message_length
+            "codepoints",  # length_unit
+            True,          # supports_edit
+            False,         # supports_typing
+        )
+        assert prior_order.supports_edit is True
+        assert prior_order.supports_typing is False
+        assert prior_order.supports_delete is False
+
 
 class TestFormatting:
     def test_format_message_identity(self):
@@ -184,3 +288,70 @@ class TestSendResult:
         r = SendResult(ok=True, message_id="m1", chat_id="c1")
         d = r.to_dict()
         assert d["ok"] and d["message_id"] == "m1" and d["chat_id"] == "c1"
+
+    def test_status_closed_union(self):
+        assert SendResult(ok=True, message_id="m1").status == "sent"
+        assert SendResult(ok=False, error="boom").status == "failed"
+        assert SendResult(ok=True, queued=True).status == "queued"
+        assert SendResult(ok=True, duplicate=True).status == "duplicate"
+
+    def test_status_in_to_dict(self):
+        d = SendResult(ok=True, queued=True).to_dict()
+        assert d["status"] == "queued"
+        assert d["queued"] is True and d["duplicate"] is False
+
+
+class QueuingBot(BasePlatformAdapter):
+    """Adapter whose ``send`` reports a non-``sent`` outcome per chunk."""
+
+    capabilities = PlatformCapabilities(max_message_length=20)
+
+    def __init__(self, *, queued=False, duplicate=False):
+        self._queued = queued
+        self._duplicate = duplicate
+        self._counter = 0
+
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
+        return True
+
+    async def disconnect(self) -> None:
+        return None
+
+    async def send(self, chat_id, content, *, reply_to=None, metadata=None):
+        self._counter += 1
+        return SendResult(
+            ok=True,
+            message_id=f"m{self._counter}",
+            chat_id=chat_id,
+            queued=self._queued,
+            duplicate=self._duplicate,
+        )
+
+    async def get_chat_info(self, chat_id):
+        return {"id": chat_id}
+
+
+class TestDeliverAggregatesOutcome:
+    def test_deliver_preserves_queued_single_chunk(self):
+        bot = QueuingBot(queued=True)
+        result = asyncio.run(bot.deliver("c1", "hello"))
+        assert result.status == "queued"
+        assert result.queued is True
+
+    def test_deliver_preserves_duplicate_single_chunk(self):
+        bot = QueuingBot(duplicate=True)
+        result = asyncio.run(bot.deliver("c1", "hello"))
+        assert result.status == "duplicate"
+        assert result.duplicate is True
+
+    def test_deliver_preserves_queued_multi_chunk(self):
+        bot = QueuingBot(queued=True)
+        long_text = "a" * 25  # exceeds max_message_length=20 → chunked
+        result = asyncio.run(bot.deliver("c1", long_text))
+        assert result.status == "queued"
+        assert len(result.message_ids) >= 2
+
+    def test_deliver_plain_send_still_sent(self):
+        bot = QueuingBot()
+        result = asyncio.run(bot.deliver("c1", "hello"))
+        assert result.status == "sent"

@@ -8,13 +8,41 @@ system and follows Hermes patterns for worker management.
 
 import asyncio
 import logging
+import math
 import os
 import re
 import subprocess
 import time
 from typing import Dict, Any, List, Optional
 
+from .._guarded_subprocess import run_guarded
+
 logger = logging.getLogger(__name__)
+
+# Ceiling for a single git invocation. Worktree add, merge and commit on a
+# large repository are legitimately slow, so this is set well above the
+# general default: the aim is to bound an indefinite hang, not to fail slow
+# work. Override with PRAISONAI_KANBAN_GIT_TIMEOUT (seconds).
+_DEFAULT_GIT_TIMEOUT = 300.0
+
+
+def _git_timeout() -> float:
+    """Resolve the per-git-command ceiling, ignoring an unusable override.
+
+    ``inf`` is rejected as well as zero and negatives: it is positive and
+    parses cleanly, so accepting it would silently restore the unbounded git
+    call this guard exists to remove.
+    """
+    raw = os.environ.get("PRAISONAI_KANBAN_GIT_TIMEOUT")
+    if not raw:
+        return _DEFAULT_GIT_TIMEOUT
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return _DEFAULT_GIT_TIMEOUT
+    if not math.isfinite(value) or value <= 0:
+        return _DEFAULT_GIT_TIMEOUT
+    return value
 
 # Global dispatcher state
 _dispatcher_running = False
@@ -141,7 +169,14 @@ class KanbanDispatcher:
             return event_name
 
     def _fire_hook_event(self, event_type: str, task_data: Dict[str, Any]):
-        """Fire kanban hook events (when available)."""
+        """Fire a kanban hook event (when the hooks package is available).
+
+        Reserved for transitions the *store* cannot announce for itself.
+        Everything that goes through ``create_task``/``claim_task``/
+        ``move_task``/``record_failure`` is emitted by the store, which is the
+        chokepoint every writer shares; firing it here as well would deliver
+        each transition twice to the same subscriber.
+        """
         try:
             # Try to import and fire hook events from praisonaiagents
             from praisonaiagents.hooks import fire_hook
@@ -238,13 +273,8 @@ class KanbanDispatcher:
                     # reclaim loop can detect a crashed/killed worker.
                     self._record_worker_pid(store, task.id)
 
-                    # Fire claimed hook event
-                    self._fire_hook_event('KANBAN_TASK_CLAIMED', {
-                        'task_id': task.id,
-                        'worker_id': self.worker_id,
-                        'run_id': run_id,
-                        'task': task.to_dict()
-                    })
+                    # KANBAN_TASK_CLAIMED is emitted by store.claim_task()
+                    # above, which is the transition that actually won the CAS.
                 except Exception as post_spawn_err:
                     # Never release the claim for an already-running worker.
                     logger.error(
@@ -379,10 +409,10 @@ class KanbanDispatcher:
 
         for task_id in reclaimed or []:
             logger.warning(f"Reclaimed stale kanban task {task_id} back to 'ready'")
-            self._fire_hook_event('KANBAN_TASK_RECLAIMED', {
-                'task_id': task_id,
-                'worker_id': self.worker_id,
-            })
+            # The running -> ready transition is announced as
+            # KANBAN_TASK_MOVED (reclaimed=True) by the store itself;
+            # 'KANBAN_TASK_RECLAIMED' was never a HookEvent member and so
+            # reached no subscriber.
 
     _SAFE_TASK_ID = re.compile(r"^[A-Za-z0-9._-]+$")
 
@@ -415,12 +445,22 @@ class KanbanDispatcher:
 
         A thin subprocess wrapper so worktree isolation stays self-contained in
         the wrapper without pulling in a Tier-2 package dependency.
+
+        Bounded via :func:`run_guarded`: the dispatcher calls this from inside
+        the gateway's event loop, so a git command blocked on a credential
+        prompt or an ``index.lock`` would otherwise stall every WebSocket
+        client indefinitely. On timeout the result carries returncode 124 and
+        a diagnosis in stderr, which the existing ``returncode == 0`` checks
+        already treat as failure.
+
+        The ceiling is deliberately generous — worktree creation and merges on
+        a large repository are legitimately slow, and the goal is to bound a
+        hang, not to fail slow-but-healthy work.
         """
-        return subprocess.run(
+        return run_guarded(
             ["git", *args],
-            capture_output=True,
-            text=True,
             cwd=cwd or self._repo_dir(),
+            timeout=_git_timeout(),
         )
 
     def _worktree_root(self) -> str:
@@ -637,11 +677,8 @@ class KanbanDispatcher:
                     store, run_id, 'blocked',
                     error=f"merge conflict in: {files}",
                 )
-            self._fire_hook_event('KANBAN_TASK_BLOCKED', {
-                'task_id': task_id,
-                'worker_id': self.worker_id,
-                'conflicted_files': files,
-            })
+            # KANBAN_TASK_BLOCKED is emitted by the move_task('blocked')
+            # above; the conflicted files are recorded on the task comment.
             logger.warning(f"Task {task_id} blocked: merge conflict in {files}")
             return True
 
@@ -844,16 +881,10 @@ class KanbanDispatcher:
                             f"Task completed successfully\n\nOutput:\n{stdout_data[:500]}"
                         )
                         
-                        # Fire completion hook
-                        task = store.get_task(task_id)
-                        self._fire_hook_event('KANBAN_TASK_COMPLETED', {
-                            'task_id': task_id,
-                            'worker_id': self.worker_id,
-                            'return_code': return_code,
-                            'run_id': run_id,
-                            'task': task.to_dict() if task else {}
-                        })
-                        
+                        # KANBAN_TASK_DONE is emitted by the move_task('done')
+                        # above. ('KANBAN_TASK_COMPLETED' was never a HookEvent
+                        # member, so this site reached no subscriber.)
+
                         logger.info(f"Task {task_id} completed successfully")
                     else:
                         # Failed - close run as failed, count it, circuit-break.
@@ -906,18 +937,10 @@ class KanbanDispatcher:
                                 f"auto-releasing for retry.\n\nOutput:\n{stdout_data[:500]}"
                             )
                         
-                        # Fire failure hook
-                        task = store.get_task(task_id)
-                        self._fire_hook_event('KANBAN_TASK_FAILED', {
-                            'task_id': task_id,
-                            'worker_id': self.worker_id,
-                            'return_code': return_code,
-                            'error': stdout_data[:500],
-                            'run_id': run_id,
-                            'circuit_broken': circuit_broken,
-                            'task': task.to_dict() if task else {}
-                        })
-                        
+                        # KANBAN_TASK_FAILED is emitted by store.record_failure()
+                        # above (with the attempt counter and circuit-breaker
+                        # state); the exit code travels in its ``error``.
+
                         logger.warning(
                             f"Task {task_id} failed with code {return_code} "
                             f"(circuit_broken={circuit_broken})"

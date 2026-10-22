@@ -21,7 +21,7 @@ import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 # The shell matches this exact prefix. Printed once, after the socket is bound,
 # so a port announced here is always a port that is actually listening.
@@ -118,6 +118,10 @@ LOCK_PATH = DATA_DIR / "engine.lock"
 # Built on first use: importing the training module costs nothing until someone
 # opens the tab, and the engine must stay fast to start for chat.
 _TRAINER = None
+_BOTS = None
+_KNOWLEDGE = None
+_MEDIA = None
+_STUDIO = None
 LOCK_FORMAT_VERSION = 2
 
 
@@ -309,7 +313,15 @@ def _chat_path(cid: str) -> pathlib.Path:
 
 def load_chat(cid: str) -> dict:
     try:
-        return json.loads(_chat_path(cid).read_text())
+        chat = json.loads(_chat_path(cid).read_text())
+        if not isinstance(chat, dict):
+            # Valid JSON, wrong shape -- the app's own export is a list. Every
+            # caller does chat.get(...), so a non-dict escapes as AttributeError
+            # and drops the connection. /projects and /search both call this on
+            # the same files list_chats() walks, so hardening only list_chats()
+            # left those two routes crashing on exactly the file this fixes.
+            raise ValueError("not a chat object")
+        return chat
     except (OSError, ValueError):
         # Absent and corrupt are answered the same way here on purpose: the
         # caller is opening a conversation, and either way there is nothing to
@@ -336,6 +348,9 @@ def list_chats() -> list:
     for f in CHATS_DIR.glob("*.json"):
         try:
             c = json.loads(f.read_text())
+            if not isinstance(c, dict):
+                # Valid JSON, wrong shape -- the app's own export is a list.
+                raise ValueError("not a chat object")
             out.append({
                 "id": c.get("id", f.stem),
                 "title": c.get("title") or "New chat",
@@ -349,6 +364,59 @@ def list_chats() -> list:
             out.append({"id": f.stem, "title": "(unreadable)", "updated": 0,
                         "count": 0, "corrupt": True})
     return sorted(out, key=lambda c: c["updated"], reverse=True)
+
+
+def _search_chats(query: str) -> list:
+    """Ranked full-text search over stored chats.
+
+    Delegates to the library's ``SqliteSessionStore`` (FTS5/bm25 with snippets
+    and lineage dedup) over the on-disk chat transcripts instead of loading
+    every chat JSON and doing a substring ``in`` scan. The chats already live
+    on disk as ``<id>.json`` with a ``messages`` list, which the store indexes
+    directly. Falls back to the substring scan if the store is unavailable so
+    search never breaks.
+    """
+    try:
+        from praisonaiagents.session import SqliteSessionStore
+
+        class _ChatSessionStore(SqliteSessionStore):
+            # Desktop chats persist their identity under ``id`` (see save_chat),
+            # not the ``session_id`` the session schema expects, so a loaded
+            # chat's ``session_id`` is empty and every chat would collide on the
+            # same empty index key. Backfill it from the filename-derived id so
+            # each chat is indexed and addressable independently.
+            def _read_session_fresh(self, session_id):
+                session = super()._read_session_fresh(session_id)
+                if not getattr(session, "session_id", ""):
+                    session.session_id = session_id
+                return session
+
+        # An in-memory index is rebuilt from the current on-disk transcripts on
+        # each query, so an edited chat is never served stale — a persistent
+        # index would skip re-indexing chats whose id is already present.
+        store = _ChatSessionStore(session_dir=str(CHATS_DIR), db_path=":memory:")
+        hits = store.search(query, limit=20)
+        titles = {c["id"]: c["title"] for c in list_chats()}
+        return [
+            {
+                "id": h.session_id,
+                "title": titles.get(h.session_id, h.title or "New chat"),
+                "snippet": h.snippet,
+            }
+            for h in hits
+        ]
+    except Exception:
+        needle = query.lower()
+        hits = []
+        for meta in list_chats():
+            chat = load_chat(meta["id"])
+            for m in chat.get("messages", []):
+                if needle in str(m.get("content", "")).lower():
+                    hits.append({"id": meta["id"], "title": meta["title"],
+                                 "snippet": str(m.get("content"))[:120]})
+                    break
+        return hits
+
 
 _agent_lock = threading.Lock()
 _agents = {}
@@ -507,10 +575,17 @@ def _builtin_tools():
     user cannot refuse is the wrong order to build in.
     """
 
+    # Risk class per tool. "smart" mode waves through low-risk reads and only
+    # prompts for medium-or-higher; anything unlisted is treated as high so a
+    # new tool is guarded by default rather than silently trusted.
+    _low_risk = {"read_file", "list_directory", "current_time", "web_search"}
+
     def _gate(name, args):
         """Ask the user before a filesystem read. Returns True when allowed."""
         mode = load_settings().get("approval_mode", "ask")
         if mode == "never" or name in _always_allow:
+            return True
+        if mode == "smart" and name in _low_risk:
             return True
         if getattr(_tool_events, "emit", None) is None:
             # No stream to ask on. Blocking here would hang the turn for the
@@ -598,14 +673,27 @@ def _builtin_tools():
             url: An http(s) URL.
         """
         import re as _re
+        import urllib.error as _e
         import urllib.request as _r
 
         if not url.startswith(("http://", "https://")):
             return "Only http and https URLs are supported."
         if not _gate("fetch_url", {"url": url}):
             return "The user declined this tool call."
+
+        # The user approved *this* URL. A 3xx would fetch a different one --
+        # any host, any port, including this engine on loopback -- under the
+        # same approval, which makes the card a lie about what happens. Refuse
+        # the redirect and say so, so the model can ask for the new URL and
+        # get a second card rather than silently reaching an unapproved host.
+        class _NoRedirect(_r.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                raise _e.HTTPError(req.full_url, code,
+                                   f"redirect to {newurl} was not approved",
+                                   headers, fp)
+
         try:
-            with _r.urlopen(url, timeout=20) as resp:
+            with _r.build_opener(_NoRedirect).open(url, timeout=20) as resp:
                 body = resp.read(400_000).decode("utf-8", "replace")
         except Exception as exc:  # noqa: BLE001
             return f"Fetch failed: {type(exc).__name__}: {exc}"
@@ -640,6 +728,39 @@ def save_mcp(servers: list) -> None:
     tmp = MCP_PATH.with_suffix(".tmp")
     tmp.write_text(json.dumps({"servers": servers}, indent=1))
     _replace_with_retry(tmp, MCP_PATH)
+
+
+PROJECTS_PATH = DATA_DIR / "projects.json"
+
+
+def load_projects() -> dict:
+    """Per-project settings, keyed by the project name a chat is filed under.
+
+    Only `instructions` today: a string prepended to every turn in the
+    project, so a chat in "Alpha" inherits Alpha's standing directions the
+    way Claude's Projects do. The name is the same string `/project/<id>`
+    writes onto a chat, so nothing else needs to change to link the two.
+    """
+    try:
+        stored = json.loads(PROJECTS_PATH.read_text())
+        return stored if isinstance(stored, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_projects(projects: dict) -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = PROJECTS_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(projects, indent=1))
+    _replace_with_retry(tmp, PROJECTS_PATH)
+
+
+def project_instructions(name: str) -> str:
+    """The standing instructions for a project, or "" when it has none."""
+    if not name:
+        return ""
+    entry = load_projects().get(name) or {}
+    return str(entry.get("instructions", "")) if isinstance(entry, dict) else ""
 # Mirrors frontend/dist/settings-registry.js. The registry is the source of
 # truth for the UI; this is the storage contract, and load_settings() drops
 # unknown keys and defaults missing ones so a hand-edited or older file can
@@ -649,7 +770,9 @@ DEFAULT_SETTINGS = {
     "temperature": 0.7,
     "max_tokens": 0,
     "top_p": 1,
+    "reasoning_effort": "off",
     "base_url": "",
+    "framework": "praisonai",
     "api_key": "",
     "system_prompt": "",
     "auto_title": True,
@@ -666,7 +789,66 @@ DEFAULT_SETTINGS = {
     "confirm_delete": True,
     "launch_at_login": False,
     "check_updates": True,
+    "onboarding_complete": False,
 }
+
+
+def api_key_configured() -> bool:
+    """Whether a provider key exists (settings keychain or environment)."""
+    if str(os.environ.get("OPENAI_API_KEY") or "").strip():
+        return True
+    key = str(load_settings().get("api_key") or "").strip()
+    return len(key) >= 20
+
+
+def _onboarding_knowledge_snapshot() -> tuple[bool, int]:
+    if _KNOWLEDGE is not None:
+        st = _KNOWLEDGE.status()
+        return bool(st.get("ready")), len(st.get("paths") or [])
+    cfg_path = DATA_DIR / "knowledge" / "knowledge.json"
+    if not cfg_path.is_file():
+        return False, 0
+    try:
+        data = json.loads(cfg_path.read_text(encoding="utf-8"))
+        paths = data.get("paths") or []
+        ready = bool(data.get("indexed_at")) and bool(paths)
+        return ready, len(paths)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return False, 0
+
+
+def _onboarding_channels_count() -> int:
+    if _BOTS is not None:
+        return len(_BOTS.list_channels())
+    path = DATA_DIR / "bots" / "channels.json"
+    if not path.is_file():
+        return 0
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return len(data) if isinstance(data, list) else 0
+    except (OSError, ValueError, json.JSONDecodeError):
+        return 0
+
+
+def onboarding_payload() -> dict:
+    cfg = load_settings()
+    knowledge_ready, knowledge_paths = _onboarding_knowledge_snapshot()
+    channels_count = _onboarding_channels_count()
+    return {
+        "complete": bool(cfg.get("onboarding_complete")),
+        "api_key_set": api_key_configured(),
+        "knowledge_ready": knowledge_ready,
+        "knowledge_paths": knowledge_paths,
+        "channels_count": channels_count,
+        "channel_platforms": ["telegram", "slack", "discord"],
+        "env_hints": {
+            "openai": "OPENAI_API_KEY",
+            "telegram": "TELEGRAM_BOT_TOKEN",
+            "slack_bot": "SLACK_BOT_TOKEN",
+            "slack_app": "SLACK_APP_TOKEN",
+            "discord": "DISCORD_BOT_TOKEN",
+        },
+    }
 
 
 # --- keychain ---------------------------------------------------------------
@@ -707,10 +889,18 @@ class KeychainSecretStore:
                                check=True, capture_output=True, timeout=10,
                                **_quiet_subprocess_kwargs())
             else:
-                subprocess.run(["security", "delete-generic-password",
-                                "-s", KEYCHAIN_SERVICE, "-a", name],
-                               capture_output=True, timeout=10,
-                               **_quiet_subprocess_kwargs())
+                # The write path above checks its exit status; this one did
+                # not, and returned True regardless. A locked keychain leaves
+                # the item intact, so "your key was removed" was reported
+                # while the credential stayed live and came back on the next
+                # launch. 44 is "no such item", which is a delete that has
+                # already happened.
+                removed = subprocess.run(
+                    ["security", "delete-generic-password",
+                     "-s", KEYCHAIN_SERVICE, "-a", name],
+                    capture_output=True, timeout=10,
+                    **_quiet_subprocess_kwargs())
+                return removed.returncode in (0, 44)
             return True
         except Exception:  # noqa: BLE001 - a keychain failure must not lose the turn
             return False
@@ -740,9 +930,15 @@ class SecretToolSecretStore:
                                input=value.encode(), check=True,
                                capture_output=True, timeout=10)
             else:
-                subprocess.run(["secret-tool", "clear",
-                                "service", KEYCHAIN_SERVICE, "account", name],
-                               capture_output=True, timeout=10)
+                # As above: unchecked, so an unavailable D-Bus session (a
+                # headless or SSH login) reported a delete that never
+                # happened. `secret-tool clear` exits 0 when it matches
+                # nothing, so a non-zero status here is a real failure.
+                cleared = subprocess.run(
+                    ["secret-tool", "clear",
+                     "service", KEYCHAIN_SERVICE, "account", name],
+                    capture_output=True, timeout=10)
+                return cleared.returncode == 0
             return True
         except Exception:  # noqa: BLE001
             return False
@@ -1022,22 +1218,83 @@ def _llm_overrides(cfg: dict) -> dict:
         out["max_tokens"] = int(cfg["max_tokens"])
     if cfg.get("top_p") != DEFAULT_SETTINGS["top_p"]:
         out["top_p"] = float(cfg["top_p"])
+    # "off" is the default no-op; anything else is a provider-portable effort
+    # level (minimal|low|medium|high) that Agent maps to each backend's native
+    # knob, exactly as the CLI's --thinking does.
+    if cfg.get("reasoning_effort") not in (None, "", DEFAULT_SETTINGS["reasoning_effort"]):
+        out["reasoning_effort"] = str(cfg["reasoning_effort"])
     _apply_env(cfg)
     return out
+
+
+# Providers whose base URL or key litellm reads from its own environment
+# variable rather than OPENAI_*. The desktop has exactly two credential
+# settings -- Base URL and API key -- and used to send both to OPENAI_API_BASE
+# and OPENAI_API_KEY only. So a user who selected `ollama/llama3.2` and set
+# Base URL to their Ollama host got the litellm default (localhost:11434)
+# instead, and `lm_studio/...` and `hosted_vllm/...` got no base URL at all.
+# Verified against litellm 1.83.14 with get_llm_provider().
+#
+# litellm's convention is <PROVIDER>_API_BASE / <PROVIDER>_API_KEY, uppercased,
+# so a provider absent from this table still resolves; the entries here exist
+# where the name is not a straight upper-casing of the prefix, or where only
+# one of the pair applies.
+PROVIDER_ENV_OVERRIDES = {
+    "ollama": ("OLLAMA_API_BASE", None),          # local, no key
+    "ollama_chat": ("OLLAMA_API_BASE", None),
+    "lm_studio": ("LM_STUDIO_API_BASE", "LM_STUDIO_API_KEY"),
+    "hosted_vllm": ("HOSTED_VLLM_API_BASE", "HOSTED_VLLM_API_KEY"),
+    "openai": ("OPENAI_API_BASE", "OPENAI_API_KEY"),
+    "text-completion-openai": ("OPENAI_API_BASE", "OPENAI_API_KEY"),
+    "together_ai": ("TOGETHERAI_API_BASE", "TOGETHERAI_API_KEY"),
+}
+
+
+def model_provider(model: str) -> str:
+    """The provider prefix of a model id, or "" for a bare name.
+
+    `ollama/llama3.2` -> `ollama`. A bare `gpt-4o-mini` has no prefix and takes
+    the plain-OpenAI path, which is why "" maps to the OPENAI_* variables.
+    """
+    if not isinstance(model, str) or "/" not in model:
+        return ""
+    return model.split("/", 1)[0].strip().lower()
+
+
+def provider_env_names(provider: str):
+    """The (base_url_var, api_key_var) litellm reads for this provider."""
+    if not provider:
+        return ("OPENAI_API_BASE", "OPENAI_API_KEY")
+    if provider in PROVIDER_ENV_OVERRIDES:
+        return PROVIDER_ENV_OVERRIDES[provider]
+    upper = provider.upper().replace("-", "_")
+    return (f"{upper}_API_BASE", f"{upper}_API_KEY")
 
 
 def _apply_env(cfg: dict) -> None:
     """Credentials and endpoint go to the environment, which the OpenAI client
     reads directly -- the constructor parameter routes through the heavier path."""
+    # Route the two settings to the variables the *selected provider* reads.
+    # Sending them to OPENAI_* alone meant Base URL was inert for every local
+    # runtime: ollama fell back to localhost:11434 and lm_studio/hosted_vllm
+    # got no base URL at all.
+    provider = model_provider(cfg.get("model") or "")
+    base_var, key_var = provider_env_names(provider)
+
     if cfg.get("base_url"):
         # Set as an env var rather than base_url=, which routes through a
         # heavier code path for identical intent.
-        _export("OPENAI_API_BASE", cfg["base_url"])
+        _export(base_var, cfg["base_url"])
+        if base_var != "OPENAI_API_BASE":
+            # Keep the OpenAI pair in step so an OpenAI-compatible server
+            # reached by a bare model id still works after switching back.
+            _export("OPENAI_API_BASE", cfg["base_url"])
     else:
         # Clearing the setting clears only what *we* exported. Popping
         # unconditionally deleted the key inherited from the user's shell --
         # and this setting is documented as "blank uses the environment", so
         # that turned every request into an auth error.
+        _unset_if_ours(base_var)
         _unset_if_ours("OPENAI_API_BASE")
     key = cfg.get("api_key") or ""
     # A too-short value is a typo or a test fixture, not a credential. Exporting
@@ -1045,9 +1302,62 @@ def _apply_env(cfg: dict) -> None:
     # refuses it at entry (see api_key's validate) so this is a backstop, not
     # the only guard -- silently ignoring it is what made a bad key look set.
     if len(key) >= MIN_API_KEY_CHARS:
-        _export("OPENAI_API_KEY", key)
+        if key_var:
+            _export(key_var, key)
+        if key_var != "OPENAI_API_KEY":
+            _export("OPENAI_API_KEY", key)
     elif not key:
+        if key_var:
+            _unset_if_ours(key_var)
         _unset_if_ours("OPENAI_API_KEY")
+
+
+def model_needs_litellm(model: str) -> bool:
+    """Whether this model id would take praisonaiagents' custom-LLM path.
+
+    A string model id containing a slash routes through LiteLLM in
+    praisonaiagents (agent.py: `elif isinstance(llm, str) and "/" in llm`).
+    Bare names go to the plain-OpenAI client instead. The desktop provisions
+    only the base package, which does not depend on litellm, so a slashed id
+    imports nothing and fails on the first turn -- this predicts that before it
+    is saved.
+    """
+    return isinstance(model, str) and "/" in model
+
+
+def litellm_available() -> bool:
+    """Whether the custom-LLM (litellm) path can actually run in this venv.
+
+    The lean desktop venv installs praisonaiagents without its `llm` extra, so
+    litellm is usually absent. Checked by import spec rather than importing, so
+    this stays cheap and has no side effects.
+    """
+    try:
+        import importlib.util
+        return importlib.util.find_spec("litellm") is not None
+    except Exception:  # noqa: BLE001 - a broken meta-path finder is "not available"
+        return False
+
+
+def unsupported_model_reason(model: str) -> "str | None":
+    """Why this model id cannot run in this build, or None if it can.
+
+    The message names the constraint the user can act on -- a slashed id needs
+    the LiteLLM path, which this lean build does not ship -- rather than letting
+    the turn fail later with an import error or a bare-OpenAI 404.
+    """
+    if model_needs_litellm(model) and not litellm_available():
+        # Name only a remedy that actually clears the guard. The check keys on
+        # the slash alone, so a Base URL override does NOT help -- a slashed id
+        # still routes through LiteLLM. The fix is a bare id: a plain
+        # OpenAI-compatible name (optionally paired with a Base URL) reaches any
+        # OpenAI-style endpoint without the missing provider path.
+        return (f"The model id \u201c{model}\u201d needs the LiteLLM provider path, "
+                "which this build does not include. Use a plain OpenAI-compatible "
+                "model id without a provider prefix (for example gpt-4o-mini); to "
+                "reach another endpoint, keep the bare id and set a Base URL "
+                "override.")
+    return None
 
 
 def _installed_version() -> str:
@@ -1124,6 +1434,121 @@ def set_launch_at_login(on: bool) -> dict:
         '  <key>RunAtLoad</key><true/>\n'
         '</dict></plist>\n')
     return {"ok": True, "enabled": True, "path": str(LAUNCH_AGENT)}
+
+
+# --- agent frameworks ---------------------------------------------------------
+# praisonai's FrameworkAdapterRegistry discovers adapters through the
+# `praisonai.framework_adapters` entry-point group, so installing
+# praisonai-frameworks makes CrewAI, AutoGen, LangGraph, Agno, Google ADK,
+# OpenAI Agents SDK and Pydantic AI selectable without a change here. The
+# desktop provisions the praisonai wrapper (see ENGINE_PACKAGES), so the
+# registry is importable; the frameworks themselves are not, which is why
+# availability is reported rather than assumed.
+DEFAULT_FRAMEWORK = "praisonai"
+
+
+def framework_registry():
+    """The wrapper's adapter registry, or None if the wrapper is absent."""
+    try:
+        from praisonai.framework_adapters import registry
+        return registry
+    except Exception:  # noqa: BLE001 - an old venv predates the wrapper
+        return None
+
+
+def list_frameworks() -> dict:
+    """Which frameworks this install can run, and how to get the others.
+
+    Reports availability rather than asserting it: a framework the user has
+    not installed must be refused with its install command, not silently
+    swapped for the default -- that is how a setting comes to mean nothing.
+    """
+    reg = framework_registry()
+    if reg is None:
+        return {"available": [DEFAULT_FRAMEWORK], "known": [DEFAULT_FRAMEWORK],
+                "hints": {}, "default": DEFAULT_FRAMEWORK,
+                "error": "the praisonai wrapper is not installed in this engine"}
+    try:
+        known = list(reg.list_framework_choices(include_unavailable=True))
+        available = list(reg.list_available_frameworks())
+        hints = {name: reg.get_install_hint(name)
+                 for name in known if name not in available}
+    except Exception as exc:  # noqa: BLE001
+        return {"available": [DEFAULT_FRAMEWORK], "known": [DEFAULT_FRAMEWORK],
+                "hints": {}, "default": DEFAULT_FRAMEWORK, "error": str(exc)}
+    return {"available": available, "known": known, "hints": hints,
+            "default": DEFAULT_FRAMEWORK, "error": None}
+
+
+def framework_error(name: str):
+    """Why this framework cannot be used, or None if it can."""
+    if not name or name == DEFAULT_FRAMEWORK:
+        return None
+    info = list_frameworks()
+    if name in info["available"]:
+        return None
+    hint = info["hints"].get(name)
+    if name not in info["known"]:
+        # The registry only knows its builtins until praisonai-frameworks is
+        # installed; its entry points are what add CrewAI, AutoGen, LangGraph,
+        # Agno, Google ADK, OpenAI Agents SDK and Pydantic AI. Naming the
+        # package is the difference between a dead end and a next step.
+        return (f"\u201c{name}\u201d is not registered in this engine. "
+                f"Available now: {', '.join(info['available'])}. "
+                f"Installing praisonai-frameworks adds CrewAI, AutoGen, "
+                f"LangGraph, Agno, Google ADK, OpenAI Agents SDK and "
+                f"Pydantic AI \u2014 for example: "
+                f"pip install \"praisonai-frameworks[{name}]\"")
+    return (f"\u201c{name}\u201d is not installed in the app\u2019s environment. "
+            + (f"Install it with: {hint}" if hint else "Install it and restart."))
+
+
+def _framework_yaml(prompt: str, cfg: dict) -> str:
+    """One agent, one task -- the chat turn expressed as an agents config.
+
+    AgentsGenerator is the only path that reaches a non-praisonai adapter, and
+    it takes a YAML document rather than an Agent object.
+    """
+    import json as _json
+
+    instructions = cfg.get("system_prompt") or "You are a helpful assistant."
+    return (
+        "framework: {fw}\n"
+        "topic: desktop chat\n"
+        "roles:\n"
+        "  assistant:\n"
+        "    role: Assistant\n"
+        "    goal: Answer the user clearly and concisely.\n"
+        "    backstory: {bs}\n"
+        "    tasks:\n"
+        "      reply:\n"
+        "        description: {desc}\n"
+        "        expected_output: A direct answer to the user.\n"
+    ).format(fw=cfg.get("framework") or DEFAULT_FRAMEWORK,
+             bs=_json.dumps(instructions),
+             desc=_json.dumps(prompt))
+
+
+def run_with_framework(prompt: str, cfg: dict) -> str:
+    """Run one turn through the selected framework adapter.
+
+    Raises RuntimeError with an actionable message when the framework is not
+    installed, rather than falling back to the built-in agent -- a silent
+    fallback would make the setting look effective while changing nothing.
+    """
+    name = cfg.get("framework") or DEFAULT_FRAMEWORK
+    problem = framework_error(name)
+    if problem:
+        raise RuntimeError(problem)
+    from praisonai.agents_generator import AgentsGenerator
+
+    generator = AgentsGenerator(
+        agent_file=None,
+        framework=name,
+        config_list=[{"model": cfg.get("model") or DEFAULT_SETTINGS["model"]}],
+        agent_yaml=_framework_yaml(prompt, cfg),
+    )
+    return str(generator.generate_crew_and_kickoff() or "")
 
 
 def _get_agent(session_id: str = "default", tools: bool = True):
@@ -1334,6 +1759,68 @@ def _persist(chat_id: str, prompt: str, reply: list,
         return None
 
 
+def redacted(cfg: dict) -> dict:
+    """A settings dict that is safe to put on the wire.
+
+    GET /settings has masked the key since the beginning. POST /settings
+    returned save_settings()'s merged dict, and that dict starts from
+    load_settings(), which reads the real secret back out of the keychain -- so
+    every settings write answered with the credential in cleartext, including a
+    write that only changed the theme.
+
+    Masking one of two exits is not masking. The secret is stored exactly as
+    before; only what leaves the process changes.
+    """
+    out = dict(cfg)
+    for key in SECRET_KEYS:
+        if key in out:
+            out[key] = "\u2022" * 8 if out[key] else ""
+    return out
+
+
+# --- request origin -----------------------------------------------------------
+# The engine binds loopback, which keeps other machines out but NOT other pages:
+# any site open in the user's browser can reach 127.0.0.1 with a two-line fetch.
+# With `Access-Control-Allow-Origin: *` and no auth, that page could POST
+# /settings and repoint `base_url` at a host it controls -- the stored API key
+# then travels to that host on the next turn. Redacting replies (see redacted())
+# stopped the key being echoed; it did nothing about the key being *sent*.
+#
+# A browser attaches Origin to every cross-origin request and a page cannot forge
+# it, so refusing unknown origins closes that path without a shared secret (which
+# would need the Rust shell to carry one). Requests with NO Origin are allowed:
+# that is cli.py, the tests and curl -- local processes that already have the
+# user's filesystem, so a token would protect nothing.
+ALLOWED_ORIGIN_HOSTS = {
+    "tauri.localhost",
+    "asset.localhost",  # some WebView2 builds use this for embedded assets
+    "localhost",
+    "127.0.0.1",
+    "[::1]",
+    "::1",
+}
+
+
+def origin_allowed(origin: str) -> bool:
+    """Whether a browser Origin may talk to the engine.
+
+    Accepts the webview's own origin on every platform Tauri targets --
+    `tauri://localhost` on macOS and Linux, `http://tauri.localhost` on Windows
+    and Android -- plus localhost on any port for `npm run dev`.
+    """
+    if not origin:
+        return True                      # not a browser; see the note above
+    if origin == "null":
+        return False                     # sandboxed iframe / file:// document
+    try:
+        parsed = urlparse(origin)
+    except ValueError:
+        return False
+    if parsed.scheme not in ("tauri", "http", "https"):
+        return False
+    return (parsed.hostname or "") in ALLOWED_ORIGIN_HOSTS
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -1341,10 +1828,42 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def _cors(self):
-        self.send_header("Access-Control-Allow-Origin", "*")
+        # Echo the caller's own origin rather than "*", so only the origins
+        # origin_allowed() admits can read a reply.
+        origin = self.headers.get("Origin") or ""
+        if origin and origin_allowed(origin):
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
+        # WebView2/Chromium preflight requires Allow-Methods or POST/DELETE fail
+        # with a network error while GET (no preflight) still works.
+        self.send_header(
+            "Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS"
+        )
         self.send_header("Access-Control-Allow-Headers", "content-type")
 
+    def _origin_ok(self) -> bool:
+        """Refuse a browser origin the engine does not recognise.
+
+        Answers the request with 403 and no CORS headers, so the calling page
+        cannot read the reply either.
+        """
+        if origin_allowed(self.headers.get("Origin") or ""):
+            return True
+        self._drain()
+        body = b'{"error":"origin not allowed"}'
+        self.send_response(403)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        return False
+
     def do_OPTIONS(self):
+        if not self._origin_ok():
+            return
         self.send_response(204)
         self._cors()
         self.send_header("Content-Length", "0")
@@ -1396,6 +1915,153 @@ class Handler(BaseHTTPRequestHandler):
             from training import Trainer
             _TRAINER = Trainer(DATA_DIR, sys.executable)
         return _TRAINER
+
+    def _bots(self):
+        """Channel bots and gateway supervisor."""
+        global _BOTS
+        if _BOTS is None:
+            from bots import BotSupervisor
+            cfg = load_settings()
+            _BOTS = BotSupervisor(
+                DATA_DIR,
+                sys.executable,
+                model=str(cfg.get("model") or "gpt-4o-mini"),
+            )
+        return _BOTS
+
+    def _knowledge(self):
+        """Folder indexing and retrieval for desktop RAG."""
+        global _KNOWLEDGE
+        if _KNOWLEDGE is None:
+            from knowledge import KnowledgeSupervisor
+            cfg = load_settings()
+            _KNOWLEDGE = KnowledgeSupervisor(
+                DATA_DIR,
+                model=str(cfg.get("model") or "gpt-4o-mini"),
+            )
+        return _KNOWLEDGE
+
+    def _media(self):
+        global _MEDIA
+        if _MEDIA is None:
+            from media import MediaSupervisor
+            _MEDIA = MediaSupervisor(DATA_DIR)
+        return _MEDIA
+
+    def _studio(self):
+        global _STUDIO
+        if _STUDIO is None:
+            from studio import StudioManager
+
+            def _log(msg: str) -> None:
+                _LOG.append(f"[studio] {msg}")
+
+            _STUDIO = StudioManager(DATA_DIR, log_fn=_log)
+        return _STUDIO
+
+    def _studio_dispatch(self, method: str, route: str) -> None:
+        """Route /studio/* to StudioManager."""
+        parts = route.strip("/").split("/")
+        mgr = self._studio()
+        try:
+            if method == "GET":
+                if route == "/studio/models":
+                    self._json(mgr.models())
+                    return
+                if route == "/studio/credentials":
+                    from studio import credential_hints
+
+                    self._json(credential_hints())
+                    return
+                if route == "/studio/projects":
+                    self._json({"projects": mgr.list_projects()})
+                    return
+                if len(parts) == 3 and parts[0] == "studio" and parts[1] == "projects":
+                    self._json(mgr.get_project(parts[2]))
+                    return
+                if len(parts) == 3 and parts[0] == "studio" and parts[1] == "jobs":
+                    job = mgr.get_job(parts[2])
+                    if job is None:
+                        self._json({"ok": False, "error": "no such job"}, 404)
+                        return
+                    self._json({"job": job.summary()})
+                    return
+                if (
+                    len(parts) == 5
+                    and parts[0] == "studio"
+                    and parts[1] == "projects"
+                    and parts[3] == "file"
+                ):
+                    path, mime = mgr.asset_file(parts[2], parts[4])
+                    data = path.read_bytes()
+                    self.send_response(200)
+                    self._cors()
+                    self.send_header("Content-Type", mime)
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return
+                self.send_error(404)
+                return
+
+            if method == "POST":
+                if route == "/studio/projects":
+                    payload = self._body()
+                    project = mgr.create_project(payload.get("name") or "Untitled")
+                    self._json({"ok": True, "project": project})
+                    return
+                if len(parts) == 4 and parts[3] == "generate":
+                    payload = self._body()
+                    jobs = mgr.start_generate(
+                        parts[2],
+                        kind=payload.get("kind") or "video",
+                        model=payload.get("model") or "",
+                        prompt=payload.get("prompt") or "",
+                        seconds=str(payload.get("seconds") or "8"),
+                        ref_asset_id=payload.get("ref_asset_id"),
+                        n_variants=int(payload.get("n_variants") or 1),
+                        image_quality=payload.get("image_quality"),
+                        image_size=payload.get("image_size"),
+                    )
+                    self._json(
+                        {
+                            "ok": True,
+                            "jobs": [j.summary() for j in jobs],
+                        }
+                    )
+                    return
+                if len(parts) == 4 and parts[3] == "assets":
+                    payload = self._body()
+                    asset = mgr.add_image_asset(
+                        parts[2],
+                        payload.get("filename") or "upload.png",
+                        payload.get("data_base64") or "",
+                        prompt=payload.get("prompt") or "",
+                    )
+                    self._json({"ok": True, "asset": asset})
+                    return
+                if len(parts) == 4 and parts[3] == "timeline":
+                    payload = self._body()
+                    result = mgr.set_timeline(
+                        parts[2], list(payload.get("timeline") or [])
+                    )
+                    self._json({"ok": True, **result})
+                    return
+                if len(parts) == 4 and parts[3] == "export":
+                    payload = self._body()
+                    result = mgr.export_timeline(
+                        parts[2], payload.get("output_name") or "export.mp4"
+                    )
+                    self._json({"ok": True, **result})
+                    return
+                self.send_error(404)
+                return
+
+            self.send_error(405)
+        except (ValueError, TypeError, KeyError) as exc:
+            self._json({"ok": False, "error": str(exc)}, 400)
+        except (RuntimeError, OSError) as exc:
+            self._json({"ok": False, "error": str(exc)}, 500)
 
     def _train_progress(self, run, cursor):
         """Replay from `cursor`, then follow. Not a subscription: a client that
@@ -1451,9 +2117,14 @@ class Handler(BaseHTTPRequestHandler):
             time.sleep(0.25)
 
     def do_GET(self):
+        if not self._origin_ok():
+            return
+        route = urlparse(self.path).path
+        if route.startswith("/studio"):
+            self._studio_dispatch("GET", route)
+            return
         if self.path.startswith("/train/progress"):
             trainer = self._training()
-            from urllib.parse import parse_qs, urlparse
             query = parse_qs(urlparse(self.path).query)
             run_id = (query.get("run") or [None])[0]
             run = trainer.get(run_id) if run_id else trainer.current
@@ -1471,6 +2142,36 @@ class Handler(BaseHTTPRequestHandler):
                 self._train_progress(run, cursor)
             except (BrokenPipeError, ConnectionResetError):
                 pass          # the window closed; the run keeps going
+            return
+
+        if self.path == "/onboarding":
+            self._json({"ok": True, **onboarding_payload()})
+            return
+        if self.path == "/knowledge/status":
+            self._json({"ok": True, **self._knowledge().status()})
+            return
+        if self.path == "/media/capabilities":
+            self._json({"ok": True, **self._media().capabilities()})
+            return
+        if self.path == "/media/video/models":
+            self._json({"ok": True, "models": self._media().list_video_models()})
+            return
+        if self.path.startswith("/media/recent?"):
+            kind = (parse_qs(urlparse(self.path).query).get("kind") or ["image"])[0]
+            self._json({"ok": True, "items": self._media().list_recent(kind)})
+            return
+        if self.path == "/bots/channels":
+            self._json({"channels": self._bots().list_channels()})
+            return
+        if self.path == "/bots/gateway":
+            self._json(self._bots().gateway_status())
+            return
+        if self.path.startswith("/bots/logs?"):
+            target = (parse_qs(urlparse(self.path).query).get("target") or [""])[0]
+            try:
+                self._json(self._bots().logs(target))
+            except ValueError as exc:
+                self._json({"ok": False, "error": str(exc)}, 404)
             return
 
         if self.path == "/train/runs":
@@ -1492,13 +2193,22 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/settings":
             cfg = load_settings()
             # The UI only needs to know whether a key is set, never its value.
-            cfg["api_key"] = "\u2022" * 8 if cfg.get("api_key") else ""
-            self._json(cfg)
+            self._json(redacted(cfg))
+            return
+        if self.path == "/frameworks":
+            # What this install can actually run, and how to get the rest.
+            self._json(list_frameworks())
             return
         if self.path == "/projects":
-            names = sorted({(load_chat(c["id"]).get("project") or "")
-                            for c in list_chats()} - {""})
-            self._json({"projects": names})
+            # Names come from the chats filed under them; instructions come from
+            # the project store. A project keeps its instructions even after its
+            # last chat leaves, so the two lists are unioned, not intersected.
+            stored = load_projects()
+            names = sorted(({(load_chat(c["id"]).get("project") or "")
+                             for c in list_chats()} | set(stored)) - {""})
+            self._json({"projects": names,
+                        "instructions": {n: project_instructions(n)
+                                         for n in names}})
             return
         if self.path == "/mcp":
             self._json({"servers": load_mcp()})
@@ -1512,18 +2222,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"lines": list(_LOG)})
             return
         if self.path.startswith("/search?"):
-            from urllib.parse import parse_qs, urlparse
-            q = (parse_qs(urlparse(self.path).query).get("q") or [""])[0].lower().strip()
-            hits = []
-            if q:
-                for meta in list_chats():
-                    chat = load_chat(meta["id"])
-                    for m in chat.get("messages", []):
-                        if q in str(m.get("content", "")).lower():
-                            hits.append({"id": meta["id"], "title": meta["title"],
-                                         "snippet": str(m.get("content"))[:120]})
-                            break
-            self._json({"hits": hits})
+            q = (parse_qs(urlparse(self.path).query).get("q") or [""])[0].strip()
+            self._json({"hits": _search_chats(q) if q else []})
             return
         if self.path == "/chats":
             self._json({"chats": list_chats()})
@@ -1556,6 +2256,13 @@ class Handler(BaseHTTPRequestHandler):
         # rather than reproduce the default and hand the user a path the app
         # is not actually using.
         body = json.dumps({"ok": True, "version": PROTOCOL_VERSION,
+                           "shell_version": os.environ.get(
+                               "PRAISONAI_DESKTOP_VERSION", "unknown"),
+                           "agents_version": _installed_version(),
+                           # Whether the LiteLLM provider path is importable, so
+                           # the picker can mark slashed provider ids this build
+                           # cannot run rather than offering them silently.
+                           "litellm": litellm_available(),
                            "data_dir": str(DATA_DIR)}).encode()
         self.send_response(200)
         self._cors()
@@ -1564,17 +2271,192 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def do_PUT(self):
+        if not self._origin_ok():
+            return
+        route = urlparse(self.path).path
+        if route.startswith("/bots/channels/"):
+            channel_id = route.rsplit("/", 1)[-1]
+            payload = self._body()
+            try:
+                ch = self._bots().update_channel(channel_id, payload)
+            except ValueError as exc:
+                self._json({"ok": False, "error": str(exc)}, 404)
+                return
+            except RuntimeError as exc:
+                self._json({"ok": False, "error": str(exc)}, 409)
+                return
+            self._json({"ok": True, "channel": ch})
+            return
+        self.send_error(404)
+
     def do_DELETE(self):
+        if not self._origin_ok():
+            return
+        route = urlparse(self.path).path
+        if route.startswith("/bots/channels/"):
+            channel_id = route.rsplit("/", 1)[-1]
+            ok = self._bots().delete_channel(channel_id)
+            if not ok:
+                self._json({"ok": False, "error": "no such channel"}, 404)
+                return
+            self._json({"ok": True})
+            return
         if not self.path.startswith("/chats/"):
             self.send_error(404)
             return
         try:
             _chat_path(self.path.rsplit("/", 1)[-1]).unlink(missing_ok=True)
-        except (OSError, ValueError):
-            pass
+        except ValueError as exc:
+            self._json({"ok": False, "error": str(exc)}, 400)
+            return
+        except OSError as exc:
+            # Reporting a delete that did not happen is how a conversation
+            # closed on screen and was back in the sidebar on reopen.
+            self._json({"ok": False, "error": str(exc)}, 500)
+            return
         self._json({"ok": True})
 
     def do_POST(self):
+        if not self._origin_ok():
+            return
+        route = urlparse(self.path).path
+
+        if route.startswith("/studio"):
+            self._studio_dispatch("POST", route)
+            return
+
+        if route == "/knowledge/configure":
+            payload = self._body() or {}
+            try:
+                st = self._knowledge().configure(payload.get("paths") or [])
+            except ValueError as exc:
+                self._json({"ok": False, "error": str(exc)}, 400)
+                return
+            self._json({"ok": True, **st})
+            return
+
+        if route == "/knowledge/reindex":
+            try:
+                st = self._knowledge().reindex()
+            except (ValueError, RuntimeError) as exc:
+                self._json({"ok": False, "error": str(exc)}, 400)
+                return
+            self._json({"ok": True, **st})
+            return
+
+        if route == "/knowledge/query":
+            payload = self._body() or {}
+            q = str(payload.get("query") or "").strip()
+            if not q:
+                self._json({"ok": False, "error": "query required"}, 400)
+                return
+            try:
+                ctx = self._knowledge().query(q)
+            except (ValueError, RuntimeError) as exc:
+                self._json({"ok": False, "error": str(exc)}, 400)
+                return
+            self._json({"ok": True, "context": ctx})
+            return
+
+        if route == "/media/image":
+            payload = self._body() or {}
+            try:
+                out = self._media().generate_image(
+                    str(payload.get("prompt") or ""),
+                    settings=load_settings(),
+                    model=str(payload.get("model") or "dall-e-3"),
+                    size=str(payload.get("size") or "1024x1024"),
+                )
+            except (ValueError, RuntimeError) as exc:
+                self._json({"ok": False, "error": str(exc)}, 400)
+                return
+            self._json({"ok": True, **out})
+            return
+
+        if route == "/media/video":
+            payload = self._body() or {}
+            try:
+                out = self._media().generate_video(
+                    str(payload.get("prompt") or ""),
+                    settings=load_settings(),
+                    model=str(payload.get("model") or "replicate/minimax/video-01"),
+                )
+            except (ValueError, RuntimeError) as exc:
+                self._json({"ok": False, "error": str(exc)}, 400)
+                return
+            self._json({"ok": True, **out})
+            return
+
+        if route == "/onboarding/complete":
+            save_settings({"onboarding_complete": True})
+            self._json({"ok": True, **onboarding_payload()})
+            return
+
+        if route == "/onboarding/test":
+            payload = self._body() or {}
+            prompt = str(payload.get("prompt") or "Hi").strip() or "Hi"
+            try:
+                agent = _get_agent("onboarding-test", tools=False)
+                reply = str(agent.start(prompt) or "")
+            except Exception as exc:  # noqa: BLE001
+                self._json({"ok": False, "error": str(exc)}, 400)
+                return
+            self._json({"ok": True, "reply": reply[:500]})
+            return
+
+        if route == "/bots/channels":
+            payload = self._body()
+            try:
+                ch = self._bots().add_channel(payload)
+            except ValueError as exc:
+                self._json({"ok": False, "error": str(exc)}, 400)
+                return
+            self._json({"ok": True, "channel": ch}, 201)
+            return
+
+        if route.startswith("/bots/channels/") and route.endswith("/start"):
+            channel_id = route.split("/")[3]
+            try:
+                ch = self._bots().start_channel(channel_id)
+            except ValueError as exc:
+                self._json({"ok": False, "error": str(exc)}, 404)
+                return
+            except RuntimeError as exc:
+                self._json({"ok": False, "error": str(exc)}, 409)
+                return
+            self._json({"ok": True, "channel": ch})
+            return
+
+        if route.startswith("/bots/channels/") and route.endswith("/stop"):
+            channel_id = route.split("/")[3]
+            try:
+                ch = self._bots().stop_channel(channel_id)
+            except ValueError as exc:
+                self._json({"ok": False, "error": str(exc)}, 404)
+                return
+            self._json({"ok": True, "channel": ch})
+            return
+
+        if route == "/bots/gateway/start":
+            payload = self._body() or {}
+            port = int(payload.get("port") or 8765)
+            try:
+                status = self._bots().start_gateway(port)
+            except ValueError as exc:
+                self._json({"ok": False, "error": str(exc)}, 400)
+                return
+            except RuntimeError as exc:
+                self._json({"ok": False, "error": str(exc)}, 409)
+                return
+            self._json({"ok": True, "gateway": status})
+            return
+
+        if route == "/bots/gateway/stop":
+            status = self._bots().stop_gateway()
+            self._json({"ok": True, "gateway": status})
+            return
+
         if self.path == "/train/start":
             payload = self._body()
             config = payload.get("config") or {}
@@ -1657,12 +2539,26 @@ class Handler(BaseHTTPRequestHandler):
             except (ValueError, TypeError):
                 self.send_error(400)
                 return
-            saved = save_settings(patch)
+            # Reject a model this build cannot run before it is saved, so the
+            # failure lands here with an explanation rather than on the first
+            # turn as an import error or a bare-OpenAI 404.
+            if "model" in patch:
+                reason = unsupported_model_reason(patch["model"])
+                if reason is not None:
+                    self._json({"ok": False, "error": reason}, 422)
+                    return
             if "launch_at_login" in patch:
-                saved = dict(saved)
-                saved["launch_at_login_result"] = set_launch_at_login(
-                    bool(patch["launch_at_login"]))
-            self._json(saved)
+                # Persist what actually happened, not what was asked. Writing
+                # the request first made the toggle report a login item that
+                # was never registered -- and survive restarts saying so.
+                result = set_launch_at_login(bool(patch["launch_at_login"]))
+                patch = {**patch, "launch_at_login": bool(result.get("enabled"))}
+                saved = dict(save_settings(patch))
+                saved["launch_at_login_result"] = result
+            else:
+                saved = save_settings(patch)
+            # Redacted: this is the reply that carried the key in cleartext.
+            self._json(redacted(saved))
             return
 
         if self.path == "/mcp":
@@ -1747,6 +2643,25 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"ok": False, "error": "cannot fork"}, 404)
             return
 
+        if self.path == "/projects":
+            # Standing instructions for a project, edited from the sidebar and
+            # prepended to every turn of its chats. Blank clears the entry so a
+            # project with nothing to say leaves no stale file behind.
+            body = self._body()
+            name = str(body.get("project", ""))[:80].strip()
+            if not name:
+                self._json({"ok": False, "error": "project name required"}, 400)
+                return
+            text = str(body.get("instructions", ""))[:20_000].strip()
+            projects = load_projects()
+            if text:
+                projects[name] = {"instructions": text}
+            else:
+                projects.pop(name, None)
+            save_projects(projects)
+            self._json({"ok": True, "project": name, "instructions": text})
+            return
+
         if self.path.startswith("/project/"):
             cid = self.path.rsplit("/", 1)[-1]
             name = self._body().get("project", "")
@@ -1809,13 +2724,55 @@ class Handler(BaseHTTPRequestHandler):
             chat_id = payload.get("chat_id") or session
             regenerate_of = payload.get("regenerate_of")
             tools_on = payload.get("tools", True) is not False
+            use_knowledge = payload.get("use_knowledge") is True
+            # Knowledge turns answer from injected document text; web tools
+            # otherwise hijack the turn (e.g. web_search when Tavily is unset).
+            if use_knowledge:
+                tools_on = False
+            # Images arrive as data: URIs and go to the agent as attachments= so a
+            # vision model actually sees them; text-like files keep being folded
+            # into the prompt as before. Nothing binary is ever stringified.
+            media_attachments = []
             for att in (payload.get("attachments") or [])[:5]:
                 nm = str(att.get("name", "file"))[:120]
+                url = att.get("url")
+                if isinstance(url, str) and url.startswith("data:"):
+                    media_attachments.append(url)
+                    continue
                 body = str(att.get("text", ""))[:100_000]
                 prompt = f"{prompt}\n\n--- attached: {nm} ---\n{body}"
         except (ValueError, TypeError):
             self.send_error(400)
             return
+
+        # A chat filed under a project inherits that project's standing
+        # instructions. They ride in front of this turn only -- `prompt` stays
+        # clean, so the transcript and the auto-title show what the user typed,
+        # not the project preamble, and a chat that later leaves the project
+        # keeps a history free of it. The agent is cached per session and shared
+        # across chats with different projects, so this is done per turn rather
+        # than baked into the agent's own instructions.
+        turn_prompt = prompt
+        try:
+            proj = load_chat(chat_id).get("project") or ""
+        except Exception:  # noqa: BLE001 - a missing chat simply has no project
+            proj = ""
+        proj_text = project_instructions(proj)
+        if proj_text:
+            turn_prompt = f"{proj_text}\n\n{prompt}"
+        if use_knowledge:
+            try:
+                ctx = self._knowledge().query(turn_prompt)
+                if ctx:
+                    turn_prompt = (
+                        "Answer using the user's indexed documents below. "
+                        "If the answer appears in the excerpt, state it plainly "
+                        "(including codes or secrets stored in those files).\n\n"
+                        f"--- Retrieved knowledge ---\n{ctx}\n\n"
+                        f"--- User question ---\n{turn_prompt}"
+                    )
+            except (ValueError, RuntimeError):
+                pass
 
         self.send_response(200)
         self._cors()
@@ -1885,9 +2842,36 @@ class Handler(BaseHTTPRequestHandler):
                                          "seconds": ev["seconds"]})
                 return shown
 
-            for chunk in agent.start(prompt, stream=True,
-                                     **_llm_overrides(load_settings())):
-                _drain_tools()
+            start_kwargs = dict(_llm_overrides(load_settings()))
+            if media_attachments:
+                start_kwargs["attachments"] = media_attachments
+
+            # A non-default framework runs through its adapter instead of the
+            # built-in Agent. Those adapters have no streaming contract, so the
+            # answer arrives whole; refusing here rather than falling back is
+            # deliberate -- a silent fallback would leave the setting looking
+            # effective while changing nothing.
+            _fw = (load_settings().get("framework") or DEFAULT_FRAMEWORK).strip()
+            _framework_turn = bool(_fw) and _fw != DEFAULT_FRAMEWORK
+            if _framework_turn:
+                whole = run_with_framework(turn_prompt, load_settings())
+                if whole:
+                    if first_token_at is None:
+                        first_token_at = time.perf_counter()
+                    streamed = True
+                    chars += len(whole)
+                    reply.append(whole)
+                    emit("delta", {"text": whole})
+
+            for chunk in (() if _framework_turn
+                          else agent.start(turn_prompt, stream=True, **start_kwargs)):
+                # Counted here too. This call drains the queue, so discarding
+                # its result meant the tally further down always read zero
+                # unless the loop body never ran at all -- and the tests only
+                # covered that one case, so the count looked right while every
+                # stream that yielded anything before dying still reported
+                # "the engine produced no output" under its own tool cards.
+                tools_shown += _drain_tools()
                 if run_id and _is_cancelled(run_id):
                     # Verified by side effect: emission stops. The client is told
                     # explicitly rather than inferring it from a stream that ends.
@@ -1995,7 +2979,21 @@ def main():
     print(f"praisonai runtime listening on 127.0.0.1:{port}", flush=True)
     write_lock(port)
     atexit.register(clear_lock)
-    register_exit_signals(lambda *_: sys.exit(0))
+
+    def _stop_everything(*_):
+        # The trainer runs in its own session (start_new_session=True), so a
+        # signal aimed at the engine's process group never reaches it. If the
+        # engine simply exits, the fine-tune is reparented to init and keeps
+        # the GPU with nothing left that can find or stop it. Trainer.stop()
+        # terminates the trainer's own group first, so quit takes it down too.
+        if _TRAINER is not None:
+            try:
+                _TRAINER.stop()
+            except Exception:  # noqa: BLE001 - never block the quit
+                pass
+        sys.exit(0)
+
+    register_exit_signals(_stop_everything)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
